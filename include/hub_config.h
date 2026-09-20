@@ -1,0 +1,13 @@
+#ifndef HUB_CONFIG_H
+#define HUB_CONFIG_H
+
+#define HUB_COMPUTER_COUNT 4
+#define HUB_INPUT_COUNT 2
+#define HUB_PAIRING_WINDOW_MS 120000u
+#define HUB_INPUT_ENROLLMENT_MS 60000u
+#ifndef HUB_CLASSIC_OPEN_TEST
+#define HUB_CLASSIC_OPEN_TEST 0
+#endif
+#define HUB_DEVICE_NAME "Pico2W Keyboard Mouse Hub"
+
+#endif

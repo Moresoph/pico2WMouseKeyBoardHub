@@ -1,0 +1,6 @@
+.deps/
+.tools/
+build/
+backups/
+__pycache__/
+*.pyc
