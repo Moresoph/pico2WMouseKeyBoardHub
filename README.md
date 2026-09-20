@@ -75,6 +75,59 @@ If Git cannot reach GitHub through your network, bootstrap accepts an explicit
 `-GitProxy` URL. It applies only to that invocation and does not change global
 Git or Windows proxy settings.
 
+## Mouse-latency tuning
+
+The saved 0.4.0 checkpoint remains the functional baseline. Firmware 0.4.1 adds
+on-demand measurements and a reversible performance mode:
+
+```text
+latency
+latency reset
+latency fast
+latency normal
+```
+
+`latency` reports the actual LE connection interval, peripheral latency and
+supervision timeout for each live link, recent input-report spacing, and
+per-computer output queue statistics. Values are recorded at the Pico:
+input gaps describe received reports, and queue times end at a successful
+`att_server_notify` submission. They do **not** measure mouse sensor latency,
+radio delivery acknowledgement, Windows processing, or screen presentation.
+Pauses longer than 100 ms are separated from active input-gap averages.
+No key codes, movement values, or report payloads are logged by these metrics.
+
+`latency fast` enables event-driven queue draining and requests a 7.5--15 ms LE
+interval with zero peripheral latency for existing BLE input links and the
+currently selected computer. The requested maximum is capped at the current
+interval when it is already below 15 ms, so a 7.5 ms link is not asked to slow
+down. The host/device can reject or choose different
+parameters; the printed negotiated values, not the request, determine whether
+radio timing changed. Inactive computers stay connected and are not accelerated;
+a previously accelerated computer is requested back to its baseline when it is
+no longer selected. Controller requests are bounded rather than retried in a loop.
+Peers can later renegotiate their power-saving parameters; fast mode does not
+continually override them. Peripheral latency permits skipping idle connection
+events, not a fixed delay added to every moving-mouse report.
+
+`latency normal` restores the baseline send scheduling and requests each tuned
+link's earlier connection parameters. Neither mode changes encryption, bond
+keys, slot selection, or input authorization. Mode selection is saved separately
+from device identities and restored at reboot. With no saved mode, startup uses
+normal mode so baseline measurements can be collected first.
+
+For comparison, reset the counters, move the mouse continuously for the same
+duration on the same selected computer, read `latency`, and repeat in the other
+mode. Keep other computer links connected throughout. A shorter BLE interval
+can increase radio duty cycle and mouse battery use; do not trade stable
+multi-device operation for a requested interval the controller cannot sustain.
+
+In a manual same-PC comparison, mean mouse queue-to-ATT submission time fell
+from 6.345 ms (767 packets) to 1.437 ms (1,353 packets); the operator reported
+more responsive motion with normal clicks and scrolling. PC1 remained at
+15 ms and the mouse remained at 7.5 ms. The mouse accepted latency 0 initially,
+then renegotiated latency 44. This is an indicative queue/scheduling result,
+not an end-to-end latency measurement or proof of a radio-interval improvement.
+
 ### Isolated minimum-security Classic input experiment
 
 Normal builds still use Classic Level 2. To make a clearly marked diagnostic

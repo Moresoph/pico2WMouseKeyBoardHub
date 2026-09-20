@@ -72,3 +72,10 @@ if ($LASTEXITCODE -ne 0) { throw "Security profile tests failed: $LASTEXITCODE" 
 
 & (Join-Path $root 'tests\test-hci-reconnect.ps1') -SdkPath $SdkPath
 & (Join-Path $root 'tests\test-output.ps1') -SdkPath $SdkPath
+$output = Join-Path $outputDirectory 'hub_latency_tests.exe'
+& $compiler -Wall -Werror -DENABLE_BLE=1 -DENABLE_CLASSIC=1 `
+    "-I$(Join-Path $root 'include')" "-I$btstack" `
+    (Join-Path $root 'tests\latency_test.c') $util -o $output
+if ($LASTEXITCODE -ne 0) { throw "Latency test compilation failed: $LASTEXITCODE" }
+& $output
+if ($LASTEXITCODE -ne 0) { throw "Latency tests failed: $LASTEXITCODE" }

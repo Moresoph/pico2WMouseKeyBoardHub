@@ -4,6 +4,7 @@
 
 #include "btstack.h"
 #include "hub_config.h"
+#include "hub_latency.h"
 #include "hub_output.h"
 #include "hub_output_store.h"
 #include "hub_router.h"
@@ -13,6 +14,8 @@
 #define OUTPUT_QUEUE_LENGTH 64u
 #define OUTPUT_AUTH_TIMEOUT_MS 90000u
 #define OUTPUT_SERVICE_INTERVAL_MS 5u
+#define OUTPUT_PUMP_BUDGET 8u
+#define OUTPUT_PUMP_YIELD_MS 1u
 #define RELEASE_KEYBOARD 1u
 #define RELEASE_MOUSE 2u
 #define RELEASE_BOTH (RELEASE_KEYBOARD | RELEASE_MOUSE)
@@ -47,6 +50,8 @@ static const uint8_t report_map[] = {
 
 typedef struct {
     uint8_t kind;
+    bool timing_valid;
+    uint32_t enqueued_us;
     union {
         uint8_t keyboard[8];
         struct {
@@ -57,6 +62,20 @@ typedef struct {
 } output_event_t;
 
 typedef struct {
+    uint32_t enqueued, notified, wait_count, wait_max_us;
+    uint64_t wait_sum_us;
+    uint32_t wait_bins[5];
+    unsigned queue_highwater;
+    uint32_t notify_errors;
+} output_report_metrics_t;
+
+typedef struct {
+    output_report_metrics_t reports[2];
+    unsigned queue_highwater;
+    uint32_t mouse_merges, releases, release_errors, registration_errors, budget_yields;
+} output_metrics_t;
+
+typedef struct {
     bool occupied;
     bool retiring;
     bool disconnecting;
@@ -65,6 +84,10 @@ typedef struct {
     bool identity_authenticated;
     bool suspended;
     bool send_registered;
+    bool pumping;
+    bool continuation_pending;
+    bool yield_pending;
+    bool retry_pending;
     bool ready_logged;
     uint8_t key_size;
     uint8_t address_type;
@@ -83,6 +106,7 @@ typedef struct {
     output_event_t queue[OUTPUT_QUEUE_LENGTH];
     unsigned head;
     unsigned count;
+    unsigned queued[2];
     unsigned slot;
     btstack_context_callback_registration_t send_registration;
 } computer_t;
@@ -95,6 +119,12 @@ static hub_output_store_t output_store;
 static btstack_packet_callback_registration_t hci_registration;
 static btstack_packet_callback_registration_t sm_registration;
 static btstack_timer_source_t service_timer;
+static btstack_timer_source_t pump_timer;
+static btstack_context_callback_registration_t pump_registration;
+static output_metrics_t output_metrics[HUB_COMPUTER_COUNT];
+static bool low_latency;
+static bool continuation_registered;
+static bool pump_timer_armed;
 static unsigned active_slot;
 static bool started;
 static bool switch_pending;
@@ -106,6 +136,7 @@ static uint8_t advertising_status;
 
 static void request_send(computer_t *computer);
 static void progress_switch(void);
+static void schedule_continuation(computer_t *computer);
 
 static unsigned slot_of(const computer_t *computer) {
     return computer->slot;
@@ -148,10 +179,17 @@ bool hub_output_switching(void) {
     return switch_pending;
 }
 
+uint16_t hub_output_active_handle(void) {
+    computer_t *computer = computer_for_slot(active_slot);
+    return !switch_pending && hub_output_ready(active_slot)
+        ? computer->handle : HCI_CON_HANDLE_INVALID;
+}
+
 static void clear_queue(computer_t *computer) {
     memset(computer->queue, 0, sizeof(computer->queue));
     computer->head = 0;
     computer->count = 0;
+    memset(computer->queued, 0, sizeof(computer->queued));
 }
 
 static void require_release(computer_t *computer) {
@@ -218,9 +256,42 @@ static int32_t clamp_delta(int32_t value, int32_t low, int32_t high) {
 }
 
 static void pop_event(computer_t *computer) {
+    --computer->queued[computer->queue[computer->head].kind == RELEASE_KEYBOARD ? 0 : 1];
     memset(&computer->queue[computer->head], 0, sizeof(output_event_t));
     computer->head = (computer->head + 1) % OUTPUT_QUEUE_LENGTH;
     --computer->count;
+}
+
+static void measure_enqueue(computer_t *computer, output_event_t *event, bool merged) {
+    output_metrics_t *metrics = &output_metrics[computer->slot];
+    unsigned kind = event->kind == RELEASE_KEYBOARD ? 0 : 1;
+    output_report_metrics_t *report = &metrics->reports[kind];
+    ++report->enqueued;
+    if (merged) {
+        ++metrics->mouse_merges;
+        return; /* A merged/split mouse event retains the oldest enqueue time. */
+    }
+    event->enqueued_us = hub_latency_now_us();
+    event->timing_valid = true;
+    ++computer->queued[kind];
+    if (computer->queued[kind] > report->queue_highwater)
+        report->queue_highwater = computer->queued[kind];
+    if (computer->count > metrics->queue_highwater)
+        metrics->queue_highwater = computer->count;
+}
+
+static void measure_notify(computer_t *computer, const output_event_t *event) {
+    output_report_metrics_t *metrics =
+        &output_metrics[computer->slot].reports[event->kind == RELEASE_KEYBOARD ? 0 : 1];
+    ++metrics->notified;
+    if (!event->timing_valid) return;
+    uint32_t wait = hub_latency_now_us() - event->enqueued_us;
+    ++metrics->wait_count;
+    metrics->wait_sum_us += wait;
+    if (wait > metrics->wait_max_us) metrics->wait_max_us = wait;
+    unsigned bin = wait < 1000 ? 0 : wait < 5000 ? 1 : wait < 10000 ? 2
+        : wait < 20000 ? 3 : 4;
+    ++metrics->wait_bins[bin];
 }
 
 static void can_send(void *context) {
@@ -253,6 +324,9 @@ static void can_send(void *context) {
         kind == RELEASE_KEYBOARD ? KEYBOARD_HANDLE : MOUSE_HANDLE,
         report, kind == RELEASE_KEYBOARD ? 8 : 6);
     if (status != ERROR_CODE_SUCCESS) {
+        if (release) ++output_metrics[computer->slot].release_errors;
+        else ++output_metrics[computer->slot].reports[kind == RELEASE_KEYBOARD ? 0 : 1].notify_errors;
+        computer->retry_pending = true;
         if (computer->last_send_error != status) {
             printf("[output] PC%u handle=0x%04x notify failed=0x%02x; retry pending\n",
                    slot_of(computer) + 1, computer->handle, status);
@@ -261,14 +335,18 @@ static void can_send(void *context) {
         return;
     }
     computer->last_send_error = 0;
+    computer->retry_pending = false;
     ++computer->sent;
     if (kind == RELEASE_KEYBOARD) memcpy(computer->last_keyboard, report, 8);
     else memcpy(computer->last_mouse, report, 6);
     if (release) {
+        ++output_metrics[computer->slot].releases;
         computer->release_pending &= (uint8_t)~kind;
     } else if (kind == RELEASE_KEYBOARD) {
+        measure_notify(computer, event);
         pop_event(computer);
     } else {
+        measure_notify(computer, event);
         event->value.mouse.x -= dx;
         event->value.mouse.y -= dy;
         event->value.mouse.wheel -= wheel;
@@ -277,24 +355,93 @@ static void can_send(void *context) {
     }
     progress_switch();
     log_readiness(computer);
-    /* Registration may invoke us synchronously. The service timer pumps further
-       queued reports instead of recursively registering from this callback. */
+    /* ATT registration can invoke this callback synchronously. Never register
+       again on its stack; an outer bounded loop or deferred worker continues. */
+    if (low_latency && !computer->pumping) schedule_continuation(computer);
+}
+
+static bool send_work(const computer_t *computer) {
+    if (computer == NULL || !computer->occupied) return false;
+    bool input_pending = !switch_pending && slot_of(computer) == active_slot
+        && computer->count != 0 && hub_output_ready(slot_of(computer));
+    return sendable_release(computer) || input_pending;
+}
+
+static void schedule_continuation(computer_t *computer) {
+    if (!send_work(computer) || computer->send_registered
+        || computer->retry_pending || computer->yield_pending) return;
+    computer->continuation_pending = true;
+    if (continuation_registered) return;
+    continuation_registered = true;
+    btstack_run_loop_execute_on_main_thread(&pump_registration);
+}
+
+static void defer_pump(computer_t *computer) {
+    computer->yield_pending = true;
+    ++output_metrics[computer->slot].budget_yields;
+    if (pump_timer_armed) return;
+    pump_timer_armed = true;
+    btstack_run_loop_set_timer(&pump_timer, OUTPUT_PUMP_YIELD_MS);
+    btstack_run_loop_add_timer(&pump_timer);
 }
 
 static void request_send(computer_t *computer) {
-    if (computer == NULL || !computer->occupied || computer->send_registered) return;
-    bool input_pending = !switch_pending && slot_of(computer) == active_slot
-        && computer->count != 0 && hub_output_ready(slot_of(computer));
-    if (!sendable_release(computer) && !input_pending) return;
-    computer->send_registered = true;
-    uint8_t status = att_server_request_to_send_notification(
-        &computer->send_registration, computer->handle);
-    if (status != ERROR_CODE_SUCCESS) {
-        computer->send_registered = false;
-        if (computer->last_send_error != status)
-            printf("[output] PC%u send registration failed=0x%02x\n",
-                   slot_of(computer) + 1, status);
-        computer->last_send_error = status;
+    if (computer == NULL || computer->pumping || computer->send_registered
+        || (low_latency && (computer->retry_pending || computer->yield_pending))) return;
+    computer->pumping = true;
+    unsigned budget = low_latency ? OUTPUT_PUMP_BUDGET : 1u;
+    while (budget && send_work(computer)) {
+        --budget;
+        uint32_t sent_before = computer->sent;
+        computer->send_registered = true;
+        uint8_t status = att_server_request_to_send_notification(
+            &computer->send_registration, computer->handle);
+        if (status != ERROR_CODE_SUCCESS) {
+            computer->send_registered = false;
+            computer->retry_pending = true;
+            ++output_metrics[computer->slot].registration_errors;
+            if (computer->last_send_error != status)
+                printf("[output] PC%u send registration failed=0x%02x\n",
+                       slot_of(computer) + 1, status);
+            computer->last_send_error = status;
+            break;
+        }
+        if (computer->send_registered || computer->sent == sent_before || !low_latency) break;
+    }
+    computer->pumping = false;
+    if (low_latency && !budget && !computer->send_registered
+        && !computer->retry_pending && send_work(computer)) defer_pump(computer);
+}
+
+static void continue_pump(void *context) {
+    (void)context;
+    continuation_registered = false;
+    for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) {
+        computer_t *computer = &computers[i];
+        bool pending = computer->continuation_pending;
+        computer->continuation_pending = false;
+        if (low_latency && pending) request_send(computer);
+    }
+    /* base_execute_callbacks drains until empty. Budget exhaustion MUST use a
+       timer, not enqueue this callback again and monopolize the same run. */
+}
+
+static void pump_after_yield(btstack_timer_source_t *timer) {
+    (void)timer;
+    pump_timer_armed = false;
+    for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) {
+        computer_t *computer = &computers[i];
+        bool pending = computer->yield_pending;
+        computer->yield_pending = false;
+        if (low_latency && pending) request_send(computer);
+    }
+}
+
+void hub_output_set_low_latency(bool enabled) {
+    low_latency = enabled;
+    for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) {
+        if (enabled) schedule_continuation(&computers[i]);
+        else computers[i].continuation_pending = false;
     }
 }
 
@@ -319,6 +466,7 @@ bool hub_output_keyboard(const uint8_t report[8]) {
     memcpy(event->value.keyboard, report, 8);
     event->value.keyboard[1] = 0;
     ++computer->count;
+    measure_enqueue(computer, event, false);
     request_send(computer);
     return true;
 }
@@ -347,6 +495,7 @@ bool hub_output_mouse(uint8_t buttons, int32_t dx, int32_t dy, int32_t wheel) {
             event->value.mouse.x = (int32_t)x;
             event->value.mouse.y = (int32_t)y;
             event->value.mouse.wheel = (int32_t)w;
+            measure_enqueue(computer, event, true);
             request_send(computer);
             return true;
         }
@@ -360,6 +509,7 @@ bool hub_output_mouse(uint8_t buttons, int32_t dx, int32_t dy, int32_t wheel) {
     event->value.mouse.y = dy;
     event->value.mouse.wheel = wheel;
     ++computer->count;
+    measure_enqueue(computer, event, false);
     request_send(computer);
     return true;
 }
@@ -662,6 +812,9 @@ static void hci_event(uint8_t packet_type, uint16_t channel, uint8_t *packet, ui
                Quarantine until the next run-loop timer, after ALL HCI handlers
                have run, before reusing this callback's storage for a new link. */
             computer->retiring = true;
+            computer->continuation_pending = false;
+            computer->yield_pending = false;
+            computer->retry_pending = false;
             if (computer_for_slot(computer->slot) == computer)
                 slot_connections[computer->slot] = NULL;
             clear_queue(computer);
@@ -774,6 +927,7 @@ static void service(btstack_timer_source_t *timer) {
                 computer->auth_deadline = now + 1000;
             }
         }
+        computer->retry_pending = false;
         request_send(computer);
         log_readiness(computer);
     }
@@ -790,6 +944,11 @@ static void service(btstack_timer_source_t *timer) {
 void hub_output_init(void) {
     _Static_assert(HUB_COMPUTER_COUNT == 4, "This feasibility firmware has four PC slots");
     _Static_assert(sizeof(HUB_DEVICE_NAME) - 1 <= 29, "BLE scan-response name too long");
+    low_latency = continuation_registered = pump_timer_armed = false;
+    memset(output_metrics, 0, sizeof(output_metrics));
+    pump_registration.callback = continue_pump;
+    pump_registration.context = NULL;
+    btstack_run_loop_set_timer_handler(&pump_timer, pump_after_yield);
     /* BTstack otherwise stops legacy connectable advertising after one link. */
     gap_set_max_number_peripheral_connections(HUB_COMPUTER_COUNT);
     att_server_init(profile_data, read_attribute, write_attribute);
@@ -824,6 +983,59 @@ void hub_output_start(void) {
     update_advertising();
     btstack_run_loop_set_timer(&service_timer, OUTPUT_SERVICE_INTERVAL_MS);
     btstack_run_loop_add_timer(&service_timer);
+}
+
+void hub_output_latency_reset(void) {
+    memset(output_metrics, 0, sizeof(output_metrics));
+    for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) {
+        computer_t *computer = &computers[i];
+        for (unsigned n = 0; n < computer->count; ++n)
+            computer->queue[(computer->head + n) % OUTPUT_QUEUE_LENGTH].timing_valid = false;
+        if (!computer->occupied || computer->slot >= HUB_COMPUTER_COUNT) continue;
+        output_metrics_t *metrics = &output_metrics[computer->slot];
+        metrics->queue_highwater = computer->count;
+        for (unsigned kind = 0; kind < 2; ++kind)
+            metrics->reports[kind].queue_highwater = computer->queued[kind];
+    }
+    printf("[latency output] reset; queues/connections unchanged, current depths seed peaks; "
+           "pre-reset queued events excluded from timing (including later merges)\n");
+}
+
+void hub_output_latency_status(void) {
+    printf("[latency output] mode=%s service-fallback=%ums burst-budget=%u yield-timer=%ums\n",
+           low_latency ? "fast" : "baseline", OUTPUT_SERVICE_INTERVAL_MS,
+           OUTPUT_PUMP_BUDGET, OUTPUT_PUMP_YIELD_MS);
+    printf("[latency output] MCU queue-to-successful-ATT-notify us, NOT radio/end-to-end; "
+           "per-logical-PC since boot/reset across reconnects; enqueue=accepted calls incl merges; "
+           "notify=ordinary packets incl split motion; timing=one sample/notify, oldest enqueue "
+           "retained for merges/splits, excludes pre-reset events and safety releases\n");
+    printf("[latency output] wait-bins=<1ms/1..<5ms/5..<10ms/10..<20ms/>=20ms; "
+           "32-bit clock subtraction (queue age must be <~71min)\n");
+    for (unsigned slot = 0; slot < HUB_COMPUTER_COUNT; ++slot) {
+        const output_metrics_t *metrics = &output_metrics[slot];
+        const computer_t *computer = computer_for_slot(slot);
+        printf("[latency output] PC%u queued=%u peak=%u mouse-merges=%" PRIu32
+               " safety-releases=%" PRIu32 " release-errors=%" PRIu32
+               " registration-errors=%" PRIu32 " budget-yields=%" PRIu32 "\n",
+               slot + 1, computer ? computer->count : 0, metrics->queue_highwater,
+               metrics->mouse_merges, metrics->releases, metrics->release_errors,
+               metrics->registration_errors, metrics->budget_yields);
+        for (unsigned kind = 0; kind < 2; ++kind) {
+            const output_report_metrics_t *report = &metrics->reports[kind];
+            printf("[latency output] PC%u %s enqueue=%" PRIu32 " notify=%" PRIu32
+                   " queued=%u peak=%u samples=%" PRIu32 " sum-us=%" PRIu64
+                   " avg-us=%" PRIu64 " max-us=%" PRIu32
+                   " bins=%" PRIu32 "/%" PRIu32 "/%" PRIu32 "/%" PRIu32 "/%" PRIu32
+                   " notify-errors=%" PRIu32 "\n",
+                   slot + 1, kind == 0 ? "keyboard" : "mouse",
+                   report->enqueued, report->notified, computer ? computer->queued[kind] : 0,
+                   report->queue_highwater, report->wait_count, report->wait_sum_us,
+                   report->wait_count ? report->wait_sum_us / report->wait_count : UINT64_C(0),
+                   report->wait_max_us, report->wait_bins[0], report->wait_bins[1],
+                   report->wait_bins[2], report->wait_bins[3], report->wait_bins[4],
+                   report->notify_errors);
+        }
+    }
 }
 
 void hub_output_status(void) {

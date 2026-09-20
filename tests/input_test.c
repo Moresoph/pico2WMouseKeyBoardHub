@@ -83,6 +83,7 @@ void btstack_run_loop_set_timer_handler(btstack_timer_source_t *timer, void (*ha
     timer->process = handler;
 }
 bool hub_security_input_pairing_blocked(void) { return pc_pairing; }
+void hub_latency_input_report(unsigned input, bool mouse) { (void)input; (void)mouse; }
 void hub_router_input_disconnected(unsigned i) { ++released[i]; }
 void hub_router_input_connected(unsigned i) { ++ready_notifications[i]; }
 void hub_router_keyboard(unsigned i, const uint8_t report[8]) { (void)i; (void)report; ++routed_keyboard; }

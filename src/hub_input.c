@@ -3,6 +3,7 @@
 #include "hub_config.h"
 #include "hub_router.h"
 #include "hub_security.h"
+#include "hub_latency.h"
 
 #include <inttypes.h>
 #include <limits.h>
@@ -761,7 +762,7 @@ static void handle_report(input_slot_t *slot, uint8_t service,
             return;
         }
         ++slot->test_reports;
-        if (slot->test_reports == 1 || (slot->test_reports & 31u) == 0) {
+        if (slot->test_reports == 1) {
             printf("[open-test] input %u reports=%" PRIu32 " bytes=%u encryption-key=%u; bridge=%u\n",
                    slot_index(slot) + 1, slot->test_reports, length,
                    gap_encryption_key_size(slot->handle), input_forwarding_allowed(slot));
@@ -803,10 +804,12 @@ static void handle_report(input_slot_t *slot, uint8_t service,
         }
     }
     if (keyboard_present && (slot->roles & HUB_INPUT_ROLE_KEYBOARD)) {
+        hub_latency_input_report(slot_index(slot), false);
         memcpy(report->keys, keys, sizeof(keys));
         send_keyboard(slot);
     }
     if (mouse_present && (slot->roles & HUB_INPUT_ROLE_MOUSE)) {
+        hub_latency_input_report(slot_index(slot), true);
         report->buttons = buttons;
         buttons = 0;
         for (unsigned i = 0; i < slot->report_count; ++i) buttons |= slot->reports[i].buttons;
