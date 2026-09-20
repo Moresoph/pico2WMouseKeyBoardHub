@@ -476,9 +476,9 @@ static void controller_event(uint8_t packet_type, uint16_t channel,
                 hub_output_start();
                 hub_input_start();
                 cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-                printf("\nPico 2 W Bluetooth Hub 0.3.6 ready. Enter help.\n");
+                printf("\nPico 2 W Bluetooth Hub %s ready. Enter help.\n", PICO_PROGRAM_VERSION_STRING);
                 if (HUB_CLASSIC_OPEN_TEST) {
-                    printf("[open-test] EXPERIMENTAL Classic Level 0, mode 2; forwarding OFF until bridge on\n");
+                    printf("[open-test] Classic Level 0, mode 2; only saved explicit bridge authorizations restore\n");
                 }
                 printf("Pairing is closed. No input is generated automatically.\n");
                 printf("BOOTSEL: short press enrolls inputs; eight-second hold forgets inputs only.\n");
@@ -628,7 +628,7 @@ static void print_help(void) {
         "  scan ble | scan classic | scan stop\n"
         "  name <address>             Read a Classic device's Bluetooth name\n"
         "  open-test <1|2> <address>   Isolated Classic Level 0 test (test image only)\n"
-        "  bridge on|off              Opt in/out of forwarding Level 0 inputs (unencrypted)\n"
+        "  bridge on|off              Save Level 0 target + forwarding consent, or persistently disable it\n"
         "  connect <1|2> classic <AA:BB:CC:DD:EE:FF>\n"
         "  connect <1|2> ble public|random <AA:BB:CC:DD:EE:FF>\n"
         "  disconnect <1|2>\n"
@@ -783,6 +783,7 @@ static void console_command(char *line) {
     }
     unsigned long number;
     if (strcmp(args[0], "status") == 0 && argc == 1) {
+        printf("[status] firmware=%s\n", PICO_PROGRAM_VERSION_STRING);
         printf("[status] uptime-ms=%" PRIu32 " pairing=%s mode=%s keyboard-ready=%u passkey-pending=%u\n",
                btstack_run_loop_get_time_ms(),
                hub_security_pairing_open() ? "open" : "closed",

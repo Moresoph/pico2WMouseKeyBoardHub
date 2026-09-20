@@ -12,6 +12,8 @@
 
 typedef struct {
     bool classic;
+    bool insecure;
+    bool forwarding;
     uint8_t type;
     uint8_t roles;
     uint8_t address[6];
@@ -43,11 +45,12 @@ static inline void hub_input_target_encode(const hub_input_target_t *target,
     memset(data, 0, HUB_INPUT_TARGET_BYTES);
     data[0] = 'H';
     data[1] = 'I';
-    data[2] = 1;
+    data[2] = target->insecure ? 2 : 1;
     data[3] = target->classic ? 1 : 2;
     data[4] = target->type;
     data[5] = target->roles;
     memcpy(data + 6, target->address, 6);
+    if (target->insecure) data[12] = 1u | (target->forwarding ? 2u : 0u);
     uint16_t crc = hub_input_target_crc(data, 14);
     data[14] = (uint8_t)crc;
     data[15] = (uint8_t)(crc >> 8);
@@ -56,11 +59,15 @@ static inline void hub_input_target_encode(const hub_input_target_t *target,
 static inline bool hub_input_target_decode(const uint8_t *data, unsigned length,
                                             hub_input_target_t *target) {
     if (length != HUB_INPUT_TARGET_BYTES || data[0] != 'H' || data[1] != 'I' ||
-        data[2] != 1 || (data[3] != 1 && data[3] != 2) || data[12] || data[13] ||
+        (data[2] != 1 && data[2] != 2) || (data[3] != 1 && data[3] != 2) || data[13] ||
+        (data[2] == 1 && data[12]) ||
+        (data[2] == 2 && (data[3] != 1 || (data[12] != 1 && data[12] != 3))) ||
         !data[5] || (data[5] & ~HUB_INPUT_ROLE_BOTH) ||
         hub_input_target_crc(data, 14) != ((uint16_t)data[14] | ((uint16_t)data[15] << 8)) ||
         !hub_input_stable_address(data[3] == 1, data[4], data + 6)) return false;
     target->classic = data[3] == 1;
+    target->insecure = data[2] == 2;
+    target->forwarding = target->insecure && (data[12] & 2u);
     target->type = data[4];
     target->roles = data[5];
     memcpy(target->address, data + 6, 6);

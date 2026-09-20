@@ -14,8 +14,10 @@
 
 static uint32_t clock_ms;
 static bool pc_pairing, fail_write, fail_delete;
+static unsigned flash_writes;
 static unsigned connects, disconnects, pairing_requests, scan_starts, inquiry_starts;
 static unsigned incoming_accepts, incoming_declines;
+static unsigned connect_cancels;
 static uint8_t connected_type;
 static bd_addr_t connected_address;
 static uint8_t flash_records[2][HUB_INPUT_TARGET_BYTES + 1u];
@@ -56,6 +58,7 @@ static int flash_store(void *context, uint32_t tag, const uint8_t *data, uint32_
     assert(tag >= INPUT_TARGET_TAG && tag < INPUT_TARGET_TAG + 2);
     assert(length <= sizeof(flash_records[0]));
     if (fail_write) return -1;
+    ++flash_writes;
     unsigned i = tag - INPUT_TARGET_TAG;
     memcpy(flash_records[i], data, length);
     flash_lengths[i] = length;
@@ -150,7 +153,7 @@ uint8_t gap_connect(const bd_addr_t address, bd_addr_type_t type) {
     memcpy(connected_address, address, 6);
     return 0;
 }
-uint8_t gap_connect_cancel(void) { return 0; }
+uint8_t gap_connect_cancel(void) { ++connect_cancels; return 0; }
 uint8_t gap_disconnect(hci_con_handle_t handle) { (void)handle; ++disconnects; return 0; }
 void gap_set_scan_parameters(uint8_t type, uint16_t interval, uint16_t window) {
     assert(type == 1); (void)interval; (void)window;
@@ -201,8 +204,10 @@ static void reset_fixture(void) {
     }
     clock_ms = 100;
     pc_pairing = fail_write = fail_delete = false;
+    flash_writes = 0;
     connects = disconnects = pairing_requests = scan_starts = inquiry_starts = 0;
     incoming_accepts = incoming_declines = 0;
+    connect_cancels = 0;
     input_started = enrollment_active = enrollment_pending = false;
     establishing = pending_candidate = -1;
     forgetting = candidate_count = 0;
@@ -243,6 +248,7 @@ static void test_records_and_policy(void) {
     hub_input_target_encode(&in, data);
     assert(hub_input_target_decode(data, sizeof(data), &out));
     assert(out.roles == 3 && out.type == 1 && !memcmp(in.address, out.address, 6));
+    assert(!out.insecure && !out.forwarding);
     for (unsigned i = 0; i < sizeof(data); ++i) {
         data[i] ^= 1;
         assert(!hub_input_target_decode(data, sizeof(data), &out));
@@ -274,6 +280,20 @@ static void test_records_and_policy(void) {
     assert(hub_input_enrollment_permitted(true, UINT32_MAX - 4, 10, false));
     assert(!hub_input_enrollment_permitted(true, 10, 10, false));
     assert(!hub_input_enrollment_permitted(true, 1, 10, true));
+
+    hub_input_target_t open = {
+        .classic = true, .insecure = true, .forwarding = true, .type = 0, .roles = 1,
+        .address = {0, 0x18, 0, 1, 2, 3}
+    };
+    hub_input_target_encode(&open, data);
+    assert(data[2] == 2 && data[12] == 3);
+    assert(hub_input_target_decode(data, sizeof(data), &out) && out.insecure && out.forwarding);
+    open.forwarding = false;
+    hub_input_target_encode(&open, data);
+    assert(hub_input_target_decode(data, sizeof(data), &out) && out.insecure && !out.forwarding);
+    open.classic = false;
+    hub_input_target_encode(&open, data);
+    assert(!hub_input_target_decode(data, sizeof(data), &out));
 }
 
 static void test_empty_boot_and_window(void) {
@@ -316,7 +336,7 @@ static void test_boot_privacy_and_backoff(void) {
     inputs[0].retries = INPUT_RETRIES;
     close_input(&inputs[0], ERROR_CODE_CONNECTION_TIMEOUT, true);
     finish_close(&inputs[0], clock_ms);
-    assert(inputs[0].deadline == clock_ms + INPUT_SLOW_RETRY_MS && inputs[0].stored);
+    assert(inputs[0].deadline == clock_ms + INPUT_RETRY_MAX_MS && inputs[0].stored);
     le_db[0].key = false;
     assert(!start_connection(&inputs[0]) && inputs[0].auth_failed && !inputs[0].pairing_authorized);
     assert(flash_lengths[0] && flash_lengths[1] && classic_key_present[1]);
@@ -620,6 +640,119 @@ static void test_ready_notification_once(void) {
     }
 }
 
+static void test_reconnect_intervals_and_cancellation(void) {
+    assert(retry_delay(0) == 1000);
+    assert(retry_delay(1) == 2000);
+    assert(retry_delay(2) == 4000);
+    for (unsigned retries = 3; retries <= 255; ++retries) {
+        assert(retry_delay((uint8_t)retries) == 5000);
+    }
+    reset_fixture();
+    seed_target(0, false, 1, 1, 1);
+    hub_input_start();
+    tick(1000);
+    input_slot_t *slot = &inputs[0];
+    assert(slot->deadline == clock_ms + INPUT_RECONNECT_ATTEMPT_MS);
+    tick(INPUT_RECONNECT_ATTEMPT_MS - 1);
+    assert(!connect_cancels && connects == 1);
+    tick(1);
+    assert(connect_cancels == 1 && slot->state == INPUT_CLOSING && establishing == 0);
+    tick(5000);
+    assert(connect_cancels == 1 && connects == 1); /* Await controller cancellation completion. */
+    uint8_t cancelled[36] = {
+        HCI_EVENT_META_GAP, 34, GAP_SUBEVENT_LE_CONNECTION_COMPLETE,
+        ERROR_CODE_UNKNOWN_CONNECTION_IDENTIFIER
+    };
+    input_hci_event(HCI_EVENT_PACKET, 0, cancelled, sizeof(cancelled));
+    tick(0);
+    assert(establishing == -1 && slot->state == INPUT_RETRY);
+    uint32_t next = slot->deadline;
+    clock_ms = next - 1u;
+    tick(0);
+    assert(connects == 1);
+    tick(1);
+    assert(connects == 2 && slot->state == INPUT_CONNECTING && !slot->pairing_authorized);
+
+    close_input(slot, ERROR_CODE_CONNECTION_TIMEOUT, true);
+    finish_disconnect(slot);
+    slot->retries = 255;
+    clock_ms = UINT32_MAX - 100u;
+    close_input(slot, ERROR_CODE_CONNECTION_TIMEOUT, true);
+    finish_close(slot, clock_ms);
+    assert(slot->deadline == clock_ms + 5000u);
+    tick(4999);
+    assert(slot->state == INPUT_RETRY);
+    tick(1);
+    assert(slot->state == INPUT_CONNECTING);
+}
+
+static void test_transient_security_failure_retries_but_key_loss_stops(void) {
+    const uint8_t transient[] = {
+        ERROR_CODE_CONNECTION_TIMEOUT,
+        ERROR_CODE_REMOTE_USER_TERMINATED_CONNECTION,
+        ERROR_CODE_CONNECTION_TERMINATED_BY_LOCAL_HOST
+    };
+    for (unsigned i = 0; i < sizeof(transient); ++i) {
+        reset_fixture();
+        seed_target(0, false, 1, 1, 1);
+        seed_target(1, true, 0, 2, 2);
+        hub_input_start();
+        input_slot_t *slot = &inputs[0];
+        slot->handle = 0;
+        slot->state = INPUT_SECURITY;
+        inputs[1].state = INPUT_READY;
+        inputs[1].handle = 1;
+        uint8_t event[12] = {SM_EVENT_REENCRYPTION_COMPLETE, 10};
+        event[11] = transient[i];
+        input_sm_event(HCI_EVENT_PACKET, 0, event, sizeof(event));
+        assert(slot->state == INPUT_CLOSING && slot->retry_allowed && !slot->auth_failed);
+        finish_disconnect(slot);
+        assert(slot->state == INPUT_RETRY && (uint32_t)(slot->deadline - clock_ms) <= 5000u);
+        assert(inputs[1].state == INPUT_READY && !released[1]);
+        assert(le_db[0].key && classic_key_present[1]);
+    }
+    reset_fixture();
+    seed_target(0, false, 1, 1, 1);
+    hub_input_start();
+    inputs[0].handle = 0;
+    inputs[0].state = INPUT_SECURITY;
+    uint8_t event[12] = {SM_EVENT_REENCRYPTION_COMPLETE, 10};
+    event[11] = ERROR_CODE_PIN_OR_KEY_MISSING;
+    input_sm_event(HCI_EVENT_PACKET, 0, event, sizeof(event));
+    assert(inputs[0].auth_failed && !inputs[0].retry_allowed);
+    event[11] = ERROR_CODE_REMOTE_USER_TERMINATED_CONNECTION;
+    input_sm_event(HCI_EVENT_PACKET, 0, event, sizeof(event));
+    assert(inputs[0].auth_failed && !inputs[0].retry_allowed);
+    finish_disconnect(&inputs[0]);
+    assert(inputs[0].state == INPUT_FAILED && le_db[0].key && flash_lengths[0]);
+}
+
+static void test_manual_pause_does_not_auto_resume(void) {
+    reset_fixture();
+    seed_target(0, false, 1, 1, 1);
+    hub_input_start();
+    hub_input_disconnect(0);
+    tick(100);
+    tick(60000);
+    assert(inputs[0].paused && inputs[0].state == INPUT_FAILED && connects == 0);
+    assert(flash_lengths[0] && le_db[0].key);
+}
+
+static void test_secure_image_does_not_activate_saved_open_input(void) {
+    reset_fixture();
+    hub_input_target_t open = {
+        .classic = true, .insecure = true, .forwarding = true, .type = 0, .roles = 1,
+        .address = {0, 0x18, 0, 1, 2, 3}
+    };
+    hub_input_target_encode(&open, flash_records[1]);
+    flash_lengths[1] = HUB_INPUT_TARGET_BYTES;
+    hub_input_start();
+    tick(60000);
+    assert(!hub_input_open_bridge_enabled() && !connects);
+    assert(inputs[1].stored && inputs[1].paused && inputs[1].state == INPUT_FAILED);
+    assert(flash_lengths[1] == HUB_INPUT_TARGET_BYTES);
+}
+
 int main(void) {
     test_records_and_policy();
     test_empty_boot_and_window();
@@ -633,6 +766,10 @@ int main(void) {
     test_composite_role_choice();
     test_only_connectable_discoverable_ble_candidates();
     test_ready_notification_once();
-    puts("input tests: 12 groups passed (production state machine and SDK HID parser)");
+    test_reconnect_intervals_and_cancellation();
+    test_transient_security_failure_retries_but_key_loss_stops();
+    test_manual_pause_does_not_auto_resume();
+    test_secure_image_does_not_activate_saved_open_input();
+    puts("input tests: 16 groups passed (production state machine and SDK HID parser)");
     return 0;
 }

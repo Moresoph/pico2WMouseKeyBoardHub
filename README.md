@@ -19,6 +19,41 @@ all six links.** Controller connection failures and disconnect reasons are
 reported over USB serial. A successful build alone does not prove radio
 capacity, computer compatibility, or switching latency.
 
+## Working milestone: 0.4.0 (2026-09-20)
+
+The current hardware setup has demonstrated a Classic Level 0 keyboard and a
+bonded BLE mouse controlling either of two encrypted BLE HID computer
+connections. Both computers stayed connected while the user switched keyboard
+and mouse input to computer 2 and back to computer 1 using the hotkeys.
+
+| Capability | Current milestone |
+| --- | --- |
+| Real keyboard and mouse forwarding | Working on both enrolled computers |
+| `Ctrl+Alt+Right` / `Ctrl+Alt+Left` | Next / previous ready computer; release the chord after each switch |
+| Persistent configuration | Input identity/authorization, reserved PC identities, and selected PC |
+| Reconnection | Known inputs retry with 1/2/4/5-second capped backoff; device wake-up can still be needed |
+| Simultaneous hardware links | Four demonstrated: two inputs and two computers |
+| Four computers / six total links | Still pending hardware confirmation |
+
+To reproduce this **specific working configuration**, build with:
+
+```powershell
+.\tools\build.ps1 -OpenClassicInputTest
+```
+
+The firmware reports `0.4.0-open-test`. The optional build mode still intentionally
+allows an **unencrypted, unauthenticated keyboard-to-Pico link**; it is not a
+security-hardened release. BLE mouse/computer connections retain encryption.
+The default build without that switch keeps the stricter Classic input policy
+and does not activate saved Level 0 inputs. No manufacturer-specific branch is
+needed for the demonstrated setup.
+
+The working firmware artifact has SHA256
+`148CF9116134D96A900B1B10343C542DBA52BD6451A06C866743B2CB0D11A487`.
+Build timestamps/tool environment may change this hash on a later rebuild.
+Binary backups, pairing keys, captured device logs, and downloaded toolchains are
+kept out of Git. Further feature/performance work should build on this checkpoint.
+
 ## Build on Windows
 
 The target is `pico2_w`, not `pico_w` or the non-wireless Pico 2.
@@ -67,15 +102,19 @@ Existing bonds are never erased; a pre-existing bond to the target causes the
 experiment to refuse, since that would not test a fresh unauthenticated connection.
 
 The test bypasses the application's encrypted/bonded-target prerequisite.
-It defaults to **not forwarding test reports** and does not save an input
-target. `HID-ready` plus increasing `reports=` proves the HID data path is open;
+For a newly selected target it defaults to **not forwarding test reports** and
+does not save the target until `bridge on` explicitly authorizes it.
+`HID-ready` plus increasing `reports=` proves the HID data path is open;
 `encryption-key=0` additionally establishes that it is unencrypted. `saved=0`
-is intentional in this experiment. If the peer initiates automatic pairing,
+before authorization is intentional. If the peer initiates automatic pairing,
 the SDK can still receive a key; this is distinct from saving an input target.
 
-Automatic input enrollment and automatic Classic reconnect are disabled in this
-image. New PC enrollment is initially disabled. An already saved BLE mouse
-remains configured.
+Automatic input enrollment is disabled in this image. An explicitly selected
+Level 0 input that has reached HID-ready can reconnect automatically during the
+same Pico uptime, with the same address and security policy. It is not enrolled
+again and no PIN is guessed. Once `bridge on` has saved the target, it also
+reconnects automatically after Pico power loss. New PC enrollment is initially disabled. An already
+saved BLE mouse remains configured.
 `diag` records outgoing authentication requests and both directions of L2CAP
 connection requests/responses, so a peer's security refusal can be distinguished
 from a locally initiated requirement.
@@ -94,7 +133,10 @@ pair keyboard
 ```
 
 `bridge on` permits only the explicitly connected Level 0 input(s) to use normal
-HID parsing/routing, and allows PC enrollment in this experimental image.
+HID parsing/routing, and allows PC enrollment in this experimental image. Since
+0.4.0 this command also saves each ready Level 0 target and its forwarding
+authorization, with a versioned CRC-checked record. A previously saved mouse
+record is retained without re-pairing.
 The keyboard-to-Pico radio link remains unencrypted and unauthenticated; an
 encrypted PC link does not make the entire path secure.
 
@@ -105,10 +147,55 @@ until computer pairing finishes and all physical keys/buttons are released.
 
 `bridge off` disables forwarding of Level 0 inputs, releases their logical state,
 and closes any active PC enrollment window. Normal authenticated input devices
-are unaffected. The opt-in is RAM-only, off after reboot, and reset when a new
-Level 0 connection is requested. The unbonded keyboard target is still not
-persisted: after reboot repeat `open-test`, then `bridge on`. This stage is a
-session-based bridge experiment, not the final persistent-input configuration.
+are unaffected. The disabled setting is also saved: after reboot the known
+keyboard reconnects but cannot forward until you re-enable it. A new Level 0
+device never inherits a different device's permission. Use `input forget N` to
+remove its saved target and permission without touching mouse or computer bonds.
+
+Persistence does not create a cryptographic bond for a Level 0 keyboard:
+`saved=1` means its address and your authorization were saved, not that its
+wireless link is encrypted. A normal build without `-OpenClassicInputTest`
+retains but refuses to activate such records. Corrupt records or failed writes
+are reported and do not enable routing. If disabling permission cannot be
+persisted, it is disabled for the current uptime but the console explicitly
+warns that reboot state is uncertain; recover storage before relying on it.
+
+## Power-on recovery after initial setup
+
+After one successful enrollment/authorization, keep devices on their original
+Bluetooth channels. On startup the Pico loads saved mouse/keyboard targets,
+reconnects them, restores their individual forwarding permissions, and advertises
+for the bonded computers to reconnect. No new `connect`, `bridge on`, or pairing
+command is needed on each normal boot.
+
+Computer slots are reserved by the bonded computer identity, not by which one
+connects first. The last explicitly selected computer is saved. If it is offline,
+ordinary input waits rather than going to another computer; `Ctrl+Alt+Right/Left`
+can explicitly select another ready slot. Encrypted identity resolution must
+complete before a computer is allowed to receive input.
+After successful bonded encryption, a redundant re-encryption-start notification
+does not revoke an already verified, still-encrypted connection with the same
+stored identity. Fresh pairing, encryption loss, identity changes and reported
+authentication failures still suspend/reject routing. This avoids leaving a
+reconnected PC permanently waiting for a second completion event.
+Four slot identities and the selection are stored together in a CRC-protected
+`PHO1` record, independently of input authorization and Bluetooth bond keys.
+Writes occur only when claiming a slot or changing selection, not on every
+reconnect or input report. An unreadable/corrupt record or failed write locks
+output instead of assigning an arbitrary new computer to the old selected slot.
+Such a storage fault requires deliberate record maintenance; an input reset
+does not repair or erase computer identities.
+
+For upgrades from pre-0.4 firmware, existing BLE/Classic bond keys and bonded
+input records are kept. Reconnect and run `bridge on` once for a previously
+RAM-only Level 0 keyboard. Existing bonded PCs acquire stable slots when they
+first reconnect successfully to the new firmware. Do not erase/re-pair devices
+merely to upgrade this configuration.
+
+Recovery is not instantaneous and cannot wake every device remotely: sleeping
+keyboards/mice may need a key press or movement, and PCs must have Bluetooth
+enabled and permit reconnection. Keys held during connection are suppressed
+until released, so pairing or wake-up keystrokes are not replayed.
 
 ## Connect and flash the board
 
@@ -246,6 +333,49 @@ or disconnect the computers and is not the same as forgetting a saved input.
 It pauses that input's automatic reconnect until the next reboot or an explicit
 manual reconnect. Temporary radio loss otherwise triggers bond-only retries.
 
+### Reconnection after power-off or sleep
+
+Firmware 0.3.7 uses retry backoff of **1, 2, 4, then at most 5 seconds**, continuing
+until the known device returns or the operator pauses/removes it. After a
+successful connection the backoff resets. Attempts are serialized and alternate
+between due input slots so an absent device does not monopolize initiation.
+
+An automatic BLE connection attempt has a five-second budget; a failed attempt
+must be cancelled and completed by the controller before another begins.
+The backoff cap does **not** promise end-to-end recovery within five seconds:
+radio link-loss detection, an in-flight connection/cancellation, encryption,
+HID discovery, and another device's connection attempt take additional time.
+First-time enrollment/PIN entry keeps its longer deadline.
+
+Bonded inputs reconnect with their saved identity and key, including BLE
+privacy identities. Transient disconnects/timeouts during encryption are retried
+without deleting keys or silently authorizing new pairing. Missing keys or
+explicit authentication rejection stop automatic retries and require operator
+action. PC pairing/enrollment deliberately pauses new input connection attempts;
+existing working keyboard, mouse, and PC links are not reset for a retry.
+
+The Level 0 keyboard follows the same capped retry backoff after it has been
+explicitly selected and become ready. In 0.4.0, `bridge on` also persists its
+target and permission for the next Pico boot.
+Manual `disconnect` remains a pause, not a transient failure, so it does not
+immediately reconnect against the operator's request.
+
+The pinned Pico SDK 2.3.1 BTstack build includes a small reconnect overlay in
+`patches\btstack`, applied by `cmake\HubBtstackReconnect.cmake` to a generated
+copy of `hci.c` under `build\generated\btstack`. It leaves `.deps\pico-sdk`
+unmodified. The overlay reuses a pending central connection when an enhanced
+completion reports the same identity as a plain public/static-random address,
+and releases pending direct-connection state after terminal failures. Otherwise
+an orphaned pending context can cause subsequent `gap_connect` calls to return
+`0x0c` indefinitely. Explicit cancellation and internal privacy-list restart
+remain distinct; established keyboard/PC connections are not freed.
+
+The overlay checks the SDK version, canonical source hash, and unique source
+anchors. Updating SDK/BTstack requires reviewing this overlay; it fails the build
+rather than silently applying to a different source revision. Its tests exercise
+the generated production handler and original GAP connection APIs, with
+controller transport/allocation/event delivery mocked.
+
 ## Replacing a mouse or keyboard
 
 No reflash or full factory reset is needed:
@@ -264,6 +394,9 @@ assigned as devices connect, so do not assume that slot 1 is always the keyboard
 
 **Input reset deletes only the selected input identities and their corresponding
 input bonds. It does not erase firmware or clear computer pairing records.**
+For an unbonded Level 0 input, it deletes only the saved target/forwarding
+authorization, not any unrelated Classic keys. Automatic enrollment remains
+disabled in the Level 0 build; use `open-test` and `bridge on` for a replacement.
 Computer Bluetooth links are not intentionally disconnected. Input state is
 released safely; release any held physical keys/buttons before continuing.
 Fast LED blinking during a long hold indicates that a reset request was accepted;
@@ -310,8 +443,10 @@ Bluetooth Security Manager's I/O capability setting is global.
 
 Each computer needs encryption and both report subscriptions before showing
 `ready=1` and `notify(k/m)=1/1`. Paired-but-disconnected computers do not count.
-Computer slots are allocated on connection arrival, not persisted names;
-inspect `status` after reconnection or restart.
+Computer slots are fixed to authenticated bonded identities when first
+registered. They remain reserved while offline and survive Pico restart;
+reconnection order does not change the selected destination. Inspect `status`
+for saved/offline slot identities.
 
 ### Console-only pairing and isolated output diagnostics
 
@@ -449,6 +584,7 @@ for identifying a discovered endpoint, independent of its manufacturer.
 | --- | --- |
 | `src\main.c` | USB console, pairing authorization, HCI connection diagnostics |
 | `src\hub_output.c`, `src\hub.gatt` | Four separate BLE HID computer contexts |
+| `src\hub_output_store.c` | Atomic identity-slot and selected-computer persistence |
 | `src\hub_input.c` | Two Classic/BLE input peers and HID report parsing |
 | `src\hub_router.c` | Input aggregation, hotkeys, release/suppression rules |
 | `src\hub_passkey.c` | Local six-digit pairing-code entry, never normal HID output |

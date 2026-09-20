@@ -1,0 +1,93 @@
+include_guard(GLOBAL)
+
+# Pico SDK 2.3.1 / BTstack eb0bb8b5ea6d234ccb940313b47f7a5c3b4e20ec.
+# Check normalized text so Git's CRLF checkout setting does not change the pin.
+function(hub_hci_find_once text needle result)
+    string(FIND "${text}" "${needle}" position)
+    if(position LESS 0)
+        message(FATAL_ERROR "Pinned BTstack overlay anchor missing: ${needle}")
+    endif()
+    string(LENGTH "${needle}" needle_length)
+    math(EXPR after "${position} + ${needle_length}")
+    string(SUBSTRING "${text}" ${after} -1 tail)
+    string(FIND "${tail}" "${needle}" duplicate)
+    if(NOT duplicate EQUAL -1)
+        message(FATAL_ERROR "Pinned BTstack overlay anchor is ambiguous: ${needle}")
+    endif()
+    set(${result} ${position} PARENT_SCOPE)
+endfunction()
+
+function(hub_hci_extract text begin end result)
+    hub_hci_find_once("${text}" "${begin}" first)
+    hub_hci_find_once("${text}" "${end}" last)
+    if(NOT last GREATER first)
+        message(FATAL_ERROR "Pinned BTstack overlay anchors are out of order")
+    endif()
+    math(EXPR length "${last} - ${first}")
+    string(SUBSTRING "${text}" ${first} ${length} region)
+    set(${result} "${region}" PARENT_SCOPE)
+endfunction()
+
+function(hub_generate_patched_hci original output)
+    file(READ "${original}" source)
+    string(REPLACE "\r\n" "\n" source "${source}")
+    string(SHA256 source_hash "${source}")
+    if(NOT source_hash STREQUAL "a9cabb8713943c0d7d4bd9fe2442828b6d88dab5bf9282d81e072be5b11ee4df")
+        message(FATAL_ERROR
+            "BTstack hci.c differs from pinned eb0bb8b5ea6d234ccb940313b47f7a5c3b4e20ec; "
+            "review the reconnect overlay before updating SDK (SHA256 ${source_hash})")
+    endif()
+
+    set(patches "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../patches/btstack")
+    file(READ "${patches}/le_connection_failure.inc" failure)
+    file(READ "${patches}/le_identity_complete.inc" identity)
+    string(REPLACE "\r\n" "\n" failure "${failure}")
+    string(REPLACE "\r\n" "\n" identity "${identity}")
+    hub_hci_extract("${source}"
+        "// handle cancelled outgoing connection\n"
+        "// emit GAP_SUBEVENT_LE_CONNECTION_COMPLETE for:\n\t        // - outgoing error not caused by connection cancel"
+        old_failure)
+    string(REPLACE "${old_failure}" "${failure}\n        " source "${source}")
+
+    set(identity_anchor "        // if an identity addresses was used without enhanced connection complete event,\n")
+    hub_hci_find_once("${source}" "${identity_anchor}" unused)
+    string(REPLACE "${identity_anchor}" "${identity}\n${identity_anchor}" source "${source}")
+
+    # configure_file avoids recompiling hci.c on every configure when unchanged.
+    get_filename_component(output_directory "${output}" DIRECTORY)
+    file(MAKE_DIRECTORY "${output_directory}")
+    set(HUB_PATCHED_HCI_SOURCE "${source}")
+    configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/hci.c.in" "${output}" @ONLY)
+    if(NOT CMAKE_SCRIPT_MODE_FILE)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${original}" "${patches}/le_connection_failure.inc" "${patches}/le_identity_complete.inc")
+    endif()
+endfunction()
+
+function(hub_patch_btstack_reconnect)
+    if(NOT PICO_SDK_VERSION_STRING STREQUAL "2.3.1")
+        message(FATAL_ERROR "The BTstack reconnect overlay requires Pico SDK 2.3.1")
+    endif()
+    if(NOT TARGET pico_btstack_base)
+        message(FATAL_ERROR "Call hub_patch_btstack_reconnect after pico_sdk_init()")
+    endif()
+    get_target_property(sources pico_btstack_base INTERFACE_SOURCES)
+    set(original "${PICO_BTSTACK_PATH}/src/hci.c")
+    set(matches 0)
+    foreach(source IN LISTS sources)
+        if(source STREQUAL original)
+            math(EXPR matches "${matches} + 1")
+        endif()
+    endforeach()
+    if(NOT matches EQUAL 1)
+        message(FATAL_ERROR "Expected exactly one ${original} in pico_btstack_base INTERFACE_SOURCES; got ${matches}")
+    endif()
+
+    set(patched "${CMAKE_CURRENT_BINARY_DIR}/generated/btstack/hci.c")
+    hub_generate_patched_hci("${original}" "${patched}")
+    list(FIND sources "${original}" source_index)
+    list(REMOVE_AT sources ${source_index})
+    list(INSERT sources ${source_index} "${patched}")
+    set_property(TARGET pico_btstack_base PROPERTY INTERFACE_SOURCES "${sources}")
+    message(STATUS "BTstack reconnect overlay: ${patched} (vendored SDK unchanged)")
+endfunction()

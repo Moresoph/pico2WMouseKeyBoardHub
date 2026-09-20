@@ -25,10 +25,11 @@
 #define INPUT_REPORTS 16u
 #define INPUT_SERVICES 3u
 #define INPUT_CONNECT_MS 20000u
+#define INPUT_RECONNECT_ATTEMPT_MS 5000u
 #define INPUT_DISCOVERY_MS 30000u
 #define INPUT_SCAN_MS 15000u
 #define INPUT_RETRIES 3u
-#define INPUT_SLOW_RETRY_MS 30000u
+#define INPUT_RETRY_MAX_MS 5000u
 #define INPUT_ENROLL_SCAN_MS 4000u
 #define INPUT_CANDIDATES 12u
 #define INPUT_SCAN_PEERS 16u
@@ -81,6 +82,7 @@ typedef struct {
     bool storage_error;
     bool bond_address_valid;
     bool open_test;
+    bool forwarding_authorized;
     uint32_t test_reports;
     uint8_t bond_address_type;
     bd_addr_t bond_address;
@@ -116,6 +118,7 @@ static btstack_timer_source_t input_timer;
 static bool input_started;
 static bool open_bridge_enabled;
 static int establishing = -1;
+static unsigned next_retry_slot;
 static enum { SCAN_OFF, SCAN_CLASSIC, SCAN_LE, SCAN_CLASSIC_STOPPING } scanning;
 static uint32_t scan_deadline;
 static bool classic_inquiry_active;
@@ -157,6 +160,15 @@ static unsigned slot_index(const input_slot_t *slot) {
 
 static bool expired(uint32_t now, uint32_t deadline) {
     return (int32_t)(now - deadline) >= 0;
+}
+
+static uint32_t retry_delay(uint8_t retries) {
+    return retries < INPUT_RETRIES ? (1000u << retries) : INPUT_RETRY_MAX_MS;
+}
+
+static bool authentication_rejected(uint8_t status) {
+    return status == ERROR_CODE_AUTHENTICATION_FAILURE || status == ERROR_CODE_PIN_OR_KEY_MISSING
+        || status == ERROR_CODE_PAIRING_NOT_ALLOWED || status == ERROR_CODE_INSUFFICIENT_SECURITY;
 }
 
 static input_slot_t *slot_for_handle(hci_con_handle_t handle) {
@@ -201,6 +213,20 @@ static void reset_slot(input_slot_t *slot) {
     slot->last_auth_status = 0xff;
     slot->last_hid_status = 0xff;
     slot->last_disconnect_reason = 0xff;
+}
+
+static void refresh_open_bridge(void) {
+    open_bridge_enabled = false;
+    if (!HUB_CLASSIC_OPEN_TEST) return;
+    for (unsigned i = 0; i < HUB_INPUT_COUNT; ++i) {
+        open_bridge_enabled |= inputs[i].selected && inputs[i].open_test
+            && inputs[i].forwarding_authorized && !inputs[i].storage_error;
+    }
+}
+
+static bool input_forwarding_allowed(const input_slot_t *slot) {
+    return !slot->open_test || (HUB_CLASSIC_OPEN_TEST && open_bridge_enabled
+        && slot->forwarding_authorized && !slot->storage_error);
 }
 
 static bool enrollment_permitted(void) {
@@ -317,6 +343,37 @@ static bool capture_identity(input_slot_t *slot, int index) {
     return true;
 }
 
+static bool store_target(input_slot_t *slot, const hub_input_target_t *target) {
+    if (!input_tlv) {
+        printf("[input %u] NOT saved: persistent TLV unavailable\n", slot_index(slot) + 1);
+        return false;
+    }
+    uint8_t record[HUB_INPUT_TARGET_BYTES], readback[HUB_INPUT_TARGET_BYTES];
+    hub_input_target_encode(target, record);
+    hub_input_target_t decoded;
+    if (!hub_input_target_decode(record, sizeof(record), &decoded)) {
+        printf("[input %u] refusing invalid target record\n", slot_index(slot) + 1);
+        return false;
+    }
+    uint32_t tag = INPUT_TARGET_TAG + slot_index(slot);
+    int length = input_tlv->get_tag(input_tlv_context, tag, readback, sizeof(readback));
+    if (length == (int)sizeof(record) && memcmp(record, readback, sizeof(record)) == 0) {
+        slot->stored = true;
+        return true;
+    }
+    int status = input_tlv->store_tag(input_tlv_context, tag, record, sizeof(record));
+    length = input_tlv->get_tag(input_tlv_context, tag, readback, sizeof(readback));
+    if (status || length != (int)sizeof(record) || memcmp(record, readback, sizeof(record))) {
+        printf("[input %u] target write/readback FAILED: status=%d length=%d; enrollment stopped\n",
+               slot_index(slot) + 1, status, length);
+        slot->storage_error = true;
+        corrupt_target[slot_index(slot)] = true;
+        return false;
+    }
+    slot->stored = true;
+    return true;
+}
+
 static bool save_target(input_slot_t *slot) {
     if (!capture_identity(slot, slot->classic ? -1 : sm_le_device_index(slot->handle)) ||
         !target_has_bond(slot)) {
@@ -335,27 +392,11 @@ static bool save_target(input_slot_t *slot) {
         }
     }
     if (slot->stored) return true;
-    if (!input_tlv) {
-        printf("[input %u] NOT saved: persistent TLV unavailable\n", slot_index(slot) + 1);
-        return false;
-    }
     hub_input_target_t target = {
         .classic = slot->classic, .type = slot->identity_type, .roles = slot->roles
     };
     memcpy(target.address, slot->identity, 6);
-    uint8_t record[HUB_INPUT_TARGET_BYTES], readback[HUB_INPUT_TARGET_BYTES];
-    hub_input_target_encode(&target, record);
-    uint32_t tag = INPUT_TARGET_TAG + slot_index(slot);
-    int status = input_tlv->store_tag(input_tlv_context, tag, record, sizeof(record));
-    int length = input_tlv->get_tag(input_tlv_context, tag, readback, sizeof(readback));
-    if (status || length != (int)sizeof(record) || memcmp(record, readback, sizeof(record))) {
-        printf("[input %u] target write/readback FAILED: status=%d length=%d; enrollment stopped\n",
-               slot_index(slot) + 1, status, length);
-        slot->storage_error = true;
-        corrupt_target[slot_index(slot)] = true;
-        return false;
-    }
-    slot->stored = true;
+    if (!store_target(slot, &target)) return false;
     printf("[input %u] saved %s identity %s type=%u roles=%u (bond retained by SDK)\n",
            slot_index(slot) + 1, slot->classic ? "Classic" : "BLE",
            bd_addr_to_str(slot->identity), slot->identity_type, slot->roles);
@@ -391,6 +432,8 @@ static void load_targets(void) {
         slot->selected = true;
         slot->stored = true;
         slot->classic = target.classic;
+        slot->open_test = target.insecure;
+        slot->forwarding_authorized = target.forwarding && HUB_CLASSIC_OPEN_TEST;
         slot->roles = target.roles;
         slot->identity_valid = true;
         slot->identity_type = target.type;
@@ -401,16 +444,25 @@ static void load_targets(void) {
         slot->retry_allowed = true;
         slot->state = INPUT_RETRY;
         slot->deadline = btstack_run_loop_get_time_ms() + 500u + i * 250u;
-        printf("[input %u] loaded %s target %s roles=%u; boot reconnect is bond-only\n",
-               i + 1, target.classic ? "Classic" : "BLE", bd_addr_to_str(target.address), target.roles);
+        if (target.insecure && !HUB_CLASSIC_OPEN_TEST) {
+            slot->paused = true;
+            slot->retry_allowed = false;
+            slot->state = INPUT_FAILED;
+            printf("[input %u] saved Level 0 target disabled in secure-only firmware; record retained\n", i + 1);
+        }
+        printf("[input %u] loaded %s target %s roles=%u policy=%s forward=%u\n",
+               i + 1, target.classic ? "Classic" : "BLE", bd_addr_to_str(target.address), target.roles,
+               target.insecure ? "explicit Level 0 (NO authentication)" : "bond-only",
+               !target.insecure || slot->forwarding_authorized);
     }
+    refresh_open_bridge();
 }
 
 static void close_input(input_slot_t *slot, uint8_t error, bool retry) {
     slot->last_error = error;
     slot->pairing_authorized = false;
-    slot->retry_allowed = retry && !slot->open_test && (slot->ever_ready || slot->stored) &&
-                          !slot->auth_failed && !slot->paused;
+    slot->retry_allowed = retry && (slot->ever_ready || slot->stored) &&
+                          !slot->auth_failed && !slot->paused && !slot->remove;
     if (slot->candidate && !slot->stored && !slot->storage_error) slot->remove = true;
     slot->state = INPUT_CLOSING;
     release_input(slot);
@@ -418,7 +470,7 @@ static void close_input(input_slot_t *slot, uint8_t error, bool retry) {
 
 static void input_error(input_slot_t *slot, const char *operation, uint8_t error) {
     printf("[input %u] %s failed: status=0x%02x\n", slot_index(slot) + 1, operation, error);
-    close_input(slot, error, slot->stored);
+    close_input(slot, error, slot->stored || slot->ever_ready);
 }
 
 static input_report_t *find_report(input_slot_t *slot, uint8_t service, uint16_t id,
@@ -658,14 +710,14 @@ static void input_ready(input_slot_t *slot) {
     slot->retries = 0;
     slot->last_error = 0;
     if (establishing == (int)slot_index(slot)) establishing = -1;
-    if (!slot->open_test || open_bridge_enabled) hub_router_input_connected(slot_index(slot));
+    if (input_forwarding_allowed(slot)) hub_router_input_connected(slot_index(slot));
     printf("[input %u] HID ready: %s handle=0x%04x cid=0x%04x descriptors=%u bytes\n",
            slot_index(slot) + 1, slot->classic ? "Classic" : "BLE",
            slot->handle, slot->cid, slot->descriptor_used);
     if (slot->open_test) {
-        printf("[open-test] input %u HID ready, encryption-key=%u, no target saved, forwarding %s\n",
+        printf("[open-test] input %u HID ready, encryption-key=%u, saved-target=%u forwarding %s\n",
                slot_index(slot) + 1, gap_encryption_key_size(slot->handle),
-               open_bridge_enabled ? "ON (explicit opt-in)" : "OFF");
+               slot->stored, input_forwarding_allowed(slot) ? "ON (explicit opt-in)" : "OFF");
     }
     if (enrollment_active && saved_input_count() == HUB_INPUT_COUNT
         && reserved_roles(NULL) == HUB_INPUT_ROLE_BOTH) {
@@ -712,9 +764,9 @@ static void handle_report(input_slot_t *slot, uint8_t service,
         if (slot->test_reports == 1 || (slot->test_reports & 31u) == 0) {
             printf("[open-test] input %u reports=%" PRIu32 " bytes=%u encryption-key=%u; bridge=%u\n",
                    slot_index(slot) + 1, slot->test_reports, length,
-                   gap_encryption_key_size(slot->handle), open_bridge_enabled);
+                   gap_encryption_key_size(slot->handle), input_forwarding_allowed(slot));
         }
-        if (!open_bridge_enabled) return;
+        if (!input_forwarding_allowed(slot)) return;
     }
     const input_descriptor_t *descriptor = &slot->descriptors[service];
     input_report_t *report = NULL;
@@ -845,8 +897,10 @@ static bool start_connection(input_slot_t *slot) {
     slot->security_complete = false;
     memset(slot->descriptors, 0, sizeof(slot->descriptors));
     establishing = (int)slot_index(slot);
-    slot->deadline = btstack_run_loop_get_time_ms() +
-                     ((slot->classic && slot->pairing_authorized) ? HUB_PAIRING_WINDOW_MS : INPUT_CONNECT_MS);
+    uint32_t attempt_ms = !slot->classic && !slot->pairing_authorized
+        ? INPUT_RECONNECT_ATTEMPT_MS : INPUT_CONNECT_MS;
+    if (slot->classic && slot->pairing_authorized) attempt_ms = HUB_PAIRING_WINDOW_MS;
+    slot->deadline = btstack_run_loop_get_time_ms() + attempt_ms;
     uint8_t status = slot->classic ?
         hid_host_connect(slot->address, HID_PROTOCOL_MODE_REPORT, &slot->cid) :
         gap_connect(slot->address, (bd_addr_type_t)slot->address_type);
@@ -874,6 +928,14 @@ static bool delete_target(input_slot_t *slot) {
     if (input_tlv->get_tag(input_tlv_context, INPUT_TARGET_TAG + index, NULL, 0) != 0) {
         printf("[input %u] FORGET FAILED: target deletion did not persist; bonds retained\n", index + 1);
         return false;
+    }
+    if (slot->open_test) {
+        slot->stored = false;
+        slot->forwarding_authorized = false;
+        refresh_open_bridge();
+        corrupt_target[index] = false;
+        printf("[input %u] Level 0 target and forwarding consent forgotten; no bond keys touched\n", index + 1);
+        return true;
     }
     if (slot->classic) {
         gap_drop_link_key_for_bd_addr(slot->identity_valid ? slot->identity : slot->address);
@@ -914,13 +976,13 @@ static void finish_close(input_slot_t *slot, uint32_t now) {
     } else if (slot->remove) {
         printf("[input %u] removed\n", slot_index(slot) + 1);
         reset_slot(slot);
+        refresh_open_bridge();
     } else if (slot->retry_allowed && !slot->auth_failed) {
         slot->state = INPUT_RETRY;
-        slot->deadline = now + (slot->retries < INPUT_RETRIES ?
-                         (1000u << slot->retries) : INPUT_SLOW_RETRY_MS);
-        printf("[input %u] bond-only reconnect in %" PRIu32 " ms%s\n",
-               slot_index(slot) + 1, slot->deadline - now,
-               slot->retries < INPUT_RETRIES ? "" : " (ongoing slow retry)");
+        slot->deadline = now + retry_delay(slot->retries);
+        printf("[input %u] %s reconnect in %" PRIu32 " ms (backoff cap=%u ms)\n",
+               slot_index(slot) + 1, slot->open_test ? "authorized Level 0" : "bond-only",
+               slot->deadline - now, INPUT_RETRY_MAX_MS);
     } else {
         slot->state = INPUT_FAILED;
         printf("[input %u] stopped; saved identity/keys retained; explicit connect or input forget to recover\n",
@@ -968,12 +1030,19 @@ static void input_tick(btstack_timer_source_t *timer) {
              * completion callback; disconnect an arriving ACL before use.
              */
         }
-        if (slot->state == INPUT_RETRY && expired(now, slot->deadline) &&
-            establishing < 0 && scanning == SCAN_OFF && !hub_security_input_pairing_blocked() &&
-            !(HUB_CLASSIC_OPEN_TEST && slot->classic) &&
-            !enrollment_active && !enrollment_pending && !forgetting && !any_closing()) {
+    }
+    if (establishing < 0 && scanning == SCAN_OFF && !hub_security_input_pairing_blocked()
+        && !enrollment_active && !enrollment_pending && !forgetting && !any_closing()) {
+        /* One radio initiation at a time; a missing mouse must not starve the keyboard. */
+        for (unsigned distance = 0; distance < HUB_INPUT_COUNT; ++distance) {
+            unsigned index = (next_retry_slot + distance) % HUB_INPUT_COUNT;
+            input_slot_t *slot = &inputs[index];
+            if (!slot->selected || slot->state != INPUT_RETRY || !expired(now, slot->deadline)
+                || (HUB_CLASSIC_OPEN_TEST && slot->classic && !slot->open_test)) continue;
+            next_retry_slot = (index + 1u) % HUB_INPUT_COUNT;
             if (slot->retries < INPUT_RETRIES) ++slot->retries;
             start_connection(slot);
+            break;
         }
     }
     enrollment_tick(now);
@@ -1033,8 +1102,7 @@ static void input_hid_event(uint8_t packet_type, uint16_t channel,
             if (status) {
                 slot->cid = 0;
                 close_input(slot, status, slot->retry_allowed);
-                if (status == ERROR_CODE_AUTHENTICATION_FAILURE ||
-                    status == ERROR_CODE_PIN_OR_KEY_MISSING) slot->auth_failed = true;
+                if (authentication_rejected(status)) slot->auth_failed = true;
             } else {
                 slot->handle = hid_subevent_connection_opened_get_con_handle(packet);
                 if (slot->state != INPUT_CLOSING) {
@@ -1430,7 +1498,7 @@ static void input_hci_event(uint8_t packet_type, uint16_t channel,
             printf("[input %u] Classic authentication status=0x%02x\n", slot_index(slot) + 1, status);
             slot->pairing_authorized = false;
             if (status) {
-                slot->auth_failed = true;
+                slot->auth_failed |= authentication_rejected(status);
                 input_error(slot, "Classic authentication", status);
             } else {
                 slot->security_complete = true;
@@ -1443,8 +1511,8 @@ static void input_hci_event(uint8_t packet_type, uint16_t channel,
             if (!slot) break;
             status = hci_event_encryption_change_get_status(packet);
             if (status || !hci_event_encryption_change_get_encryption_enabled(packet)) {
-                slot->auth_failed = true;
-                input_error(slot, "link encryption", status ? status : ERROR_CODE_AUTHENTICATION_FAILURE);
+                slot->auth_failed |= authentication_rejected(status);
+                input_error(slot, "link encryption", status ? status : ERROR_CODE_CONNECTION_TIMEOUT);
             } else {
                 if (slot->classic) slot->security_complete = true;
                 else discover_le(slot);
@@ -1512,7 +1580,7 @@ static void input_sm_event(uint8_t packet_type, uint16_t channel,
                    slot_index(slot) + 1, status, sm_event_pairing_complete_get_reason(packet));
             slot->pairing_authorized = false;
             if (status) {
-                slot->auth_failed = true;
+                slot->auth_failed |= authentication_rejected(status);
                 input_error(slot, "LE pairing", status);
             } else {
                 slot->security_complete = true;
@@ -1527,7 +1595,7 @@ static void input_sm_event(uint8_t packet_type, uint16_t channel,
             printf("[input %u] LE bond re-encryption status=0x%02x\n", slot_index(slot) + 1, status);
             if (status) {
                 // Do not delete bonds or trigger endless pairing after key loss.
-                slot->auth_failed = true;
+                slot->auth_failed |= authentication_rejected(status);
                 input_error(slot, "LE bond re-encryption (reauthorize explicitly)", status);
             } else {
                 slot->pairing_authorized = false;
@@ -1542,6 +1610,7 @@ static void input_sm_event(uint8_t packet_type, uint16_t channel,
 
 void hub_input_init(void) {
     open_bridge_enabled = false;
+    next_retry_slot = 0;
     for (unsigned i = 0; i < HUB_INPUT_COUNT; ++i) reset_slot(&inputs[i]);
     hid_host_init(classic_descriptors, sizeof(classic_descriptors));
     hid_host_register_packet_handler(input_hid_event);
@@ -1798,7 +1867,7 @@ static bool connect_input(unsigned index, bool classic, uint8_t address_type,
         return false;
     }
     input_slot_t *slot = &inputs[index];
-    if (open_test && slot->stored) {
+    if (open_test && slot->stored && !slot->open_test) {
         printf("[open-test] choose an empty input slot; saved targets are not replaced\n");
         return false;
     }
@@ -1817,7 +1886,7 @@ static bool connect_input(unsigned index, bool classic, uint8_t address_type,
         printf("[input %u] connect rejected: busy/not ready; stop scan or disconnect existing slot first\n", index + 1);
         return false;
     }
-    if (slot->stored && (slot->classic != classic ||
+    if (slot->stored && (slot->classic != classic || slot->open_test != open_test ||
         !(((slot->address_type & 1u) == address_type && !memcmp(slot->address, address, 6)) ||
           (slot->identity_type == address_type && !memcmp(slot->identity, address, 6))))) {
         printf("[input %u] connect rejected: forget the saved target before replacing it\n", index + 1);
@@ -1837,9 +1906,7 @@ static bool connect_input(unsigned index, bool classic, uint8_t address_type,
         }
     }
     bool stored = slot->stored;
-    if (open_test && open_bridge_enabled) {
-        hub_input_set_open_bridge(false);
-    }
+    bool forwarding = slot->forwarding_authorized;
     hub_input_target_t target = {
         .classic = slot->classic, .type = slot->identity_type, .roles = slot->roles
     };
@@ -1857,6 +1924,8 @@ static bool connect_input(unsigned index, bool classic, uint8_t address_type,
         memcpy(slot->identity, target.address, 6);
         slot->roles = target.roles;
         slot->ever_ready = true;
+        slot->retry_allowed = true;
+        slot->forwarding_authorized = forwarding;
     }
     slot->open_test = open_test;
     slot->pairing_authorized = !open_test;
@@ -1868,6 +1937,7 @@ static bool connect_input(unsigned index, bool classic, uint8_t address_type,
         }
         printf("[open-test] local Classic Level 0; no PIN will be supplied and reports will not be forwarded\n");
     }
+    refresh_open_bridge();
     return start_connection(slot);
 }
 
@@ -1905,16 +1975,46 @@ bool hub_input_set_open_bridge(bool enabled) {
             return false;
         }
     }
-    if (enabled == open_bridge_enabled) return true;
-    open_bridge_enabled = enabled;
+    bool success = true;
     for (unsigned i = 0; i < HUB_INPUT_COUNT; ++i) {
-        if (!inputs[i].selected || !inputs[i].open_test) continue;
-        if (enabled && inputs[i].state == INPUT_READY) hub_router_input_connected(i);
-        else hub_router_input_disconnected(i);
+        input_slot_t *slot = &inputs[i];
+        if (!slot->selected || !slot->open_test) continue;
+        if (enabled && slot->state != INPUT_READY) continue;
+        if (enabled && slot->storage_error) {
+            printf("[bridge] input %u storage error; forwarding remains disabled\n", i + 1);
+            success = false;
+            continue;
+        }
+        if (slot->stored || enabled) {
+            hub_input_target_t target = {
+                .classic = true, .insecure = true, .forwarding = enabled,
+                .type = 0, .roles = slot->roles
+            };
+            memcpy(target.address, slot->identity_valid ? slot->identity : slot->address, 6);
+            /* Remember the explicitly chosen identity even if Flash fails, so
+               input-only forget can safely clear this record without guessing. */
+            memcpy(slot->identity, target.address, 6);
+            slot->identity_type = 0;
+            slot->identity_valid = true;
+            if (!store_target(slot, &target)) {
+                slot->forwarding_authorized = false;
+                hub_router_input_disconnected(i);
+                printf("[bridge] input %u policy persistence FAILED; disabled now, reboot state not guaranteed\n", i + 1);
+                success = false;
+                continue;
+            }
+        }
+        bool changed = slot->forwarding_authorized != enabled;
+        slot->forwarding_authorized = enabled;
+        if (changed) {
+            if (enabled) hub_router_input_connected(i);
+            else hub_router_input_disconnected(i);
+        }
     }
-    printf("[bridge] unauthenticated-input forwarding %s; keyboard radio link remains unencrypted\n",
-           enabled ? "ON by explicit operator choice" : "OFF");
-    return true;
+    refresh_open_bridge();
+    printf("[bridge] forwarding=%u persist-result=%s; Level 0 authorization is saved, link remains unencrypted\n",
+           open_bridge_enabled, success ? "OK" : "FAILED");
+    return success;
 }
 
 void hub_input_disconnect(unsigned index) {
@@ -1965,7 +2065,7 @@ bool hub_input_allow_pairing(uint16_t handle) {
 bool hub_input_keyboard_ready(void) {
     for (unsigned i = 0; i < HUB_INPUT_COUNT; ++i) {
         input_slot_t *slot = &inputs[i];
-        if (!slot->selected || slot->remove || (slot->open_test && !open_bridge_enabled)
+        if (!slot->selected || slot->remove || !input_forwarding_allowed(slot)
             || slot->state != INPUT_READY) continue;
         for (unsigned j = 0; j < slot->report_count; ++j) {
             if (slot->reports[j].keyboard && (slot->roles & HUB_INPUT_ROLE_KEYBOARD)) return true;
@@ -1986,6 +2086,8 @@ void hub_input_status(void) {
     printf("[input] scan=%u establishing-slot=%d (0=none) targets=persistent enrollment=%s forgetting=%u\n",
            (unsigned)scanning, establishing + 1,
            enrollment_active ? "active" : enrollment_pending ? "deferred" : "closed", forgetting);
+    printf("[input] reconnect-backoff-max=%u ms BLE-reconnect-attempt=%u ms\n",
+           INPUT_RETRY_MAX_MS, INPUT_RECONNECT_ATTEMPT_MS);
     for (unsigned i = 0; i < HUB_INPUT_COUNT; ++i) {
         input_slot_t *slot = &inputs[i];
         if (!slot->selected) {
@@ -2009,10 +2111,10 @@ void hub_input_status(void) {
                i + 1, slot->last_auth_status, slot->last_hid_status,
                slot->last_disconnect_reason, slot->security_complete, slot->hid_validated);
         if (slot->open_test) {
-            printf("[open-test] input %u reports=%" PRIu32 " encryption-key=%u forwarding=%s saved-target=0\n",
+            printf("[open-test] input %u reports=%" PRIu32 " encryption-key=%u forwarding=%s saved-target=%u\n",
                    i + 1, slot->test_reports, slot->handle == HCI_CON_HANDLE_INVALID
                        ? 0 : gap_encryption_key_size(slot->handle),
-                   open_bridge_enabled ? "ON" : "OFF");
+                   input_forwarding_allowed(slot) ? "ON" : "OFF", slot->stored);
         }
     }
 }

@@ -17,6 +17,7 @@ typedef struct {
 static input_state_t inputs[HUB_INPUT_COUNT];
 static bool suppressed;
 static bool stopped;
+static bool switch_chord_blocked;
 
 static bool all_released(void) {
     for (unsigned i = 0; i < HUB_INPUT_COUNT; ++i) {
@@ -105,9 +106,11 @@ void hub_router_init(void) {
     }
     suppressed = false;
     stopped = false;
+    switch_chord_blocked = false;
 }
 
 void hub_router_poll(void) {
+    if (all_released()) switch_chord_blocked = false;
     if (!stopped && suppressed && !hub_output_switching()
         && !hub_security_capture_active() && hub_output_ready(hub_output_active_slot())
         && all_released()) {
@@ -144,7 +147,10 @@ void hub_router_keyboard(unsigned input, const uint8_t report[8]) {
         inputs[input].keyboard_armed = neutral;
         return;
     }
-    if (should_suppress()) return;
+    if (stopped || hub_security_capture_active() || hub_output_switching()) {
+        should_suppress();
+        return;
+    }
 
     uint8_t merged[8];
     if (!combined_keyboard(merged)) {
@@ -155,7 +161,9 @@ void hub_router_keyboard(unsigned input, const uint8_t report[8]) {
     bool ctrl_alt = (merged[0] & 0x11u) && (merged[0] & 0x44u);
     bool right = has_key(merged, 0x4f);
     bool left = has_key(merged, 0x50);
-    if (ctrl_alt && (right || left)) {
+    if (ctrl_alt && (right || left) && !switch_chord_blocked
+        && (!suppressed || !hub_output_ready(hub_output_active_slot()))) {
+        switch_chord_blocked = true;
         /* Modifier presses may already have reached the old computer. */
         if (right == left || !switch_relative(right ? 1 : -1)) {
             suppress_with_release("switch chord consumed");
@@ -164,6 +172,7 @@ void hub_router_keyboard(unsigned input, const uint8_t report[8]) {
         }
         return;
     }
+    if (should_suppress()) return;
     if (!hub_output_keyboard(merged)) {
         suppress_with_release("keyboard output unavailable");
     }

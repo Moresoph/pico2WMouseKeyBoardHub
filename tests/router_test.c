@@ -330,6 +330,24 @@ static void test_pairing_still_accepts_new_keyboard_before_normal_routing_is_arm
     assert(captured_reports == 1);
 }
 
+static void test_switch_from_saved_offline_computer(void) {
+    reset();
+    ready[0] = false;
+    ready[2] = true;
+    keyboard(0, 0, 4);
+    assert(keyboard_count == 0);
+    keyboard(0, 0, 0);
+    keyboard(0, 5, 0);
+    keyboard(0, 5, 0x4f);
+    assert(select_count == 1 && pending == 2 && switching);
+    keyboard(0, 5, 0x4f);
+    assert(select_count == 1 && keyboard_count == 0);
+    finish_switch();
+    keyboard(0, 0, 0);
+    keyboard(0, 0, 5);
+    assert(keyboard_count == 1 && last_keyboard[2] == 5);
+}
+
 int main(void) {
     test_normal_input();
     test_independent_sources();
@@ -348,6 +366,7 @@ int main(void) {
     test_input_first_does_not_replay_or_repeat_errors();
     test_new_input_requires_neutral_without_leaking_to_other_source();
     test_pairing_still_accepts_new_keyboard_before_normal_routing_is_armed();
+    test_switch_from_saved_offline_computer();
     puts("All router tests passed.");
     return 0;
 }

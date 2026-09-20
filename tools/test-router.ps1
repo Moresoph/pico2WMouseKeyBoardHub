@@ -69,3 +69,6 @@ $output = Join-Path $outputDirectory 'hub_security_policy_tests.exe'
 if ($LASTEXITCODE -ne 0) { throw "Security profile compilation failed: $LASTEXITCODE" }
 & $output
 if ($LASTEXITCODE -ne 0) { throw "Security profile tests failed: $LASTEXITCODE" }
+
+& (Join-Path $root 'tests\test-hci-reconnect.ps1') -SdkPath $SdkPath
+& (Join-Path $root 'tests\test-output.ps1') -SdkPath $SdkPath

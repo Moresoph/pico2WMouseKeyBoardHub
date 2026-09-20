@@ -5,6 +5,7 @@
 #include "btstack.h"
 #include "hub_config.h"
 #include "hub_output.h"
+#include "hub_output_store.h"
 #include "hub_router.h"
 #include "hub_security.h"
 #include "hub.h"
@@ -57,7 +58,11 @@ typedef struct {
 
 typedef struct {
     bool occupied;
+    bool retiring;
     bool disconnecting;
+    bool rejected;
+    bool authentication_complete;
+    bool identity_authenticated;
     bool suspended;
     bool send_registered;
     bool ready_logged;
@@ -78,10 +83,15 @@ typedef struct {
     output_event_t queue[OUTPUT_QUEUE_LENGTH];
     unsigned head;
     unsigned count;
+    unsigned slot;
     btstack_context_callback_registration_t send_registration;
 } computer_t;
 
+/* Physical contexts never move, including while their registration is queued in
+   ATT. Persistent logical slots point at contexts only after bond verification. */
 static computer_t computers[HUB_COMPUTER_COUNT];
+static computer_t *slot_connections[HUB_COMPUTER_COUNT];
+static hub_output_store_t output_store;
 static btstack_packet_callback_registration_t hci_registration;
 static btstack_packet_callback_registration_t sm_registration;
 static btstack_timer_source_t service_timer;
@@ -98,7 +108,11 @@ static void request_send(computer_t *computer);
 static void progress_switch(void);
 
 static unsigned slot_of(const computer_t *computer) {
-    return (unsigned)(computer - computers);
+    return computer->slot;
+}
+
+static computer_t *computer_for_slot(unsigned slot) {
+    return slot < HUB_COMPUTER_COUNT ? slot_connections[slot] : NULL;
 }
 
 static computer_t *computer_for_handle(hci_con_handle_t handle) {
@@ -109,7 +123,10 @@ static computer_t *computer_for_handle(hci_con_handle_t handle) {
 }
 
 static bool secure(const computer_t *computer) {
-    return computer->occupied && !computer->disconnecting
+    return computer != NULL && computer->occupied && !computer->disconnecting
+        && !computer->rejected && computer->identity_authenticated
+        && output_store.loaded && !output_store.fault
+        && computer_for_slot(computer->slot) == computer
         && gap_encryption_key_size(computer->handle) >= 16;
 }
 
@@ -119,8 +136,8 @@ static bool transport_ready(const computer_t *computer) {
 }
 
 bool hub_output_ready(unsigned slot) {
-    return slot < HUB_COMPUTER_COUNT && transport_ready(&computers[slot])
-        && computers[slot].release_pending == 0;
+    computer_t *computer = computer_for_slot(slot);
+    return transport_ready(computer) && computer->release_pending == 0;
 }
 
 unsigned hub_output_active_slot(void) {
@@ -138,6 +155,7 @@ static void clear_queue(computer_t *computer) {
 }
 
 static void require_release(computer_t *computer) {
+    if (computer == NULL) return;
     clear_queue(computer);
     /* No new input is accepted until both releases finish. Preserve partial
        progress when the router repeats release_all during congestion. */
@@ -155,6 +173,7 @@ static void active_readiness_lost(const computer_t *computer, const char *reason
 }
 
 static void log_readiness(computer_t *computer) {
+    if (computer->slot >= HUB_COMPUTER_COUNT) return;
     bool ready = hub_output_ready(slot_of(computer));
     if (ready == computer->ready_logged) return;
     computer->ready_logged = ready;
@@ -167,8 +186,8 @@ static void log_readiness(computer_t *computer) {
 
 static void progress_switch(void) {
     if (!switch_pending) return;
-    computer_t *old = &computers[switch_old_slot];
-    bool same_link = old->occupied && old->handle == switch_old_handle;
+    computer_t *old = computer_for_slot(switch_old_slot);
+    bool same_link = old != NULL && old->occupied && old->handle == switch_old_handle;
     if (same_link && old->release_pending != 0 && transport_ready(old)) return;
     if (same_link && old->release_pending != 0) {
         printf("[output] switch: PC%u cannot receive both releases "
@@ -263,7 +282,7 @@ static void can_send(void *context) {
 }
 
 static void request_send(computer_t *computer) {
-    if (!computer->occupied || computer->send_registered) return;
+    if (computer == NULL || !computer->occupied || computer->send_registered) return;
     bool input_pending = !switch_pending && slot_of(computer) == active_slot
         && computer->count != 0 && hub_output_ready(slot_of(computer));
     if (!sendable_release(computer) && !input_pending) return;
@@ -291,7 +310,7 @@ static bool queue_overflow(computer_t *computer, const char *reason) {
 }
 
 bool hub_output_keyboard(const uint8_t report[8]) {
-    computer_t *computer = &computers[active_slot];
+    computer_t *computer = computer_for_slot(active_slot);
     if (report == NULL || switch_pending || !hub_output_ready(active_slot)) return false;
     if (computer->count == OUTPUT_QUEUE_LENGTH) return queue_overflow(computer, "keyboard");
     unsigned tail = (computer->head + computer->count) % OUTPUT_QUEUE_LENGTH;
@@ -313,7 +332,7 @@ static bool bounded_motion(int64_t x, int64_t y, int64_t wheel) {
 }
 
 bool hub_output_mouse(uint8_t buttons, int32_t dx, int32_t dy, int32_t wheel) {
-    computer_t *computer = &computers[active_slot];
+    computer_t *computer = computer_for_slot(active_slot);
     if (switch_pending || !hub_output_ready(active_slot)) return false;
     buttons &= 0x1f;
     if (!bounded_motion(dx, dy, wheel)) return queue_overflow(computer, "excessive mouse delta");
@@ -351,6 +370,11 @@ void hub_output_release_all(void) {
     progress_switch();
 }
 
+static void storage_fault(void) {
+    for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) require_release(&computers[i]);
+    hub_router_release_all();
+}
+
 bool hub_output_select(unsigned slot) {
     if (slot >= HUB_COMPUTER_COUNT || !hub_output_ready(slot)) {
         printf("[output] PC%u unavailable; selection stays PC%u\n", slot + 1, active_slot + 1);
@@ -361,15 +385,22 @@ bool hub_output_select(unsigned slot) {
         return false;
     }
     if (slot == active_slot) return true;
+    /* Commit once, before acknowledging selection. A later timer only drains
+       releases; it must neither rewrite flash nor choose another target. */
+    if (!hub_output_store_select(&output_store, slot)) {
+        storage_fault();
+        printf("[output] selection rejected: persistent storage unavailable\n");
+        return false;
+    }
     switch_old_slot = active_slot;
     switch_target_slot = slot;
-    computer_t *old = &computers[active_slot];
-    switch_old_handle = old->occupied ? old->handle : HCI_CON_HANDLE_INVALID;
+    computer_t *old = computer_for_slot(active_slot);
+    switch_old_handle = old != NULL ? old->handle : HCI_CON_HANDLE_INVALID;
     switch_pending = true;
     switch_wait_log = btstack_run_loop_get_time_ms() + 5000;
     printf("[output] switching PC%u -> PC%u; discarding unsent old input, releasing old PC\n",
            active_slot + 1, slot + 1);
-    clear_queue(&computers[slot]);
+    clear_queue(computer_for_slot(slot));
     require_release(old);
     request_send(old);
     progress_switch();
@@ -377,7 +408,8 @@ bool hub_output_select(unsigned slot) {
 }
 
 static uint8_t access_error(const computer_t *computer) {
-    if (computer == NULL) return ATT_ERROR_INSUFFICIENT_AUTHORIZATION;
+    if (computer == NULL || computer->rejected || computer->disconnecting)
+        return ATT_ERROR_INSUFFICIENT_AUTHORIZATION;
     uint8_t key_size = gap_encryption_key_size(computer->handle);
     if (key_size == 0) return ATT_ERROR_INSUFFICIENT_ENCRYPTION;
     if (key_size < 16) return ATT_ERROR_INSUFFICIENT_ENCRYPTION_KEY_SIZE;
@@ -437,17 +469,18 @@ static int write_attribute(hci_con_handle_t handle, uint16_t attribute, uint16_t
         if (value > 1) return ATT_ERROR_VALUE_NOT_ALLOWED;
         if (attribute == KEYBOARD_CCCD) computer->keyboard_cccd = value;
         else computer->mouse_cccd = value;
-        printf("[output] PC%u handle=0x%04x %s notifications=%u\n",
-               slot_of(computer) + 1, handle, attribute == KEYBOARD_CCCD ? "keyboard" : "mouse", value);
+        printf("[output] handle=0x%04x %s notifications=%u (identity-bound=%u)\n",
+               handle, attribute == KEYBOARD_CCCD ? "keyboard" : "mouse", value,
+               computer->identity_authenticated);
     } else if (attribute == LED_HANDLE) {
         if (size != 1) return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
         computer->leds = buffer[0] & 0x1f;
-        printf("[output] PC%u keyboard LEDs=0x%02x\n", slot_of(computer) + 1, computer->leds);
+        printf("[output] handle=0x%04x keyboard LEDs=0x%02x\n", handle, computer->leds);
     } else if (attribute == ATT_CHARACTERISTIC_2A4C_01_VALUE_HANDLE) {
         if (size != 1) return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
         if (buffer[0] > 1) return ATT_ERROR_VALUE_NOT_ALLOWED;
         computer->suspended = buffer[0] == 0;
-        printf("[output] PC%u suspend=%u\n", slot_of(computer) + 1, computer->suspended);
+        printf("[output] handle=0x%04x suspend=%u\n", handle, computer->suspended);
     } else {
         return ATT_ERROR_WRITE_NOT_PERMITTED;
     }
@@ -484,13 +517,13 @@ static void connected(uint8_t *packet) {
     if (computer_for_handle(handle) != NULL) return;
     computer_t *computer = NULL;
     for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) {
-        if (!computers[i].occupied) {
+        if (!computers[i].occupied && !computers[i].retiring) {
             computer = &computers[i];
             break;
         }
     }
     if (computer == NULL) {
-        printf("[output] excess LE-peripheral handle=0x%04x rejected: four PC slots occupied\n",
+        printf("[output] excess LE-peripheral handle=0x%04x rejected: connection contexts full\n",
                handle);
         gap_disconnect(handle);
         update_advertising();
@@ -498,32 +531,109 @@ static void connected(uint8_t *packet) {
     }
     memset(computer, 0, sizeof(*computer));
     computer->occupied = true;
+    computer->slot = HUB_COMPUTER_COUNT;
     computer->handle = handle;
+    computer->release_pending = RELEASE_BOTH;
     computer->address_type = gap_subevent_le_connection_complete_get_peer_address_type(packet);
     gap_subevent_le_connection_complete_get_peer_address(packet, computer->address);
     computer->auth_deadline = btstack_run_loop_get_time_ms() + OUTPUT_AUTH_TIMEOUT_MS;
     computer->send_registration.callback = can_send;
     computer->send_registration.context = computer;
-    printf("[output] PC%u connected address=%s type=%u role=LE-peripheral handle=0x%04x "
+    printf("[output] provisional connected address=%s type=%u role=LE-peripheral handle=0x%04x "
            "pairing-window=%u gate=%u; requesting security, NOT yet ready\n",
-           slot_of(computer) + 1, bd_addr_to_str(computer->address), computer->address_type,
+           bd_addr_to_str(computer->address), computer->address_type,
            handle, hub_security_pairing_open(), hub_security_allow_pairing(handle));
     sm_request_pairing(handle);
     update_advertising();
 }
 
+static void reject_computer(computer_t *computer, const char *reason) {
+    printf("[output] handle=0x%04x rejected: %s; saved slots unchanged\n",
+           computer->handle, reason);
+    computer->rejected = true;
+    computer->identity_authenticated = false;
+    require_release(computer);
+    active_readiness_lost(computer, reason);
+    uint8_t status = gap_disconnect(computer->handle);
+    computer->disconnecting = status == ERROR_CODE_SUCCESS;
+    computer->auth_deadline = btstack_run_loop_get_time_ms() + 1000;
+    if (status) printf("[output] rejection disconnect failed=0x%02x; retry pending\n", status);
+}
+
+static bool authenticated_identity_unchanged(const computer_t *computer) {
+    if (!secure(computer) || !computer->authentication_complete) return false;
+    int index = sm_le_device_index(computer->handle);
+    if (index < 0 || index >= le_device_db_max_count()) return false;
+    int type = -1, key_size = 0;
+    bd_addr_t identity = {0};
+    le_device_db_info(index, &type, identity, NULL);
+    le_device_db_encryption_get(index, NULL, NULL, NULL, &key_size, NULL, NULL, NULL);
+    return type >= 0 && type <= 1 && key_size >= 16
+        && hub_output_store_find(&output_store, (uint8_t)type, identity) == (int)computer->slot;
+}
+
+static void bind_identity(computer_t *computer) {
+    if (computer->identity_authenticated || computer->rejected || computer->disconnecting
+        || !computer->authentication_complete || computer->key_size < 16
+        || !output_store.loaded || output_store.fault) return;
+    int index = sm_le_device_index(computer->handle);
+    if (index < 0 || index >= le_device_db_max_count()) return;
+    int type = -1, bond_key_size = 0;
+    bd_addr_t identity = {0};
+    le_device_db_info(index, &type, identity, NULL);
+    /* Query only this peripheral link's resolved bond, never enumerate the DB
+       shared with central inputs. No keys are copied or logged. Just Works bonds
+       may be non-MITM: authentication here means proof of their 128-bit LTK. */
+    le_device_db_encryption_get(index, NULL, NULL, NULL, &bond_key_size, NULL, NULL, NULL);
+    if (bond_key_size < 16 || type < 0 || type > 1
+        || !hub_output_identity_valid((uint8_t)type, identity)) return;
+    int slot = hub_output_store_find(&output_store, (uint8_t)type, identity);
+    if (computer->slot < HUB_COMPUTER_COUNT && slot != (int)computer->slot) {
+        reject_computer(computer, "bond identity changed within connection");
+        return;
+    }
+    if (slot >= 0 && slot_connections[slot] != NULL && slot_connections[slot] != computer) {
+        reject_computer(computer, "duplicate connected computer identity");
+        return;
+    }
+    if (slot < 0) {
+        slot = hub_output_store_claim(&output_store, (uint8_t)type, identity);
+        if (slot < 0) {
+            if (output_store.fault) storage_fault();
+            reject_computer(computer, output_store.fault ? "identity persistence failed"
+                                                        : "all four identities reserved");
+            return;
+        }
+    }
+    computer->slot = (unsigned)slot;
+    slot_connections[slot] = computer;
+    computer->identity_authenticated = true;
+    require_release(computer);
+    printf("[output] PC%u bound handle=0x%04x identity=%s type=%d bond-index=%d "
+           "selected=%u; connection CCCDs retained, neutral reports required\n",
+           computer->slot + 1, computer->handle, bd_addr_to_str(identity), type, index,
+           computer->slot == active_slot);
+}
+
 static void refresh_security(computer_t *computer) {
     uint8_t key_size = gap_encryption_key_size(computer->handle);
-    if (key_size == computer->key_size) return;
-    printf("[output] PC%u handle=0x%04x encryption key-size=%u\n",
-           slot_of(computer) + 1, computer->handle, key_size);
+    if (key_size == computer->key_size) {
+        /* Identity resolution and bond storage may finish after encryption and
+           after ATT restores/writes CCCDs. Preserve those per-link writes. */
+        bind_identity(computer);
+        return;
+    }
+    printf("[output] handle=0x%04x encryption key-size=%u\n", computer->handle, key_size);
     bool lost_security = computer->key_size >= 16 && key_size < 16;
     computer->key_size = key_size;
     if (lost_security) {
+        computer->authentication_complete = false;
+        computer->identity_authenticated = false;
         require_release(computer);
         computer->auth_deadline = btstack_run_loop_get_time_ms() + OUTPUT_AUTH_TIMEOUT_MS;
         active_readiness_lost(computer, "lost encryption");
     }
+    bind_identity(computer);
     progress_switch();
     log_readiness(computer);
 }
@@ -540,13 +650,21 @@ static void hci_event(uint8_t packet_type, uint16_t channel, uint8_t *packet, ui
         case HCI_EVENT_DISCONNECTION_COMPLETE:
             computer = computer_for_handle(hci_event_disconnection_complete_get_connection_handle(packet));
             if (computer == NULL) break;
-            printf("[output] PC%u handle=0x%04x disconnected reason=0x%02x address=%s "
-                   "release-pending=0x%02x\n", slot_of(computer) + 1, computer->handle,
+            printf("[output] handle=0x%04x disconnected reason=0x%02x address=%s "
+                   "logical-PC=%u (0=provisional) release-pending=0x%02x\n", computer->handle,
                    hci_event_disconnection_complete_get_reason(packet),
-                   bd_addr_to_str(computer->address), computer->release_pending);
+                   bd_addr_to_str(computer->address),
+                   computer->slot < HUB_COMPUTER_COUNT ? computer->slot + 1 : 0,
+                   computer->release_pending);
             computer->occupied = false;
+            computer->identity_authenticated = false;
+            /* The SDK disconnect handler purges ATT notification_requests.
+               Quarantine until the next run-loop timer, after ALL HCI handlers
+               have run, before reusing this callback's storage for a new link. */
+            computer->retiring = true;
+            if (computer_for_slot(computer->slot) == computer)
+                slot_connections[computer->slot] = NULL;
             clear_queue(computer);
-            computer->send_registered = false;
             computer->release_pending = 0;
             memset(computer->last_keyboard, 0, sizeof(computer->last_keyboard));
             memset(computer->last_mouse, 0, sizeof(computer->last_mouse));
@@ -584,6 +702,31 @@ static void security_event(uint8_t packet_type, uint16_t channel, uint8_t *packe
     uint8_t status;
     const char *operation;
     switch (hci_event_packet_get_type(packet)) {
+        case SM_EVENT_PAIRING_STARTED:
+        case SM_EVENT_REENCRYPTION_STARTED: {
+            computer_t *computer = computer_for_handle(little_endian_read_16(packet, 2));
+            if (computer == NULL) return;
+            printf("[output] security-start event=0x%02x handle=0x%04x key=%u identity-bound=%u\n",
+                   hci_event_packet_get_type(packet), computer->handle,
+                   gap_encryption_key_size(computer->handle), computer->identity_authenticated);
+            /* BTstack may announce another security request after this very link
+               has already completed re-encryption. That notification alone does
+               not revoke its established encrypted identity or guarantee a new
+               completion event. Real pairing, encryption loss and failure still
+               invalidate readiness through their respective handlers. */
+            if (hci_event_packet_get_type(packet) == SM_EVENT_REENCRYPTION_STARTED
+                && authenticated_identity_unchanged(computer)) {
+                printf("[output] PC%u retains verified encrypted identity during redundant re-encryption request\n",
+                       computer->slot + 1);
+                return;
+            }
+            bool was_authenticated = computer->identity_authenticated;
+            computer->authentication_complete = false;
+            computer->identity_authenticated = false;
+            require_release(computer);
+            if (was_authenticated) active_readiness_lost(computer, "security setup restarted");
+            return;
+        }
         case SM_EVENT_PAIRING_COMPLETE:
             handle = sm_event_pairing_complete_get_handle(packet);
             status = sm_event_pairing_complete_get_status(packet);
@@ -599,8 +742,12 @@ static void security_event(uint8_t packet_type, uint16_t channel, uint8_t *packe
     }
     computer_t *computer = computer_for_handle(handle);
     if (computer == NULL) return;
-    printf("[output] PC%u handle=0x%04x %s status=0x%02x\n",
-           slot_of(computer) + 1, handle, operation, status);
+    printf("[output] handle=0x%04x %s status=0x%02x\n", handle, operation, status);
+    if (status != ERROR_CODE_SUCCESS) {
+        reject_computer(computer, "pairing/reencryption failed");
+        return;
+    }
+    computer->authentication_complete = true;
     refresh_security(computer);
 }
 
@@ -608,13 +755,17 @@ static void service(btstack_timer_source_t *timer) {
     uint32_t now = btstack_run_loop_get_time_ms();
     for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) {
         computer_t *computer = &computers[i];
-        if (!computer->occupied) continue;
+        if (!computer->occupied) {
+            computer->retiring = false;
+            computer->send_registered = false;
+            continue;
+        }
         refresh_security(computer);
-        if (!computer->disconnecting && computer->key_size < 16
+        if (!computer->disconnecting && !secure(computer)
             && (int32_t)(now - computer->auth_deadline) >= 0) {
-            printf("[output] PC%u handle=0x%04x SECURITY TIMEOUT: disconnecting "
-                   "unauthenticated/short-key link, not an inactive ready PC\n",
-                   i + 1, computer->handle);
+            printf("[output] handle=0x%04x SECURITY TIMEOUT: disconnecting "
+                   "unbound/unauthenticated/short-key link, not an inactive ready PC\n",
+                   computer->handle);
             require_release(computer);
             uint8_t status = gap_disconnect(computer->handle);
             computer->disconnecting = status == ERROR_CODE_SUCCESS;
@@ -654,6 +805,9 @@ void hub_output_init(void) {
 void hub_output_start(void) {
     if (started) return;
     started = true;
+    /* The port installs TLV only once the controller reaches WORKING. */
+    hub_output_store_load(&output_store);
+    active_slot = output_store.selected;
     static uint8_t advertising_data[] = {
         2, BLUETOOTH_DATA_TYPE_FLAGS, 0x02,
         3, BLUETOOTH_DATA_TYPE_COMPLETE_LIST_OF_16_BIT_SERVICE_CLASS_UUIDS, 0x12, 0x18,
@@ -673,12 +827,24 @@ void hub_output_start(void) {
 }
 
 void hub_output_status(void) {
-    printf("[output] selected=PC%u switching=%u advertising-requested=%u last-adv-status=0x%02x\n",
-           active_slot + 1, switch_pending, advertising_requested, advertising_status);
+    printf("[output] selected=PC%u saved-selected=PC%u storage=%s switching=%u "
+           "advertising-requested=%u last-adv-status=0x%02x\n",
+           active_slot + 1, output_store.selected + 1,
+           output_store.fault ? "LOCKED" : output_store.loaded ? "verified" : "not-loaded",
+           switch_pending, advertising_requested, advertising_status);
     for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) {
-        computer_t *computer = &computers[i];
-        if (!computer->occupied) {
-            printf("[output] PC%u vacant%s\n", i + 1, active_slot == i ? " SELECTED" : "");
+        const hub_output_identity_t *identity = &output_store.identities[i];
+        computer_t *computer = computer_for_slot(i);
+        if (!identity->reserved) {
+            printf("[output] PC%u %s%s\n", i + 1,
+                   output_store.fault ? "UNKNOWN/LOCKED" : "vacant",
+                   active_slot == i ? " SELECTED" : "");
+            continue;
+        }
+        printf("[output] PC%u%s reserved identity=%s type=%u %s\n",
+               i + 1, active_slot == i ? " SELECTED" : "",
+               bd_addr_to_str(identity->address), identity->type, computer ? "online" : "OFFLINE");
+        if (computer == NULL) {
             continue;
         }
         printf("[output] PC%u%s address=%s type=%u role=LE-peripheral handle=0x%04x "
@@ -689,5 +855,22 @@ void hub_output_status(void) {
                gap_encryption_key_size(computer->handle), computer->keyboard_cccd,
                computer->mouse_cccd, computer->suspended, computer->leds, computer->count,
                computer->release_pending, computer->sent, computer->overflows);
+        const hci_connection_t *connection = hci_connection_for_handle(computer->handle);
+        printf("[output] PC%u auth-complete=%u identity-bound=%u send-pending=%u last-send=0x%02x "
+               "SM-state=%u SM-pairing=%u SM-reencrypt=%u\n",
+               i + 1, computer->authentication_complete, computer->identity_authenticated,
+               computer->send_registered, computer->last_send_error,
+               connection ? (unsigned)connection->sm_connection.sm_engine_state : 0,
+               connection ? connection->sm_connection.sm_pairing_active : 0,
+               connection ? connection->sm_connection.sm_reencryption_active : 0);
+    }
+    for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) {
+        const computer_t *computer = &computers[i];
+        if (!computer->occupied || computer->slot < HUB_COMPUTER_COUNT) continue;
+        printf("[output] provisional handle=0x%04x address=%s type=%u key=%u "
+               "notify(k/m)=%u/%u rejected=%u; no logical PC slot, no routing\n",
+               computer->handle, bd_addr_to_str(computer->address), computer->address_type,
+               computer->key_size, computer->keyboard_cccd, computer->mouse_cccd,
+               computer->rejected);
     }
 }

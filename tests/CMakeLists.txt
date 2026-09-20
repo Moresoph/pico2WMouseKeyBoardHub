@@ -92,3 +92,36 @@ else()
     target_compile_options(hub_diag_ring_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
 endif()
 add_test(NAME hub_diag_ring_tests COMMAND hub_diag_ring_tests)
+
+set(HUB_HCI_TEST_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated/hci")
+execute_process(COMMAND "${CMAKE_COMMAND}"
+    "-DBTSTACK_PATH=${HUB_BTSTACK_PATH}"
+    "-DOUTPUT_DIR=${HUB_HCI_TEST_GENERATED}"
+    -P "${CMAKE_CURRENT_LIST_DIR}/generate_hci_reconnect_test.cmake"
+    RESULT_VARIABLE HUB_HCI_GENERATE_RESULT)
+if(NOT HUB_HCI_GENERATE_RESULT EQUAL 0)
+    message(FATAL_ERROR "Generating the pinned HCI reconnect tests failed")
+endif()
+add_executable(hub_hci_reconnect_tests hci_reconnect_test.c
+    "${HUB_BTSTACK_PATH}/src/btstack_linked_list.c"
+    "${HUB_BTSTACK_PATH}/src/btstack_util.c")
+target_include_directories(hub_hci_reconnect_tests PRIVATE
+    ../include "${HUB_BTSTACK_PATH}/src" "${HUB_HCI_TEST_GENERATED}")
+target_compile_definitions(hub_hci_reconnect_tests PRIVATE ENABLE_BLE=1 ENABLE_CLASSIC=1)
+if(MSVC)
+    target_compile_options(hub_hci_reconnect_tests PRIVATE /W4 /UNDEBUG)
+else()
+    target_compile_options(hub_hci_reconnect_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+endif()
+add_test(NAME hub_hci_reconnect_tests COMMAND hub_hci_reconnect_tests)
+
+add_executable(hub_output_tests output_test.c "${HUB_BTSTACK_PATH}/src/btstack_util.c")
+target_include_directories(hub_output_tests PRIVATE ../include
+    "${HUB_BTSTACK_PATH}/src" "${CMAKE_CURRENT_LIST_DIR}/output_stubs")
+target_compile_definitions(hub_output_tests PRIVATE ENABLE_BLE=1)
+if(MSVC)
+    target_compile_options(hub_output_tests PRIVATE /W4 /UNDEBUG)
+else()
+    target_compile_options(hub_output_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+endif()
+add_test(NAME hub_output_tests COMMAND hub_output_tests)

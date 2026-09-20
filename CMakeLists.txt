@@ -9,15 +9,18 @@ if(NOT EXISTS "${PICO_SDK_PATH}/external/pico_sdk_import.cmake")
 endif()
 include("${PICO_SDK_PATH}/external/pico_sdk_import.cmake")
 
-project(pico_bt_hub VERSION 0.3.6 LANGUAGES C CXX ASM)
-option(HUB_CLASSIC_OPEN_TEST "Enable isolated, non-forwarding Classic Level 0 tests" OFF)
+project(pico_bt_hub VERSION 0.4.0 LANGUAGES C CXX ASM)
+option(HUB_CLASSIC_OPEN_TEST "Enable Classic Level 0 inputs with explicit forwarding authorization" OFF)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 pico_sdk_init()
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/HubBtstackReconnect.cmake")
+hub_patch_btstack_reconnect()
 
 add_executable(pico_bt_hub
     src/main.c
     src/hub_output.c
+    src/hub_output_store.c
     src/hub_input.c
     src/hub_router.c
     src/hub_passkey.c
