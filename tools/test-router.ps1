@@ -79,3 +79,10 @@ $output = Join-Path $outputDirectory 'hub_latency_tests.exe'
 if ($LASTEXITCODE -ne 0) { throw "Latency test compilation failed: $LASTEXITCODE" }
 & $output
 if ($LASTEXITCODE -ne 0) { throw "Latency tests failed: $LASTEXITCODE" }
+$output = Join-Path $outputDirectory 'hub_perf_tests.exe'
+& $compiler -Wall -Werror -DENABLE_BLE=1 -DENABLE_CLASSIC=1 `
+    "-I$(Join-Path $root 'include')" "-I$btstack" `
+    (Join-Path $root 'tests\perf_test.c') $util -o $output
+if ($LASTEXITCODE -ne 0) { throw "Performance recorder compilation failed: $LASTEXITCODE" }
+& $output
+if ($LASTEXITCODE -ne 0) { throw "Performance recorder tests failed: $LASTEXITCODE" }

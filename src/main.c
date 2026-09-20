@@ -21,6 +21,7 @@
 #include "hub_smp_decode.h"
 #include "hub_security_policy.h"
 #include "hub_latency.h"
+#include "hub_perf.h"
 
 typedef enum {
     LINK_CLASSIC,
@@ -617,6 +618,7 @@ static void print_help(void) {
         "\nCommands (computer/input slots are 1-based):\n"
         "  help | status | bonds | diag | latency\n"
         "  latency fast|normal|reset  Runtime latency tuning / measurement reset\n"
+        "  latency trace              RAM timing/link history (no input payloads)\n"
         "  diag                       Replay recent pairing metadata (no PIN/key values)\n"
         "  enroll | enroll stop       Timed automatic keyboard/mouse enrollment\n"
         "  inputs reset               Forget both inputs, then enroll replacements\n"
@@ -789,6 +791,7 @@ static void console_command(char *line) {
         if (argc == 2 && strcmp(args[1], "fast") == 0) { hub_latency_set_fast(true); return; }
         if (argc == 2 && strcmp(args[1], "normal") == 0) { hub_latency_set_fast(false); return; }
         if (argc == 2 && strcmp(args[1], "reset") == 0) { hub_latency_reset(); return; }
+        if (argc == 2 && strcmp(args[1], "trace") == 0) { hub_perf_status(); return; }
     }
     if (strcmp(args[0], "status") == 0 && argc == 1) {
         printf("[status] firmware=%s\n", PICO_PROGRAM_VERSION_STRING);
@@ -1091,6 +1094,7 @@ int main(void) {
     hub_output_init();
     hub_input_init();
     hub_latency_init();
+    hub_perf_init();
     btstack_run_loop_set_timer_handler(&console_timer, console_poll);
     btstack_run_loop_set_timer(&console_timer, 10);
     btstack_run_loop_add_timer(&console_timer);

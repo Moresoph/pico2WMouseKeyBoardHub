@@ -82,6 +82,7 @@ on-demand measurements and a reversible performance mode:
 
 ```text
 latency
+latency trace
 latency reset
 latency fast
 latency normal
@@ -93,18 +94,34 @@ per-computer output queue statistics. Values are recorded at the Pico:
 input gaps describe received reports, and queue times end at a successful
 `att_server_notify` submission. They do **not** measure mouse sensor latency,
 radio delivery acknowledgement, Windows processing, or screen presentation.
-Pauses longer than 100 ms are separated from active input-gap averages.
+Gaps longer than 100 ms are separated from the short-gap averages. These gaps
+may represent normal idle time **or a stall**; the firmware cannot distinguish
+them solely from the absence of a report.
 No key codes, movement values, or report payloads are logged by these metrics.
 
-`latency fast` enables event-driven queue draining and requests a 7.5--15 ms LE
-interval with zero peripheral latency for existing BLE input links and the
-currently selected computer. The requested maximum is capped at the current
-interval when it is already below 15 ms, so a 7.5 ms link is not asked to slow
-down. The host/device can reject or choose different
+`latency fast` enables event-driven queue draining. Starting with firmware 0.4.2,
+it requests an exact **7.5 ms** LE interval (minimum and maximum both 6 units)
+with zero peripheral latency for the currently selected computer. Previously
+the 7.5--15 ms request allowed a computer to retain 15 ms.
+Existing BLE inputs retain their 7.5--15 ms request policy with zero peripheral
+latency; their requested maximum is capped at the current interval when it is
+already below 15 ms, so a 7.5 ms input link is not asked to slow down.
+The host/device can reject or choose different
 parameters; the printed negotiated values, not the request, determine whether
 radio timing changed. Inactive computers stay connected and are not accelerated;
 a previously accelerated computer is requested back to its baseline when it is
 no longer selected. Controller requests are bounded rather than retried in a loop.
+Firmware 0.4.3 also waits for input connection/authentication/HID discovery,
+scanning and closing operations to finish before optional parameter requests.
+It observes a two-second quiet window after radio activity or a selected-PC
+change, and waits for an outstanding local or observed peer update to complete
+or expire before requesting changes on another link. Reports continue flowing
+while requests are deferred; reconnect attempts are not delayed by this policy.
+Already-satisfied intervals and peripheral latency are left alone instead of
+requesting an identical update. Exact baseline restoration also compares the
+supervision timeout. These guards reduce avoidable negotiation traffic; they
+do not prove the cause of earlier `0x28` disconnections or prevent all
+controller/host-initiated procedures.
 Peers can later renegotiate their power-saving parameters; fast mode does not
 continually override them. Peripheral latency permits skipping idle connection
 events, not a fixed delay added to every moving-mouse report.
@@ -115,18 +132,47 @@ keys, slot selection, or input authorization. Mode selection is saved separately
 from device identities and restored at reboot. With no saved mode, startup uses
 normal mode so baseline measurements can be collected first.
 
+`latency trace` prints bounded RAM-only timing and connection history without
+key codes, button states, movement values, PINs, or raw report payloads. It adds
+long input-gap observations, slow output queue waits, link/parameter events,
+controller completed-packet statistics, and run-loop timing. Routine reports
+are counted rather than printed continuously; this is not a Flash log.
+Controller completed-packet counts include other ACL traffic and represent
+controller buffer-credit returns, **not** per-report delivery acknowledgements,
+radio retransmission counts, or end-to-end latency. Dumps themselves consume
+processing/USB time, so collect them after a movement sample, not continuously.
+`latency reset` clears measurement history/counters without disconnecting
+devices, discarding queued input, changing pairing, or cancelling pending
+parameter procedures. Long-term stability must still be observed on hardware.
+
 For comparison, reset the counters, move the mouse continuously for the same
 duration on the same selected computer, read `latency`, and repeat in the other
 mode. Keep other computer links connected throughout. A shorter BLE interval
 can increase radio duty cycle and mouse battery use; do not trade stable
 multi-device operation for a requested interval the controller cannot sustain.
 
-In a manual same-PC comparison, mean mouse queue-to-ATT submission time fell
+In the firmware 0.4.1 manual same-PC comparison, mean mouse queue-to-ATT submission time fell
 from 6.345 ms (767 packets) to 1.437 ms (1,353 packets); the operator reported
 more responsive motion with normal clicks and scrolling. PC1 remained at
 15 ms and the mouse remained at 7.5 ms. The mouse accepted latency 0 initially,
 then renegotiated latency 44. This is an indicative queue/scheduling result,
 not an end-to-end latency measurement or proof of a radio-interval improvement.
+
+The first 0.4.3 hardware trace showed both PCs at 7.5 ms after recovery, all four
+links ready, and user-confirmed input/switching operation. The recorder observed
+real controller-credit events and skipped a redundant request for an already
+7.5 ms PC. It also retained a PC1 supervision timeout (`0x08`) shortly after a
+parameter request, followed by automatic reconnection at 7.5 ms. This is not
+evidence that the earlier intermittent disconnections have been eliminated.
+
+A later stutter capture contained repeated mouse input gaps around 232--240 ms,
+while software queue waits remained around 0.5 ms. The operator confirmed
+stuttering during continuous movement. Reapplying the mouse's 7.5 ms /
+peripheral-latency-0 parameters without rebooting restored subjective smoothness;
+both PC intervals stayed at 7.5 ms. This is a useful diagnostic lead, not proof
+of a single cause: PC2 subsequently reconnected after another `0x28` error.
+The current policy still permits later peer parameter updates; it does not
+permanently enforce zero peripheral latency or disable device firmware sleep.
 
 ### Isolated minimum-security Classic input experiment
 

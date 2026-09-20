@@ -84,6 +84,11 @@ void btstack_tlv_get_instance(const btstack_tlv_t **impl, void **context) {
 }
 uint32_t btstack_run_loop_get_time_ms(void) { return clock_ms; }
 uint32_t hub_latency_now_us(void) { return clock_us; }
+void hub_perf_output_wait(uint16_t handle, unsigned slot, bool mouse, uint32_t wait_us) {
+    (void)mouse; (void)wait_us;
+    assert(computer_for_handle(handle) != NULL);
+    assert(slot < HUB_COMPUTER_COUNT && computer_for_handle(handle)->slot == slot);
+}
 void btstack_run_loop_add_timer(btstack_timer_source_t *timer) {
     assert(timer == &service_timer || timer == &pump_timer);
     if (timer == &pump_timer) {

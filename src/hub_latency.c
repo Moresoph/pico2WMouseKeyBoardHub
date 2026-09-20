@@ -14,11 +14,13 @@
 #include "hub_config.h"
 #include "hub_input.h"
 #include "hub_output.h"
+#include "hub_perf.h"
 #include "hub_security.h"
 
 #define LATENCY_FAST_INTERVAL_MIN 6u
 #define LATENCY_FAST_INTERVAL_MAX 12u
 #define LATENCY_REQUEST_TIMEOUT_MS 5000u
+#define LATENCY_SETTLE_MS 2000u
 #define LATENCY_SETTINGS_TAG 0x50484c31u /* PHL1 */
 
 typedef struct {
@@ -26,6 +28,7 @@ typedef struct {
     bool attempted;
     bool requested_fast;
     bool pending;
+    bool remote_pending;
     bool tuned;
     uint8_t role;
     uint16_t handle;
@@ -37,7 +40,9 @@ typedef struct {
     uint16_t baseline_timeout;
     uint32_t connected_at;
     uint32_t request_at;
+    uint32_t remote_request_at;
     unsigned requests;
+    unsigned satisfied;
 } latency_link_t;
 
 typedef struct {
@@ -57,6 +62,8 @@ static btstack_packet_callback_registration_t l2cap_registration;
 static btstack_timer_source_t timer;
 static bool fast_mode;
 static bool working;
+static uint32_t radio_activity_at;
+static uint16_t observed_active;
 
 static bool save_mode(bool enabled) {
     const btstack_tlv_t *tlv;
@@ -112,6 +119,7 @@ void hub_latency_input_report(unsigned input, bool mouse) {
         return;
     }
     input_timing_t *metric = &timing[input][mouse ? 1 : 0];
+    hub_perf_input_report(input, mouse);
     uint32_t now = hub_latency_now_us();
     if (metric->count) {
         uint32_t gap = now - metric->last;
@@ -131,15 +139,18 @@ void hub_latency_input_report(unsigned input, bool mouse) {
 static void print_link(const latency_link_t *link) {
     uint32_t interval_us = (uint32_t)link->interval * 1250u;
     printf("[latency] LE handle=0x%04x role=%s interval=%" PRIu32 ".%03" PRIu32
-           "ms latency=%u timeout=%ums fast-requested=%u pending=%u requests=%u\n",
+           "ms latency=%u timeout=%ums fast-requested=%u pending=%u remote-pending=%u requests=%u satisfied=%u\n",
            link->handle, link->role == HCI_ROLE_MASTER ? "input-central" : "PC-peripheral",
            interval_us / 1000u, interval_us % 1000u, link->latency,
-           link->timeout * 10u, link->requested_fast, link->pending, link->requests);
+           link->timeout * 10u, link->requested_fast, link->pending, link->remote_pending,
+           link->requests, link->satisfied);
 }
 
 static void event_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     (void)channel;
     if (packet_type != HCI_EVENT_PACKET || size < 2) return;
+    if ((unsigned)packet[1] + 2u > size) return;
+    size = (uint16_t)packet[1] + 2u;
     if (packet[0] == BTSTACK_EVENT_STATE && size >= 3) {
         working = btstack_event_state_get_state(packet) == HCI_STATE_WORKING;
         return;
@@ -170,6 +181,7 @@ static void event_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
         link->baseline_latency = link->latency;
         link->baseline_timeout = link->timeout;
         link->connected_at = btstack_run_loop_get_time_ms();
+        radio_activity_at = link->connected_at;
         print_link(link);
     } else if (packet[0] == HCI_EVENT_LE_META && size >= 12
                && hci_event_le_meta_get_subevent_code(packet) == HCI_SUBEVENT_LE_CONNECTION_UPDATE_COMPLETE) {
@@ -177,6 +189,8 @@ static void event_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
         if (!link) return;
         uint8_t status = hci_subevent_le_connection_update_complete_get_status(packet);
         link->pending = false;
+        link->remote_pending = false;
+        radio_activity_at = btstack_run_loop_get_time_ms();
         printf("[latency] connection update handle=0x%04x status=0x%02x\n", link->handle, status);
         if (status == 0) {
             link->interval = hci_subevent_le_connection_update_complete_get_conn_interval(packet);
@@ -192,34 +206,70 @@ static void event_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
     } else if (packet[0] == HCI_EVENT_DISCONNECTION_COMPLETE && size >= 6 && packet[2] == 0) {
         latency_link_t *link = find_link(hci_event_disconnection_complete_get_connection_handle(packet));
         if (link) memset(link, 0, sizeof(*link));
+        radio_activity_at = btstack_run_loop_get_time_ms();
+    } else if ((packet[0] == HCI_EVENT_ENCRYPTION_CHANGE && size >= 6)
+               || (packet[0] == HCI_EVENT_ENCRYPTION_KEY_REFRESH_COMPLETE && size >= 5)
+               || (packet[0] == HCI_EVENT_CONNECTION_COMPLETE && size >= 13)) {
+        radio_activity_at = btstack_run_loop_get_time_ms();
+    } else if ((packet[0] == L2CAP_EVENT_CONNECTION_PARAMETER_UPDATE_REQUEST && size >= 12)
+               || (packet[0] == HCI_EVENT_LE_META && size >= 13
+                   && packet[2] == HCI_SUBEVENT_LE_REMOTE_CONNECTION_PARAMETER_REQUEST)) {
+        uint16_t handle = little_endian_read_16(packet, packet[0] == HCI_EVENT_LE_META ? 3 : 2);
+        latency_link_t *link = find_link(handle);
+        radio_activity_at = btstack_run_loop_get_time_ms();
+        if (link) {
+            link->remote_pending = true;
+            link->remote_request_at = radio_activity_at;
+        }
     } else if (packet[0] == L2CAP_EVENT_CONNECTION_PARAMETER_UPDATE_RESPONSE && size >= 6) {
         latency_link_t *link = find_link(little_endian_read_16(packet, 2));
         if (link) {
             uint16_t result = little_endian_read_16(packet, 4);
             printf("[latency] PC update response handle=0x%04x result=0x%04x\n", link->handle, result);
-            if (result) link->pending = false;
+            if (result) {
+                link->pending = false;
+                radio_activity_at = btstack_run_loop_get_time_ms();
+            }
         }
     }
 }
 
-static void service(btstack_timer_source_t *source) {
+static void update_parameters(void) {
     uint32_t now = btstack_run_loop_get_time_ms();
     uint16_t active = hub_output_active_handle();
+    if (active != observed_active) {
+        observed_active = active;
+        radio_activity_at = now;
+    }
+    bool pending = false;
+    bool busy = hub_security_input_pairing_blocked() || hub_input_radio_busy();
     for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i) {
         latency_link_t *link = &links[i];
         if (!link->connected) continue;
-        if (link->pending) {
-            if ((uint32_t)(now - link->request_at) >= LATENCY_REQUEST_TIMEOUT_MS) {
-                link->pending = false;
-                printf("[latency] handle=0x%04x no applied update observed; current interval retained\n",
-                       link->handle);
-            }
-            continue;
+        if (link->pending && (uint32_t)(now - link->request_at) >= LATENCY_REQUEST_TIMEOUT_MS) {
+            link->pending = false;
+            radio_activity_at = now;
+            hub_perf_parameter_timeout(link->handle);
+            printf("[latency] handle=0x%04x no applied update observed; current interval retained\n",
+                   link->handle);
         }
+        if (link->remote_pending
+            && (uint32_t)(now - link->remote_request_at) >= LATENCY_REQUEST_TIMEOUT_MS) {
+            link->remote_pending = false;
+            radio_activity_at = now;
+            printf("[latency] handle=0x%04x peer update observation window expired\n", link->handle);
+        }
+        pending |= link->pending || link->remote_pending;
+        busy |= gap_encryption_key_size(link->handle) == 0;
+    }
+    if (busy) radio_activity_at = now;
+    if (!working || busy || pending || (uint32_t)(now - radio_activity_at) < LATENCY_SETTLE_MS) return;
+
+    for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i) {
+        latency_link_t *link = &links[i];
+        if (!link->connected) continue;
         bool desired = fast_mode && ((link->role == HCI_ROLE_MASTER && hub_input_is_connection(link->handle))
             || (link->role == HCI_ROLE_SLAVE && link->handle == active));
-        if (!working || hub_security_input_pairing_blocked()
-            || now - link->connected_at < 2000u || gap_encryption_key_size(link->handle) == 0) continue;
         if (link->attempted && desired == link->requested_fast) continue;
         if (!desired && !link->tuned) {
             link->attempted = true;
@@ -232,14 +282,26 @@ static void service(btstack_timer_source_t *source) {
             ? (link->interval >= LATENCY_FAST_INTERVAL_MIN && link->interval < LATENCY_FAST_INTERVAL_MAX
                 ? link->interval : LATENCY_FAST_INTERVAL_MAX)
             : link->baseline_interval;
+        /* A 7.5--15 ms range lets the computer retain its existing 15 ms interval. */
+        if (desired && link->role == HCI_ROLE_SLAVE) maximum = minimum;
         uint16_t latency = desired ? 0 : link->baseline_latency;
         uint16_t timeout = desired ? 200 : link->baseline_timeout;
         link->attempted = true;
         link->requested_fast = desired;
+        if (link->interval >= minimum && link->interval <= maximum && link->latency == latency
+            && (desired || link->timeout == timeout)) {
+            if (!desired) link->tuned = false;
+            ++link->satisfied;
+            printf("[latency] handle=0x%04x %s parameters already satisfied; no request\n",
+                   link->handle, desired ? "fast" : "baseline");
+            continue;
+        }
         ++link->requests;
         int status = link->role == HCI_ROLE_MASTER
             ? gap_update_connection_parameters(link->handle, minimum, maximum, latency, timeout)
             : gap_request_connection_parameter_update(link->handle, minimum, maximum, latency, timeout);
+        radio_activity_at = now;
+        hub_perf_parameter_request(link->handle, desired, minimum, maximum, latency, timeout, status);
         printf("[latency] %s request handle=0x%04x interval-units=%u..%u latency=%u result=0x%02x\n",
                desired ? "low-latency" : "restore-baseline", link->handle,
                minimum, maximum, latency, status);
@@ -248,9 +310,13 @@ static void service(btstack_timer_source_t *source) {
             link->request_at = now;
             link->tuned = desired;
         }
-        /* Avoid issuing updates for all radio links in one callback. */
+        /* Wait for completion (or timeout) and a quiet window before another link. */
         break;
     }
+}
+
+static void service(btstack_timer_source_t *source) {
+    update_parameters();
     btstack_run_loop_set_timer(source, 250);
     btstack_run_loop_add_timer(source);
 }
@@ -284,6 +350,8 @@ bool hub_latency_set_fast(bool enabled) {
 void hub_latency_status(void) {
     printf("[latency] mode=%s; MCU queue timing is NOT end-to-end latency or radio delivery time\n",
            fast_mode ? "fast" : "normal");
+    printf("[latency] updates serialized; quiet-window=%ums input-radio-busy=%u quiet-age=%" PRIu32 "ms\n",
+           LATENCY_SETTLE_MS, hub_input_radio_busy(), btstack_run_loop_get_time_ms() - radio_activity_at);
     for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i) {
         if (links[i].connected) print_link(&links[i]);
     }
@@ -293,7 +361,8 @@ void hub_latency_status(void) {
             if (!metric->count) continue;
             printf("[latency] input=%u type=%s reports=%" PRIu32 " gap-samples=%" PRIu32
                    " gap-us min=%" PRIu32 " mean=%" PRIu64 " max=%" PRIu32
-                   " idle-gaps-over-100ms=%" PRIu32 "\n", i + 1, type ? "mouse" : "keyboard",
+                   " long-gaps-over-100ms=%" PRIu32 " (idle-or-stall; excluded from this mean)\n",
+                   i + 1, type ? "mouse" : "keyboard",
                    metric->count, metric->samples, metric->minimum,
                    metric->samples ? metric->sum / metric->samples : 0,
                    metric->maximum, metric->idle_gaps);
@@ -305,6 +374,7 @@ void hub_latency_status(void) {
 void hub_latency_reset(void) {
     memset(timing, 0, sizeof(timing));
     hub_output_latency_reset();
+    hub_perf_reset();
     printf("[latency] measurement counters reset; input state and links retained\n");
 }
 
@@ -313,6 +383,8 @@ void hub_latency_init(void) {
     memset(timing, 0, sizeof(timing));
     fast_mode = false;
     working = false;
+    radio_activity_at = btstack_run_loop_get_time_ms();
+    observed_active = HCI_CON_HANDLE_INVALID;
     load_mode();
     registration.callback = event_handler;
     hci_add_event_handler(&registration);

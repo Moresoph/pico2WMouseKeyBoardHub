@@ -19,6 +19,7 @@ bool hub_input_is_expected_classic(const uint8_t address[6]);
 bool hub_input_allow_pairing(uint16_t handle);
 bool hub_input_keyboard_ready(void);
 bool hub_input_pairing_busy(void);
+bool hub_input_radio_busy(void);
 
 /* Enrollment fills missing keyboard/mouse roles; it never replaces stored peers. */
 bool hub_input_enroll_start(void);

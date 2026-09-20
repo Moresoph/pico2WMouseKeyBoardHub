@@ -5,6 +5,7 @@
 #include "btstack.h"
 #include "hub_config.h"
 #include "hub_latency.h"
+#include "hub_perf.h"
 #include "hub_output.h"
 #include "hub_output_store.h"
 #include "hub_router.h"
@@ -286,6 +287,7 @@ static void measure_notify(computer_t *computer, const output_event_t *event) {
     ++metrics->notified;
     if (!event->timing_valid) return;
     uint32_t wait = hub_latency_now_us() - event->enqueued_us;
+    hub_perf_output_wait(computer->handle, computer->slot, event->kind == RELEASE_MOUSE, wait);
     ++metrics->wait_count;
     metrics->wait_sum_us += wait;
     if (wait > metrics->wait_max_us) metrics->wait_max_us = wait;

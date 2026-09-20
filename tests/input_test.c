@@ -754,6 +754,31 @@ static void test_secure_image_does_not_activate_saved_open_input(void) {
     assert(flash_lengths[1] == HUB_INPUT_TARGET_BYTES);
 }
 
+static void test_radio_busy_covers_establishment_and_scans(void) {
+    reset_fixture();
+    assert(!hub_input_radio_busy());
+    scanning = SCAN_LE;
+    assert(hub_input_radio_busy());
+    scanning = SCAN_CLASSIC_STOPPING;
+    assert(hub_input_radio_busy());
+    scanning = SCAN_OFF;
+    const input_state_t busy_states[] = {INPUT_CONNECTING, INPUT_SECURITY, INPUT_DISCOVERING, INPUT_CLOSING};
+    inputs[0].selected = true;
+    for (unsigned i = 0; i < sizeof(busy_states) / sizeof(busy_states[0]); ++i) {
+        inputs[0].state = busy_states[i];
+        assert(hub_input_radio_busy());
+    }
+    inputs[0].state = INPUT_READY;
+    assert(!hub_input_radio_busy());
+    inputs[0].state = INPUT_RETRY;
+    assert(!hub_input_radio_busy());
+    establishing = 0;
+    assert(hub_input_radio_busy());
+    establishing = -1;
+    enrollment_pending = true;
+    assert(hub_input_radio_busy());
+}
+
 int main(void) {
     test_records_and_policy();
     test_empty_boot_and_window();
@@ -771,6 +796,7 @@ int main(void) {
     test_transient_security_failure_retries_but_key_loss_stops();
     test_manual_pause_does_not_auto_resume();
     test_secure_image_does_not_activate_saved_open_input();
-    puts("input tests: 16 groups passed (production state machine and SDK HID parser)");
+    test_radio_busy_covers_establishment_and_scans();
+    puts("input tests: 17 groups passed (production state machine and SDK HID parser)");
     return 0;
 }

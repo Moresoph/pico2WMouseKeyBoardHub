@@ -9,7 +9,7 @@ if(NOT EXISTS "${PICO_SDK_PATH}/external/pico_sdk_import.cmake")
 endif()
 include("${PICO_SDK_PATH}/external/pico_sdk_import.cmake")
 
-project(pico_bt_hub VERSION 0.4.1 LANGUAGES C CXX ASM)
+project(pico_bt_hub VERSION 0.4.3 LANGUAGES C CXX ASM)
 option(HUB_CLASSIC_OPEN_TEST "Enable Classic Level 0 inputs with explicit forwarding authorization" OFF)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -33,6 +33,7 @@ add_executable(pico_bt_hub
     src/hub_diag_ring.c
     src/hub_clock.c
     src/hub_latency.c
+    src/hub_perf.c
 )
 target_include_directories(pico_bt_hub PRIVATE include)
 target_link_libraries(pico_bt_hub PRIVATE

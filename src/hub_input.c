@@ -2081,6 +2081,16 @@ bool hub_input_pairing_busy(void) {
     return establishing >= 0 || hub_input_enrolling() || forgetting || any_closing();
 }
 
+bool hub_input_radio_busy(void) {
+    if (scanning != SCAN_OFF || hub_input_pairing_busy()) return true;
+    for (unsigned i = 0; i < HUB_INPUT_COUNT; ++i) {
+        const input_slot_t *slot = &inputs[i];
+        if (slot->selected && (slot->state == INPUT_CONNECTING || slot->state == INPUT_SECURITY
+            || slot->state == INPUT_DISCOVERING || slot->state == INPUT_CLOSING)) return true;
+    }
+    return false;
+}
+
 void hub_input_status(void) {
     static const char *const states[] = {
         "empty", "connecting", "security", "HID-discovery", "HID-ready",
