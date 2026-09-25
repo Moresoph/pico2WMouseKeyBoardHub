@@ -77,6 +77,324 @@ Git or Windows proxy settings.
 
 ## Mouse-latency tuning
 
+### Optional single-PC Classic output experiment
+
+The `classic-hid-output` branch preserves the usable BLE baseline on `main` at
+`0c642f2` (0.4.3). Classic output is **opt-in**, not a replacement for the
+four-slot BLE build:
+
+```powershell
+.\tools\build.ps1 -Jobs 8 -OpenClassicInputTest -ClassicOutputTest
+```
+
+This produces `build\classic-output\pico_bt_hub.uf2` by default, without
+overwriting the normal build directory. The firmware identifies itself as
+`0.4.3-classic-output-test-acl8` and advertises the name `Pico2W Classic HID Test`.
+Omit `-ClassicOutputTest` to build the original BLE output again.
+
+The experiment retains both input slots and their existing authorizations,
+but offers **only one Classic HID computer, PC1**. There is no BLE computer
+advertising, no second Classic PC, and no disconnect/reconnect hotkey switching.
+The composite keyboard/mouse report descriptor is shared with the BLE backend.
+Classic avoids the BLE output connection-interval floor; it does **not** promise
+a 1 ms report rate or remove the BLE mouse-to-Pico hop.
+
+After boot, wait for the inputs to reconnect, then use USB serial:
+
+```text
+classic target AA:BB:CC:DD:EE:FF
+pair justworks
+```
+
+Use the **computer's Bluetooth adapter address**, not the keyboard address.
+From that computer's Bluetooth settings, add `Pico2W Classic HID Test` within
+120 seconds. The PC initiates the HID channels; hub-initiated Classic PC
+reconnection is not implemented in this first experiment. Pairing closes
+automatically once encrypted HID output is ready, or with `pair off`.
+Only the explicitly selected address is admitted. `pair keyboard` / console
+numeric-comparison enrollment are not implemented for this output experiment.
+
+PC output requires a saved Classic link key, Level 2 security and a 16-byte
+encryption key; Just Works provides **no MITM protection**. The separately
+authorized Level 0 keyboard exception never enables unencrypted PC output.
+The target is saved only after successful secure HID establishment, under
+the separate `PHC1` tag. The BLE `PHO1` record, BLE bonds, and input records are
+not overwritten. A saved Classic target cannot silently be replaced.
+
+Both Classic profiles use the same control/interrupt PSMs. A pinned,
+generated-source BTstack overlay registers a single incoming-service
+dispatcher and retains channel ownership through each channel's lifetime.
+Selected input connections go to the HID host; the selected PC goes to the
+HID device only after security succeeds. Incoming PC security waits are
+bounded: an initial enrollment may require retrying from Windows rather
+than leaving an unauthenticated HID channel pending indefinitely.
+Vendored SDK sources are not edited.
+
+`status` identifies the output transport; `latency` / `latency trace` report
+Classic software queue-to-**L2CAP submission**, not queue-to-ATT or radio
+delivery. For a fair comparison, also inspect the BLE mouse's actual interval
+and peripheral latency: the mouse can still renegotiate its low-power policy.
+Classic multi-PC operation and lower end-to-end latency remain unproven until
+hardware trials.
+
+The default Classic build spaces ordinary keyboard/mouse L2CAP submissions by at least
+**2,500 microseconds** (up to 400 reports/second **combined**, not per device).
+A microsecond one-shot worker shares BTstack's async context; there is no
+busy-wait or millisecond rounding to approximate 2.5 ms. The first report after
+idle can send immediately. Empty ticks produce no reports; missed deadlines
+are not replayed as catch-up bursts. Controller backpressure can make the actual
+gap longer, and safety neutral releases bypass this pacing. This is a software
+submission limit, **not a configured Classic air-link polling interval**.
+`latency` exposes the configured period and observed submission gaps; the gap
+statistics include idle periods below 60 seconds and are not end-to-end latency.
+It also reports PC1's observed Classic link mode (active/hold/sniff/park) and
+mode interval separately; software pacing does not establish the link's power mode.
+
+The first Classic hardware trial exposed excessive software queueing
+(mouse average about 114 ms, maximum about 585 ms in that capture). Its send
+readiness path repeatedly scanned the Flash-backed Classic bond database.
+Bond verification is now retained only for the current verified connection:
+ordinary reports do not reread Flash, while live encryption, channel ownership,
+and authorization checks remain. Disconnect or security failure invalidates
+verification; a new connection must verify its bond again. `latency` includes
+bond-lookup counts/timing to distinguish connection setup from the send path.
+
+The next capture reduced mouse software queueing to about 1.3 ms on average,
+but still showed individual waits above 100 ms and the user reported severe
+stutter. It also showed the mouse requesting latency 44 roughly every 30 seconds,
+with each accepted change taking several seconds to return to latency 0.
+Thus the Flash fix and 2.5 ms pacing alone did not resolve the mouse problem.
+
+In this Classic experiment's `latency fast` mode, initial BLE input negotiation
+is allowed to settle. Once an input actually reaches latency 0, BTstack's
+connection-parameter acceptance range rejects further nonzero-latency requests
+via either L2CAP or HCI, instead of repeatedly accepting and reversing them.
+This range is global, so the guard is confined to the Classic-output experiment,
+which has no BLE PC links. Interval and supervision-timeout bounds are unchanged.
+The original range is restored in normal mode or when no BLE input remains.
+An applied BLE input update that nevertheless reintroduces nonzero peripheral
+latency re-arms a request for `latency=0`.
+Existing connection/encryption/quiet-window guards remain, and repeated requests
+are separated by at least 10 seconds. A failed request is not retried indefinitely
+without another applied peer update. `latency normal` disables this policy.
+The original BLE-output build keeps its one-shot policy. Neither build can
+guarantee peer acceptance or zero sensor-to-screen latency.
+
+The guarded hardware trial still exhibited intermittent mouse-only stalls:
+the input report counter stopped while the BLE ACL stayed connected, keyboard
+reports continued, PC1 remained in Active mode, and the output queue was empty.
+Reconnecting only the mouse restored reports temporarily. Returning to normal
+mode also preceded recovery, but a remote-initiated mouse disconnect/reconnect
+occurred in between, so this does not isolate the guard as the cause or prove
+the stall fixed. The current board was left in persisted `latency normal`
+(mouse 11.25 ms / latency 44), with the 2,500 us output pacing retained.
+Do not describe the latency-zero guard as validated for sustained mouse use.
+PC1 also needed scoped re-pairing after reboot due to authentication failure;
+reliable saved-Classic-PC reconnection remains unresolved.
+
+The flow-diagnostic build changes no radio parameters. `latency trace` now counts
+incoming BLE-input ACL packets and unfragmented ATT notifications/indications
+before GATT/HIDS dispatch, with per-attribute counts, lengths and ages. Fragmented
+traffic is counted separately, not reassembled or mistaken for missing reports.
+These counters reset with `latency reset` and follow ACL generations. `status`
+adds HIDS callback, callback rejection, parse failure and accepted mouse/keyboard
+counts since each BLE HID discovery. No report payloads or keys are retained.
+Comparing these stages during continuous physical movement distinguishes missing
+controller deliveries from notification dispatch/parser loss; an idle gap alone
+does not demonstrate a stall. Earlier parsed-report counters alone could not make
+that distinction.
+
+The September 23 capture reproduced silence in normal mode with the guard off:
+the mouse remained connected but no incoming ACL packets reached the host during
+the 30-second keyboard-disconnected sample. The user reported complete loss of
+motion. Two recorded last-report times were about 30 seconds after encryption
+completed; this suggests checking protocol transaction deadlines, not assuming
+that subscriptions expire. Recorded mouse disconnects carried reason `0x13`
+(remote termination), without a preceding local mouse disconnect command.
+That reason does not identify why the peer terminated the connection.
+
+Investigation found a concrete Classic-build omission: replacing the BLE output
+module also removed the application's only ATT-server initialization. BTstack's
+GATT client does not answer incoming ATT requests; its dispatcher drops them
+when no server handler exists. A mouse can act as both HID server and ATT client,
+so successful discovery and notifications do not exclude an unanswered reverse
+request. Classic output now initializes an independent, static GAP/GATT database
+to answer MTU/discovery/read requests or return ATT errors. It exposes no BLE HID
+service and does not enable BLE advertising.
+
+The deployed correction captured mouse-originated Read By Group Type (`0x10`),
+Read By Type (`0x08`) and Read (`0x0a`) requests, with corresponding responses or
+ATT errors from Pico. These are precisely the requests the old initialization
+path would discard. One unchanged mouse connection subsequently delivered
+reports more than seven minutes after encryption; its parsed counter increased
+from 3,468 to 6,043 during a 60-second three-link sample, with no disconnect in
+that sample and no rejected/invalid reports. This supports the reverse-request
+timeout explanation for the earlier approximately 30-second cutoff, but does
+not attribute every remote `0x13` termination to that defect or prove all stutter
+resolved. Earlier post-flash reconnects still occurred.
+
+The extended trace retains bounded RX/TX ATT control-opcode counts and first/last
+timestamps, excluding notification payloads. This preserves evidence of requests
+and responses during discovery even after many motion reports. Fragmented packets
+are not decoded; `untracked-opcodes` reports exhausted histogram capacity. These
+are HCI-side observations, not proof of peer reception. Classic `latency` also
+separates request-to-`CAN_SEND_NOW` waiting from total queue-to-L2CAP waiting, so
+stack/controller availability can be distinguished from software pacing. The
+latest capture measured a 126.445 ms maximum wait for `CAN_SEND_NOW`, close to
+the 126.970 ms maximum total mouse queue wait. This locates an observed output
+stall at stack/controller send availability rather than the 2.5 ms pacing timer;
+it does not distinguish controller-credit batching, transport scheduling, RF
+retries, or PC-side behavior. Input-arrival gaps also remain to be correlated
+with physical motion.
+
+After this reflash Windows retained the Classic pairing but did not initiate
+reconnection. A user-authorized restart of only the Pico's Windows Classic HID
+device node restored encrypted PC1 output using the existing key. The firmware
+still lacks hub-initiated Classic PC reconnection; this scoped recovery does not
+implement reliable automatic reconnection.
+
+The next controlled change raises only the Classic experiment's host-side
+`MAX_NR_CONTROLLER_ACL_BUFFERS` cap from 3 to 8. The actual CYW43439 reports
+8 Classic buffers and a separate 8-buffer LE pool; BTstack still clamps the
+Classic allowance to what the controller reports. The normal BLE-output build
+keeps its original cap of 3. The software report queue, 2,500 us pacing and BLE
+mouse parameters are unchanged. This uses existing controller capacity, not
+additional radio bandwidth or eight computer connections.
+
+`latency` now records controller-reported capacities and classifies each send
+request's initial HCI state: no controller credit, shared packet buffer reserved,
+transport unavailable with credit available, or HCI ready. These are initial
+snapshots, not a trace of every state transition during the wait. In the 8-buffer
+capture all five `CAN_SEND_NOW` waits of at least 10 ms began without credit;
+HCI-ready requests completed within 156 us. Thus credit exhaustion is directly
+observed for those delays, but why credits were delayed remains unproven.
+
+| Separate approximately 60-second motion captures | 3-buffer cap | 8-buffer cap |
+| --- | --- | --- |
+| Mouse submissions in the measured window | 2,416 | 1,728 |
+| Mean MCU queue-to-L2CAP time | 1.53 ms | 0.91 ms |
+| Mouse queue waits at least 10 ms | 58 (2.40%) | 6 (0.35%) |
+| Maximum mouse queue wait | 126.97 ms | 131.15 ms |
+
+These are different physical-motion samples, not matched workloads or
+sensor-to-screen measurements. The user reported noticeably smoother motion
+with occasional remaining stutter, so the 8-buffer cap is retained for this
+experiment. No links disconnected during the latest window. The unchanged
+worst-case spike means the problem is improved, not fully resolved; raising the
+cap above controller capacity would not be a solution.
+
+Repeated PC authentication failures with `0x23` were also observed while Pico
+immediately initiated authentication on an incoming ACL. The Classic backend
+now gives the incoming PC 500 ms to initiate authentication before requesting
+its own security upgrade if still needed. Reports remain blocked until the same
+bond, Level 2, 16-byte-key and two-HID-channel checks succeed. The next connection
+encrypted using the saved key without a Pico authentication request or collision.
+This does not add outgoing PC reconnection or relax failure handling.
+
+#### Mouse-only 7.5 ms interval trial
+
+The optional interval trial retains the 8-buffer cap and 2,500 us Classic output
+pacing:
+
+```powershell
+.\tools\build.ps1 -Jobs 8 -OpenClassicInputTest -ClassicOutputTest -MouseInterval7p5
+```
+
+It identifies itself as `0.4.3-classic-output-test-mouse7p5` and writes to the
+same Classic build directory. In normal mode, only HID-ready BLE inputs with
+a mouse role request minimum/maximum interval 6/6 (7.5 ms). Composite mouse
+devices are included; keyboard-only inputs and PC output links are excluded.
+The request retains the current peripheral latency and supervision timeout;
+returning from fast mode instead restores their saved baseline values.
+Encryption, input-radio-busy, serialized-update and quiet-window guards remain.
+A subsequently applied peer interval change can re-arm a request, spaced at
+least 10 seconds from the previous request. Rejection or timeout alone does
+not trigger retries. Normal mode does not enable the latency-zero rejection
+guard. Peer/controller acceptance is still required; `latency` reports the
+actual interval, not just the desired value.
+
+The hardware accepted 7.500 ms while retaining peripheral latency 44 and
+supervision timeout 2,160 ms. PC1 remained at 2,500 us software pacing, and all
+three links became ready using their saved authorizations. Windows required
+one separately authorized restart of the Pico HID node; FILCO needed waking.
+The user reported occasional very good response followed by noticeably laggy
+motion, so the interval change has **not** resolved intermittent stutter.
+
+In a subsequent 60-second capture with all three links established, there were
+1,930 mouse reports and 1,766 output submissions after movement merging. The
+short input-gap mean was 9.51 ms (gaps above 100 ms excluded). Mean MCU
+queue-to-L2CAP time was 1.76 ms, with 76 waits of at least 10 ms (4.30%) and a
+65.57 ms maximum. All 55 `CAN_SEND_NOW` waits of at least 10 ms started without
+controller credit; their maximum was 65.06 ms. There were no observed parameter
+changes, disconnects or output errors in this window. Reports occupied only
+the first approximately 21 seconds, so this is not a confirmed continuous-motion
+comparison; absent reports do not distinguish idle from a stall. Different
+workloads also prevent attributing the change in slow-wait frequency solely to
+7.5 ms. These measurements do not include controller residence or screen latency.
+
+Omit `-MouseInterval7p5` to build the preceding Classic policy again. Its saved
+working image, with the mouse previously negotiating 11.25 ms, is
+`backups\pico_bt_hub-classic-acl8-mouse11p25.uf2`, SHA256
+`E0F23A5CBB858E7A168436E44DEAA1C474B1B74C69A564EBF4A0F5C40A5424C2`.
+The trial is off by default and cannot be enabled in the BLE-output build.
+
+#### 7.5 ms output pacing trial
+
+To retain the mouse's 7.5 ms input interval and reduce the Classic output rate
+limit independently:
+
+```powershell
+.\tools\build.ps1 -Jobs 8 -OpenClassicInputTest -ClassicOutputTest -MouseInterval7p5 -ClassicOutput7p5
+```
+
+This build identifies itself as
+`0.4.3-classic-output-test-mouse7p5-output7p5`. Ordinary keyboard/mouse
+submissions share a minimum gap of 7,500 us, approximately 133.33 reports/second
+combined. The 8-buffer cap, input latency/timeout and security policy are
+unchanged. The first report after idle still sends as soon as possible; this is
+not a mandatory 7.5 ms collection window. Pending pure motion with unchanged
+buttons merges using the existing queue, while button transitions, wheel
+events and keyboard events remain ordered. Safety neutral releases bypass
+pacing, and missed opportunities do not generate catch-up bursts.
+
+This may reduce burst pressure at the cost of additional pacing delay; it does
+not guarantee an available controller credit or a radio transmission every
+7.5 ms. The input BLE interval and output software timer are not synchronized.
+Use `latency` to distinguish pacing/queue wait from `CAN_SEND_NOW` wait.
+Omit only `-ClassicOutput7p5` to return to the 2.5 ms output limit while retaining
+the 7.5 ms input trial. Neither trial flag affects the normal BLE-output build.
+
+The 7.5 ms output trial was deployed with all three links ready, the mouse at
+7.500 ms / latency 44 / timeout 2,160 ms, and the Classic cap still 8. Its
+60-second sample contained 1,823 mouse inputs and 1,666 mouse submissions.
+Mean mouse queue-to-L2CAP time was 4.00 ms, with 45 waits of at least 10 ms
+(2.70%) and a 78.21 ms maximum. There were 29 slow `CAN_SEND_NOW` waits, all
+starting without controller credit, with a 72.57 ms maximum. No disconnects or
+parameter changes were observed in the window. This differs from the earlier
+2.5 ms sample (1.76 ms mean, 65.57 ms maximum), but input workloads and keyboard
+activity were different; it is not a matched or end-to-end latency comparison.
+Reducing the rate limit did not eliminate long waits and did add pacing delay.
+
+The user's final requested configuration is **7.5 ms mouse input, 2.5 ms
+Classic output, and 8 controller buffers**, not 11.25 ms input. The preceding
+firmware was restored from
+`backups\pico_bt_hub-classic-mouse7p5-output2p5.uf2`, SHA256
+`28850090724E189293B397B515D04D88E34AE890DDBB8463EFF8F26483929FD3`.
+Build that configuration with `-MouseInterval7p5` and without
+`-ClassicOutput7p5`. Intermittent stutter remains unresolved; neither pacing
+setting guarantees timely radio delivery.
+
+The saved rollback image is
+`backups\pico_bt_hub-0.4.3-ble-baseline.uf2`, SHA256
+`F89C76D5C31E8B69281990E3858DD56C82E152FAE8F6E6843A3E68D0A0A7F025`.
+Reflashing it restores the BLE backend using its preserved records; normal
+firmware loading does not erase pairing storage. Do not globally clear bonds
+or remove all Windows Bluetooth devices to diagnose the experiment. If
+Windows reuses a cached BLE device entry, resolve that individual pairing
+explicitly before proceeding.
+
+### BLE baseline measurements
+
 The saved 0.4.0 checkpoint remains the functional baseline. Firmware 0.4.1 adds
 on-demand measurements and a reversible performance mode:
 
@@ -173,6 +491,93 @@ both PC intervals stayed at 7.5 ms. This is a useful diagnostic lead, not proof
 of a single cause: PC2 subsequently reconnected after another `0x28` error.
 The current policy still permits later peer parameter updates; it does not
 permanently enforce zero peripheral latency or disable device firmware sleep.
+
+### Optional BLE mouse-buffer experiment
+
+```text
+mouse-buffer on
+mouse-buffer off
+mouse-buffer status
+```
+
+This is a **default-on, RAM-only** BLE output experiment: rebooting enables it.
+The BLE firmware version has a `-mouse-buffer` suffix. A runtime `off` lasts until
+the next reboot; it is not written to Flash.
+It is independent of `latency fast|normal`, changes no connection parameters or
+pairing records, and is explicitly unsupported by the Classic output backend.
+`off` removes the experimental hold immediately, retains queued input in order,
+and resumes baseline sending/merging; it does not disconnect devices or discard
+movement. Actual sending still requires transport readiness and available credits.
+
+With the experiment enabled:
+
+- The first pure movement can use any real available ACL credit. A new movement
+  burst means an empty output queue and either no movement since the last queue
+  reset or at least **100ms without nonzero X/Y input**, measured by the run-loop
+  millisecond clock. An empty queue alone does not restart this allowance.
+  Only the first packet bypasses the reserve if a large delta needs splitting.
+- Subsequent pure movement normally submits only with **at least five free ACL
+  slots**, leaving four. The observed controller has eight LE slots shared by
+  all BLE links, not eight per mouse/PC; other traffic can consume the reserve.
+  Adjacent pure movement with unchanged buttons is merged in the Pico's existing
+  64-event queue. There is no attempt to fill a 251-byte ACL packet: a mouse HID
+  report remains six bytes regardless of accumulated movement.
+- The oldest queued movement has a **7,500us intentional-hold budget**. Merging,
+  splitting and `latency reset` do not restart its deadline. A microsecond timer
+  wakes the sender at the deadline; controller-credit returns also wake it.
+  At expiry the reserve is relaxed, but zero real credits still means waiting
+  for ATT/controller availability, not repeatedly scheduling an expired timer.
+- Keyboard reports, mouse button changes, wheels and zero-motion reports are
+  ordered boundaries. They are not merged with pure movement or with one another.
+  Their arrival cancels reservation-based waiting for earlier movement, which
+  must be submitted **before** the boundary; clicks never overtake movement.
+  Safety releases retain their existing priority and queue-clearing semantics.
+
+The 7.5ms value limits deliberate accumulation, **not** total queue, radio or
+Windows latency. Run-loop scheduling, transport backpressure and errors can delay
+submission further; the controller-credit count is not a mouse acknowledgement.
+If the deadline timer cannot be armed, firmware logs an error and disables only
+this experiment, retaining the queue and resuming the baseline path.
+
+`mouse-buffer status` (also included in `status` and `latency`) shows the policy,
+per-PC waiting state, shared free credits, `hold-entries` and `deadline-sends`.
+`hold-entries` counts transitions into reservation waiting, not reports;
+`deadline-sends` counts successful submissions that relax the four-slot reserve
+after expiry, not delivered packets. `latency reset` clears these counters but
+leaves the experiment and pending deadlines intact. Enabling it with existing
+queued data cannot undo merges already performed while it was off.
+
+For A/B measurements, keep the same `latency` mode and negotiated interval,
+set `mouse-buffer on` or `off` **before** `latency reset` and `output-test`.
+During an active generator run, `mouse-buffer off` and `mouse-buffer status`
+remain available; enabling requires stopping the run first. Disabling mid-run
+is safe but mixes policies within that sample. Performance benefit remains
+unverified until a hardware comparison is performed.
+
+On 2026-09-25, the default-on image `0.4.3-open-test-mouse-buffer` was flashed
+with existing bonds retained. M720, FILCO and PC1 reconnected, and the operator
+reported much better mouse feel. This was not a controlled buffering on/off
+comparison. `latency fast` negotiated 7.5ms/latency 0 for both BLE links, but
+the mouse subsequently restored peripheral latency 44 before the sample;
+PC1 retained 7.5ms/latency 0.
+
+In the following 30-second physical-mouse sample, the first post-capture
+`latency` snapshot counted 3,701 mouse enqueues/submissions, no merges or errors,
+eight reservation holds and no deadline-reserve overrides. Queue-to-ATT mean
+was 537us, maximum 3,424us, with no waits reaching 5ms. Windows recorded 3,198
+nonzero-motion events: mean arrival gap 9.382ms, p95 15.408ms, maximum 71.946ms.
+Two gaps exceeded 50ms (71.946ms and 70.910ms), and none reached 100ms.
+These Windows timings include host scheduling and are not absolute RF latency.
+Counts are not a packet-loss calculation.
+
+Pico's input-gap mean excluding >100ms gaps was 8.124ms, with a 22.587ms maximum
+in that short-gap group. One >100ms idle-or-stall gap was also counted; the
+subsequent 31.1-second trace reported it as 127.545ms. The MCU collection begins
+slightly before the Windows capture, and that later trace also extends beyond
+it, so neither its 3,794-report count nor its 4,089us output maximum should be
+substituted for the earlier snapshot. The trace recorded no disconnections or
+parameter changes. There were no keyboard reports in this measurement window;
+the operator deferred a separate keyboard sample and retained the running setup.
 
 ### Isolated minimum-security Classic input experiment
 
@@ -560,6 +965,15 @@ This command also works in the Level 0 experimental image without `bridge on`,
 so the PC output connection can be enrolled independently. It does not enable
 input forwarding: the unencrypted keyboard still needs an explicit `bridge on`.
 
+If Windows has forgotten an old BLE bond while the Pico still retains it,
+BTstack reports `PIN_OR_KEY_MISSING` before continuing the new Pairing Request.
+Only an explicitly open, authorized pairing window lets a provisional,
+unencrypted output link continue that handshake. It remains unable to send
+input until fresh pairing, identity verification and 16-byte-key encryption
+complete; the original authentication timeout still applies. Closed-window
+requests, established-link failures and other security errors remain rejected.
+No unrelated bonds or logical PC reservations are erased.
+
 The original `pair on` mode is still available without a connected keyboard.
 It uses the console's display/confirmation workflow, including
 `confirm <ticket> yes` only after comparing both six-digit displays, or
@@ -570,6 +984,76 @@ To isolate the output radio before adding input devices, `select 1`,
 selected ready PC. Use a blank text editor. These commands are rejected while
 physical input peers are connected, a switch is pending, or keyboard enrollment
 is active; they never run automatically.
+
+Both BLE and Classic output images provide `output-test 7500` and
+`output-test 2500`: a **30-second**, internally timed mouse-motion generator.
+First use `disconnect 1` and `disconnect 2`, wait for both inputs to show
+`paused`, and confirm that only the selected encrypted PC link remains. Saved targets
+and bonds are preserved. Stop scans/enrollment and close pairing before starting.
+The generator moves horizontally by one count per event, reversing every
+64 events; it never presses a key/button or scrolls. It keeps the normal output
+queue, motion merging, controller credits and configured output pacing intact.
+Thus `7500` changes the **test event generation period**, not normal output pacing
+or the BLE connection interval. BLE uses its existing ATT notification scheduler;
+Classic retains its configured minimum submission period. For BLE, record the
+negotiated interval from `latency`; `latency fast` requests 7.5ms/latency 0 for
+the selected PC but requires peer acceptance and also changes queue draining.
+Wait for negotiation to settle before resetting counters and starting a sample.
+Changing the selected PC or connecting another peer aborts the generator.
+
+Use `latency reset` before each test; afterward inspect `output-test status`,
+`latency`, and `latency trace`. The independent microsecond timer records
+generator lateness and skipped periods instead of sending catch-up bursts.
+Do not use repeated serial `move` commands to measure 2.5ms performance:
+the console itself polls every 10ms. `output-test stop`, `release`, loss of
+PC readiness, or input/radio activity stops the generator. Stopping discards
+pending test motion and sends neutral safety reports; these are included in
+the safety/CAN_SEND counters, not ordinary mouse submissions. The generator is
+inactive at boot and never changes persistent settings. Resume the saved input
+targets explicitly after the experiment.
+
+Pico enqueue-to-L2CAP timings still do not measure radio delivery. A separate
+PC-side, device-filtered Windows Raw Input recorder can measure report arrival
+intervals, which also include Windows/message-thread scheduling. Neither metric
+alone is absolute sensor-to-display latency. Motion merging and zero-motion
+filtering mean different generated/submitted/Raw Input counts are not by
+themselves evidence of packet loss.
+
+On 2026-09-25, the same Windows PC was measured with both physical inputs paused
+and no other PC connected. Classic used its 2.5ms minimum submission period and
+eight controller buffers. BLE used `latency fast`, with **7.5ms / latency 0**
+actually negotiated. These compare the existing backends, not protocol-only
+limits: Classic and BLE have different queue schedulers.
+
+| 30s sample | Generated | Submitted (L2CAP / ATT) | Merges | Mean / maximum MCU queue wait |
+| --- | ---: | ---: | ---: | --- |
+| Classic, 7.5ms generator | 3,999 | 3,999 | 0 | 0.601 / 0.721ms |
+| Classic, 2.5ms generator | 11,999 | 8,947 | 3,051 | 2.464 / 29.716ms |
+| BLE, 7.5ms generator, motion-only repeat | 3,999 | 3,999 | 0 | 0.420 / 0.567ms |
+| BLE, 2.5ms generator, motion-only repeat | 11,999 | 11,977 | 22 | 0.415 / 45.384ms |
+
+Classic's 2.5ms sample discarded one remaining merged event at automatic stop;
+all samples used the ordinary motion-merging path and no buttons/keys. The BLE
+repeat recorded Windows **nonzero-motion Raw Input events** at 131.0 / 132.8 per
+second for the 7.5 / 2.5ms generators. Mean gaps were 7.635 / 7.530ms; maximum
+gaps were 31.621 / 37.248ms; gaps >=20ms numbered 6 / 7, with none >=50ms.
+Each lasted 30 seconds with no reconnect, parameter update or notification
+error. The 2.5ms BLE repeat still had two MCU queue waits >=10ms, including
+the 45.384ms maximum: higher throughput did not eliminate every outlier.
+
+The first BLE pass submitted 3,999 / 11,995 reports and had maximum MCU waits
+0.547 / 13.110ms. Its unfiltered Windows recorder included a 56.609ms **last**
+gap after the high-load stimulus ended, motivating a second pass with a
+per-event motion/no-motion flag and neutral reports excluded. Do not silently
+discard this first sample or treat its unclassified last gap as a proven
+in-motion stall. Classic's older Windows samples included neutral events
+(maximum 28.960 / 31.247ms; >=20ms counts 50 / 64), so those event statistics
+are not identically filtered. These short, non-interleaved samples support
+better BLE submission throughput in this setup, not guaranteed 400Hz Windows
+delivery, zero latency, or a measured benefit with live keyboard/mouse inputs.
+Local logs are `build\classic-output\output-only-*-20260925-*`,
+`build\ble-output-only-*-20260925-*`, and
+`build\ble-output-motion-*-20260925-*`.
 
 ## Switching and input safety
 

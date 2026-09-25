@@ -3,9 +3,16 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "hub_config.h"
 
 #define HUB_OUTPUT_STORE_SLOTS 4u
+#if HUB_CLASSIC_OUTPUT_TEST
+#define HUB_OUTPUT_STORE_TAG 0x50484331u /* PHC1; never replace the BLE PC record. */
+#define HUB_OUTPUT_STORE_NAME "PHC1"
+#else
 #define HUB_OUTPUT_STORE_TAG 0x50484f31u /* PHO1; separate from input policy/bond tags. */
+#define HUB_OUTPUT_STORE_NAME "PHO1"
+#endif
 #define HUB_OUTPUT_STORE_BYTES 44u
 
 typedef struct {

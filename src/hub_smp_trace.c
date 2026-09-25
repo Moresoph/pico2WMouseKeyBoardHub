@@ -1,6 +1,7 @@
 #include "hub_smp_decode.h"
 #include "hub_classic_decode.h"
 #include "hub_diag_ring.h"
+#include "hub_perf.h"
 
 #include <inttypes.h>
 #include <stdarg.h>
@@ -110,6 +111,10 @@ static void trace_classic(const hub_classic_metadata_t *metadata, const char *di
 }
 
 static void trace_packet(uint8_t packet_type, uint8_t incoming, uint8_t *packet, uint16_t length) {
+    if (packet_type == HCI_ACL_DATA_PACKET) {
+        if (incoming) hub_perf_acl_receive(packet, length);
+        else hub_perf_acl_transmit(packet, length);
+    }
     hub_classic_metadata_t classic;
     if ((packet_type == HCI_COMMAND_DATA_PACKET && hub_classic_command_decode(packet, length, &classic))
         || (packet_type == HCI_EVENT_PACKET && hub_classic_event_decode(packet, length, &classic))) {

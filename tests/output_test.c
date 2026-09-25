@@ -20,6 +20,11 @@ static int flash_length;
 static unsigned flash_writes, flash_attempts;
 static bool fail_write, fail_readback, no_tlv, fail_read;
 static bool synchronous_send;
+static bool pairing_window;
+static int free_acl_slots;
+static bool track_acl_slots, motion_timer_pending, motion_timer_error;
+static uint32_t motion_timer_due;
+static void (*motion_timer_callback)(void);
 static uint8_t notify_error, disconnect_error, registration_error;
 static uint32_t clock_ms, clock_us;
 static unsigned notify_attempts, registration_attempts, callback_depth, max_callback_depth;
@@ -84,6 +89,23 @@ void btstack_tlv_get_instance(const btstack_tlv_t **impl, void **context) {
 }
 uint32_t btstack_run_loop_get_time_ms(void) { return clock_ms; }
 uint32_t hub_latency_now_us(void) { return clock_us; }
+int hci_number_free_acl_slots_for_handle(hci_con_handle_t handle) {
+    assert(handle < TEST_HANDLES && links[handle].connected);
+    return free_acl_slots;
+}
+bool hub_output_timer_schedule_us(uint32_t delay, void (*callback)(void)) {
+    assert(!motion_timer_pending && delay > 0 && delay <= MOUSE_HOLD_US);
+    assert(callback == motion_timer_ready);
+    if (motion_timer_error) return false;
+    motion_timer_due = clock_us + delay;
+    motion_timer_callback = callback;
+    motion_timer_pending = true;
+    return true;
+}
+void hub_output_timer_cancel(void) {
+    motion_timer_pending = false;
+    motion_timer_callback = NULL;
+}
 void hub_perf_output_wait(uint16_t handle, unsigned slot, bool mouse, uint32_t wait_us) {
     (void)mouse; (void)wait_us;
     assert(computer_for_handle(handle) != NULL);
@@ -109,8 +131,8 @@ void btstack_run_loop_set_timer_handler(btstack_timer_source_t *timer,
     timer->process = handler;
 }
 void hub_router_release_all(void) { ++router_releases; hub_output_release_all(); }
-bool hub_security_pairing_open(void) { return false; }
-bool hub_security_allow_pairing(hci_con_handle_t handle) { (void)handle; return false; }
+bool hub_security_pairing_open(void) { return pairing_window; }
+bool hub_security_allow_pairing(hci_con_handle_t handle) { (void)handle; return pairing_window; }
 void hci_add_event_handler(btstack_packet_callback_registration_t *registration) {
     (void)registration;
 }
@@ -176,7 +198,7 @@ uint8_t att_server_request_to_send_notification(btstack_context_callback_registr
     assert(((computer_t *)registration->context)->handle == handle);
     ++registration_attempts;
     if (registration_error) return registration_error;
-    if (synchronous_send) call_send(registration);
+    if (synchronous_send && free_acl_slots > 0) call_send(registration);
     else links[handle].pending = registration;
     return ERROR_CODE_SUCCESS;
 }
@@ -190,6 +212,8 @@ uint8_t att_server_notify(hci_con_handle_t handle, uint16_t attribute,
     assert(length == (attribute == KEYBOARD_HANDLE ? 8 : 6));
     ++notify_attempts;
     if (notify_error) return notify_error;
+    assert(free_acl_slots > 0);
+    if (track_acl_slots) --free_acl_slots;
     assert(notification_count < 512);
     notifications[notification_count].handle = handle;
     notifications[notification_count].attribute = attribute;
@@ -235,8 +259,12 @@ static void boot(void) {
     notify_attempts = registration_attempts = callback_depth = max_callback_depth = 0;
     main_callback_count = 0;
     yield_timer_pending = false;
+    free_acl_slots = 8;
+    track_acl_slots = motion_timer_pending = motion_timer_error = false;
+    motion_timer_callback = NULL;
     yield_timer_delay = 0;
     hub_output_init();
+    assert(mouse_buffering);
     hub_output_start();
 }
 
@@ -254,6 +282,8 @@ static void fresh(void) {
         bonds[i].key_size = 16;
     }
     boot();
+    /* Keep the baseline scenarios explicit even though firmware boots ON. */
+    assert(hub_output_set_mouse_buffering(false));
 }
 
 static void tick(void) {
@@ -264,7 +294,7 @@ static void tick(void) {
 
 static void deliver(unsigned handle) {
     btstack_context_callback_registration_t *registration = links[handle].pending;
-    if (!registration) return;
+    if (!registration || free_acl_slots == 0) return;
     links[handle].pending = NULL;
     assert(((computer_t *)registration->context)->handle == handle);
     call_send(registration);
@@ -494,6 +524,75 @@ static void redundant_reencryption_does_not_revoke_verified_link(void) {
     failed[11] = ERROR_CODE_AUTHENTICATION_FAILURE;
     security_event(HCI_EVENT_PACKET, 0, failed, sizeof(failed));
     assert(!hub_output_ready(0) && computer->rejected && disconnects == 1);
+}
+
+static void explicit_repair_after_peer_loses_bond(void) {
+    uint8_t event[12] = {SM_EVENT_REENCRYPTION_COMPLETE, 10};
+    little_endian_store_16(event, 2, 2);
+    event[11] = ERROR_CODE_PIN_OR_KEY_MISSING;
+
+    fresh();
+    ready_peer(1, 0, false);
+    unsigned writes = flash_writes;
+    disconnect_peer(1);
+    pump();
+    connect_peer(2, HCI_ROLE_SLAVE, 0, false);
+    security_event(HCI_EVENT_PACKET, 0, event, sizeof(event));
+    assert(disconnects == 1 && computer_for_handle(2)->rejected);
+
+    fresh();
+    ready_peer(1, 0, false);
+    writes = flash_writes;
+    disconnect_peer(1);
+    pump();
+    connect_peer(2, HCI_ROLE_SLAVE, 0, false);
+    computer_t *computer = computer_for_handle(2);
+    uint32_t deadline = computer->auth_deadline;
+    pairing_window = true;
+    security_event(HCI_EVENT_PACKET, 0, event, sizeof(event));
+    assert(!disconnects && !computer->rejected && !hub_output_ready(0));
+    assert(!computer->authentication_complete && !computer->identity_authenticated);
+    assert(!hub_output_mouse(0, 1, 0, 0) && flash_writes == writes);
+    assert(computer->auth_deadline == deadline);
+    links[2].key_size = 16;
+    subscribe(2);
+    pump();
+    assert(!hub_output_ready(0));
+    event[0] = SM_EVENT_PAIRING_COMPLETE;
+    event[11] = 0;
+    security_event(HCI_EVENT_PACKET, 0, event, sizeof(event));
+    pump();
+    assert(hub_output_ready(0) && computer->slot == 0 && flash_writes == writes);
+
+    fresh();
+    ready_peer(2, 0, false);
+    event[0] = SM_EVENT_REENCRYPTION_COMPLETE;
+    event[11] = ERROR_CODE_PIN_OR_KEY_MISSING;
+    security_event(HCI_EVENT_PACKET, 0, event, sizeof(event));
+    assert(disconnects == 1 && !hub_output_ready(0));
+
+    fresh();
+    connect_peer(2, HCI_ROLE_SLAVE, 0, false);
+    event[0] = SM_EVENT_PAIRING_COMPLETE;
+    event[11] = ERROR_CODE_PIN_OR_KEY_MISSING;
+    security_event(HCI_EVENT_PACKET, 0, event, sizeof(event));
+    assert(disconnects == 1); /* Real pairing failures still fail closed. */
+
+    fresh();
+    connect_peer(2, HCI_ROLE_SLAVE, 0, false);
+    event[0] = SM_EVENT_REENCRYPTION_COMPLETE;
+    event[11] = ERROR_CODE_AUTHENTICATION_FAILURE;
+    security_event(HCI_EVENT_PACKET, 0, event, sizeof(event));
+    assert(disconnects == 1);
+
+    fresh();
+    connect_peer(2, HCI_ROLE_SLAVE, 0, false);
+    event[11] = ERROR_CODE_PIN_OR_KEY_MISSING;
+    security_event(HCI_EVENT_PACKET, 0, event, sizeof(event));
+    clock_ms += OUTPUT_AUTH_TIMEOUT_MS;
+    tick();
+    assert(disconnects == 1 && !hub_output_ready(0)); /* No endless repair lease. */
+    pairing_window = false;
 }
 
 static void authentication_guards(void) {
@@ -1087,11 +1186,361 @@ static void reset_preserves_pending_state(void) {
     assert(output_metrics[0].reports[0].wait_count == 1);
 }
 
+static void advance_us(uint32_t delta) {
+    clock_us += delta;
+    clock_ms += delta / 1000u;
+}
+
+static void fire_motion_deadline(void) {
+    assert(motion_timer_pending);
+    advance_us(motion_timer_due - clock_us);
+    motion_timer_pending = false;
+    void (*callback)(void) = motion_timer_callback;
+    motion_timer_callback = NULL;
+    callback();
+}
+
+static void completed_credits(int free_slots) {
+    free_acl_slots = free_slots;
+    uint8_t packet[] = {HCI_EVENT_NUMBER_OF_COMPLETED_PACKETS, 5, 1, 1, 0, 1, 0};
+    hci_event(HCI_EVENT_PACKET, 0, packet, sizeof(packet));
+    run_main_callbacks();
+}
+
+static void buffer_setup(bool fast) {
+    fresh();
+    ready_peer(1, 0, false);
+    synchronous_send = true;
+    hub_output_set_low_latency(fast);
+    assert(!mouse_buffering);
+    unsigned writes = flash_writes;
+    assert(hub_output_set_mouse_buffering(true));
+    assert(mouse_buffering && flash_writes == writes);
+    track_acl_slots = true;
+}
+
+static void buffer_threshold_and_deadline(void) {
+    for (unsigned fast = 0; fast < 2; ++fast) {
+        buffer_setup(fast != 0);
+        unsigned sent = notification_count;
+        free_acl_slots = 1;
+        assert(hub_output_mouse(0, 1, 0, 0)); /* First report uses the last real slot. */
+        assert(notification_count == sent + 1 && free_acl_slots == 0);
+        advance_us(2500);
+        free_acl_slots = 4;
+        unsigned registrations = registration_attempts;
+        assert(hub_output_mouse(0, 2, 0, 0));
+        assert(computers[0].motion_waiting && motion_timer_pending);
+        uint32_t deadline = motion_timer_due;
+        advance_us(2500);
+        assert(hub_output_mouse(0, 3, 0, 0));
+        assert(motion_timer_due == deadline && computers[0].count == 1);
+        for (unsigned i = 0; i < 20; ++i) {
+            request_send(&computers[0]);
+            completed_credits(4);
+        }
+        assert(registration_attempts == registrations && notification_count == sent + 1);
+        advance_us(deadline - clock_us - 1u);
+        request_send(&computers[0]);
+        assert(notification_count == sent + 1); /* Exactly 7,499us is still held. */
+        fire_motion_deadline();
+        assert(notification_count == sent + 2 && free_acl_slots == 3);
+        assert(little_endian_read_16(notifications[sent + 1].data, 1) == 5);
+        assert(output_metrics[0].motion_deadline_sends == 1);
+        assert(!computers[0].count && !motion_timer_pending);
+
+        advance_us(2500);
+        assert(hub_output_mouse(0, 4, 0, 0)); /* Empty queue does NOT mean a new burst. */
+        assert(computers[0].motion_waiting);
+        completed_credits(5);
+        assert(notification_count == sent + 3 && free_acl_slots == 4);
+        assert(!computers[0].motion_waiting && !motion_timer_pending);
+        advance_us(MOUSE_IDLE_MS * 1000u);
+        free_acl_slots = 1;
+        assert(hub_output_mouse(0, 5, 0, 0));
+        assert(notification_count == sent + 4 && free_acl_slots == 0);
+        assert(max_callback_depth == 1);
+    }
+}
+
+static void buffer_no_credit_and_callback_recheck(void) {
+    for (unsigned fast = 0; fast < 2; ++fast) {
+        buffer_setup(fast != 0);
+        assert(hub_output_mouse(0, 1, 0, 0));
+        advance_us(2500);
+        unsigned sent = notification_count;
+        free_acl_slots = 0;
+        assert(hub_output_mouse(0, 2, 0, 0));
+        fire_motion_deadline();
+        assert(notification_count == sent && !motion_timer_pending);
+        assert(links[1].pending && computers[0].send_registered);
+        unsigned registrations = registration_attempts;
+        for (unsigned i = 0; i < 20; ++i) request_send(&computers[0]);
+        assert(registration_attempts == registrations);
+        completed_credits(1);
+        deliver(1);
+        assert(notification_count == sent + 1 && free_acl_slots == 0);
+
+        advance_us(2500);
+        synchronous_send = false;
+        free_acl_slots = 5;
+        assert(hub_output_mouse(0, 3, 0, 0));
+        assert(links[1].pending && !motion_timer_pending);
+        free_acl_slots = 4; /* Another BLE link consumes a credit before the callback. */
+        deliver(1);
+        assert(notification_count == sent + 1 && computers[0].motion_waiting);
+        assert(!links[1].pending && motion_timer_pending);
+        completed_credits(5);
+        deliver(1);
+        assert(notification_count == sent + 2 && free_acl_slots == 4);
+        assert(!motion_timer_pending && !computers[0].count);
+    }
+}
+
+static void buffer_discrete_fifo(void) {
+    for (unsigned fast = 0; fast < 2; ++fast) {
+        buffer_setup(fast != 0);
+        assert(hub_output_mouse(0, 1, 0, 0));
+        advance_us(2500);
+        free_acl_slots = 4;
+        unsigned sent = notification_count;
+        assert(hub_output_mouse(0, 2, 0, 0));
+        assert(computers[0].motion_waiting);
+        synchronous_send = false;
+        const uint8_t neutral[8] = {0};
+        assert(hub_output_keyboard(key_down));
+        assert(links[1].pending && !motion_timer_pending); /* Key wakes earlier movement. */
+        assert(hub_output_keyboard(neutral));
+        assert(hub_output_mouse(1, 0, 0, 0));
+        assert(hub_output_mouse(1, 3, 0, 0));
+        assert(hub_output_mouse(1, 0, 0, 1));
+        assert(hub_output_mouse(1, 0, 0, -1));
+        assert(hub_output_mouse(1, 4, 0, 0));
+        assert(hub_output_mouse(0, 0, 0, 0));
+        assert(hub_output_mouse(0, 5, 0, 0));
+        assert(computers[0].count == 10); /* Button/wheel boundaries never merge. */
+        for (unsigned i = 0; i < 10; ++i) {
+            free_acl_slots = 8;
+            request_send(&computers[0]);
+            deliver(1);
+            run_main_callbacks();
+        }
+        assert(notification_count == sent + 10 && !computers[0].count);
+        assert(little_endian_read_16(notifications[sent].data, 1) == 2);
+        assert(notifications[sent + 1].attribute == KEYBOARD_HANDLE
+            && notifications[sent + 1].data[2] == 4);
+        assert(notifications[sent + 2].attribute == KEYBOARD_HANDLE
+            && notifications[sent + 2].data[2] == 0);
+        assert(notifications[sent + 3].data[0] == 1
+            && little_endian_read_16(notifications[sent + 3].data, 1) == 0);
+        assert(notifications[sent + 4].data[0] == 1
+            && little_endian_read_16(notifications[sent + 4].data, 1) == 3);
+        assert(notifications[sent + 5].data[5] == 1);
+        assert(notifications[sent + 6].data[5] == 255);
+        assert(little_endian_read_16(notifications[sent + 7].data, 1) == 4);
+        assert(notifications[sent + 8].data[0] == 0
+            && little_endian_read_16(notifications[sent + 8].data, 1) == 0);
+        assert(little_endian_read_16(notifications[sent + 9].data, 1) == 5);
+    }
+}
+
+static void buffer_toggle_reset_wrap_and_split(void) {
+    buffer_setup(true);
+    assert(hub_output_mouse(0, 1, 0, 0));
+    clock_us = UINT32_MAX - 1000u;
+    free_acl_slots = 4;
+    unsigned sent = notification_count, writes = flash_writes;
+    assert(hub_output_mouse(0, 2, 0, 0));
+    uint32_t deadline = motion_timer_due;
+    advance_us(2500);
+    hub_output_latency_reset();
+    assert(hub_output_mouse(0, 3, 0, 0));
+    assert(motion_timer_due == deadline);
+    fire_motion_deadline();
+    assert(notification_count == sent + 1);
+    assert(little_endian_read_16(notifications[sent].data, 1) == 5);
+    assert(output_metrics[0].reports[1].wait_count == 0);
+    assert(output_metrics[0].motion_deadline_sends == 1);
+    advance_us(2500);
+    assert(hub_output_mouse(0, 4, 0, 0));
+    assert(computers[0].motion_waiting);
+    assert(hub_output_set_mouse_buffering(false));
+    assert(!motion_timer_pending && !computers[0].motion_waiting);
+    assert(notification_count == sent + 2 && flash_writes == writes);
+    assert(little_endian_read_16(notifications[sent + 1].data, 1) == 4);
+    assert(hub_output_set_mouse_buffering(true));
+    advance_us(2500);
+    assert(hub_output_mouse(0, 6, 0, 0));
+    assert(computers[0].motion_waiting); /* Toggling doesn't create another idle bypass. */
+    hub_output_release_all();
+    free_acl_slots = 8;
+    deliver(1);
+    run_main_callbacks();
+    if (computers[0].release_pending) request_send(&computers[0]);
+    assert(!computers[0].motion_waiting && !motion_timer_pending);
+    boot();
+    assert(mouse_buffering && !motion_timer_pending && flash_writes == writes);
+
+    buffer_setup(true);
+    free_acl_slots = 4;
+    sent = notification_count;
+    assert(hub_output_mouse(0, 40000, 0, 0));
+    run_main_callbacks();
+    assert(notification_count == sent + 1 && free_acl_slots == 3);
+    assert(computers[0].motion_waiting); /* Only the first packet bypasses, not all splits. */
+    fire_motion_deadline();
+    assert(notification_count == sent + 2 && !computers[0].count);
+    assert(little_endian_read_16(notifications[sent].data, 1) == 32767);
+    assert(little_endian_read_16(notifications[sent + 1].data, 1) == 7233);
+}
+
+static void buffer_security_switch_and_disconnect(void) {
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        buffer_setup(true);
+        ready_peer(2, 1, false);
+        free_acl_slots = 8;
+        assert(hub_output_mouse(0, 1, 0, 0));
+        advance_us(2500);
+        free_acl_slots = 4;
+        assert(hub_output_mouse(0, 42, 0, 0));
+        assert(motion_timer_pending);
+        unsigned ordinary = nonneutral_notifications();
+        if (mode == 0) {
+            links[1].key_size = 0;
+            tick();
+        } else if (mode == 1) {
+            uint8_t suspend = 0;
+            assert(write_attribute(1, ATT_CHARACTERISTIC_2A4C_01_VALUE_HANDLE,
+                                   0, 0, &suspend, 1) == 0);
+        } else if (mode == 2) {
+            assert(hub_output_select(1));
+        } else {
+            completed_credits(4); /* Queue/dequeue a credit wake before the disconnect. */
+            disconnect_peer(1);
+        }
+        assert(!motion_timer_pending && !computers[0].motion_waiting);
+        free_acl_slots = 8;
+        pump();
+        run_main_callbacks();
+        assert(nonneutral_notifications() == ordinary);
+        if (mode == 3) {
+            ready_peer(3, 0, false);
+            assert(hub_output_mouse(0, 7, 0, 0));
+            assert(notifications[notification_count - 1].handle == 3);
+        }
+    }
+}
+
+static void buffer_timer_and_notify_failures(void) {
+    buffer_setup(true);
+    assert(hub_output_mouse(0, 1, 0, 0));
+    advance_us(2500);
+    free_acl_slots = 4;
+    motion_timer_error = true;
+    unsigned sent = notification_count;
+    assert(hub_output_mouse(0, 2, 0, 0));
+    assert(!mouse_buffering && !motion_timer_pending && !computers[0].count);
+    assert(notification_count == sent + 1); /* Explicit error disables only the experiment. */
+
+    buffer_setup(true);
+    assert(hub_output_mouse(0, 1, 0, 0));
+    advance_us(2500);
+    free_acl_slots = 4;
+    assert(hub_output_mouse(0, 3, 0, 0));
+    notify_error = ERROR_CODE_COMMAND_DISALLOWED;
+    fire_motion_deadline();
+    assert(computers[0].count == 1 && computers[0].retry_pending);
+    assert(!motion_timer_pending && output_metrics[0].motion_deadline_sends == 0);
+    notify_error = 0;
+    tick();
+    assert(!computers[0].count && output_metrics[0].motion_deadline_sends == 1);
+    assert(output_metrics[0].reports[1].notify_errors == 1);
+}
+
+static void buffer_pending_toggle_and_idle(void) {
+    buffer_setup(false);
+    free_acl_slots = 0;
+    unsigned sent = notification_count;
+    assert(hub_output_mouse(0, 1, 0, 0));
+    assert(links[1].pending && !motion_timer_pending && notification_count == sent);
+    completed_credits(1);
+    deliver(1);
+    assert(notification_count == sent + 1 && free_acl_slots == 0);
+    advance_us((MOUSE_IDLE_MS - 1u) * 1000u);
+    free_acl_slots = 4;
+    assert(hub_output_mouse(0, 2, 0, 0));
+    assert(motion_timer_pending && notification_count == sent + 1);
+    assert(hub_output_set_mouse_buffering(false));
+    assert(notification_count == sent + 2 && !motion_timer_pending);
+
+    synchronous_send = false;
+    assert(hub_output_mouse(1, 0, 0, 1));
+    assert(hub_output_mouse(1, 3, 0, -1)); /* Baseline merges button/wheel/motion. */
+    assert(computers[0].count == 1 && !computers[0].queue[computers[0].head].motion_only);
+    assert(hub_output_set_mouse_buffering(true));
+    assert(hub_output_mouse(1, 4, 0, 0));
+    assert(computers[0].count == 2); /* Do not merge new movement into an old boundary. */
+    deliver(1);
+    assert(notification_count == sent + 3);
+    assert(notifications[sent + 2].data[0] == 1
+        && little_endian_read_16(notifications[sent + 2].data, 1) == 3);
+    request_send(&computers[0]);
+    assert(motion_timer_pending);
+    assert(hub_output_set_mouse_buffering(false));
+    assert(links[1].pending && !motion_timer_pending && computers[0].count == 1);
+    deliver(1);
+    assert(notification_count == sent + 4 && !computers[0].count);
+    assert(little_endian_read_16(notifications[sent + 3].data, 1) == 4);
+}
+
+static void buffer_boundary_wake_and_overflow(void) {
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        buffer_setup(false);
+        assert(hub_output_mouse(0, 1, 0, 0));
+        advance_us(2500);
+        free_acl_slots = 4;
+        unsigned sent = notification_count;
+        assert(hub_output_mouse(0, 2, 0, 0));
+        assert(motion_timer_pending);
+        assert(hub_output_mouse(mode == 0 ? 1 : 0, 0, 0, mode == 1 ? 1 : 0));
+        assert(notification_count == sent + 1 && !motion_timer_pending);
+        assert(little_endian_read_16(notifications[sent].data, 1) == 2);
+        request_send(&computers[0]);
+        assert(notification_count == sent + 2 && !computers[0].count);
+    }
+
+    buffer_setup(true);
+    assert(hub_output_mouse(0, 1, 0, 0));
+    advance_us(2500);
+    free_acl_slots = 4;
+    assert(hub_output_mouse(0, 2, 0, 0));
+    free_acl_slots = 5;
+    uint8_t completed[] = {HCI_EVENT_NUMBER_OF_COMPLETED_PACKETS, 5, 1, 1, 0, 1, 0};
+    hci_event(HCI_EVENT_PACKET, 0, completed, sizeof(completed));
+    hub_output_set_low_latency(false);
+    assert(computers[0].continuation_pending);
+    run_main_callbacks();
+    assert(!motion_timer_pending && !computers[0].count && free_acl_slots == 4);
+
+    advance_us(2500);
+    assert(hub_output_mouse(0, 3, 0, 0));
+    assert(motion_timer_pending);
+    free_acl_slots = 0;
+    unsigned ordinary = nonneutral_notifications();
+    for (unsigned i = 1; i < OUTPUT_QUEUE_LENGTH; ++i) assert(hub_output_keyboard(key_down));
+    assert(!hub_output_keyboard(key_down));
+    assert(!computers[0].count && !motion_timer_pending && !computers[0].motion_waiting);
+    free_acl_slots = 8;
+    pump();
+    assert(nonneutral_notifications() == ordinary && !computers[0].release_pending);
+}
+
 int main(void) {
     migration_and_restore();
     provisional_and_duplicates();
     authentication_guards();
     redundant_reencryption_does_not_revoke_verified_link();
+    explicit_repair_after_peer_loses_bond();
     selection_target_disappears();
     context_disconnect_lifetime();
     reservation_capacity();
@@ -1110,6 +1559,14 @@ int main(void) {
     timing_rollover_and_bins();
     split_mouse_oldest_timestamp();
     reset_preserves_pending_state();
-    puts("Output persistence/state-machine/latency tests passed (22 scenario groups)");
+    buffer_threshold_and_deadline();
+    buffer_no_credit_and_callback_recheck();
+    buffer_discrete_fifo();
+    buffer_toggle_reset_wrap_and_split();
+    buffer_security_switch_and_disconnect();
+    buffer_timer_and_notify_failures();
+    buffer_pending_toggle_and_idle();
+    buffer_boundary_wake_and_overflow();
+    puts("Output persistence/state-machine/latency tests passed (31 scenario groups)");
     return 0;
 }

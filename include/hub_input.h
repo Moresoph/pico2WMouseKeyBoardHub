@@ -15,7 +15,9 @@ bool hub_input_connect(unsigned slot, bool classic, uint8_t address_type,
                        const char *address);
 void hub_input_disconnect(unsigned slot);
 bool hub_input_is_connection(uint16_t handle);
+bool hub_input_is_ble_mouse_ready(uint16_t handle);
 bool hub_input_is_expected_classic(const uint8_t address[6]);
+bool hub_input_is_classic_target(const uint8_t address[6]);
 bool hub_input_allow_pairing(uint16_t handle);
 bool hub_input_keyboard_ready(void);
 bool hub_input_pairing_busy(void);

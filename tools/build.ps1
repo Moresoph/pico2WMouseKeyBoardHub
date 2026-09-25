@@ -15,6 +15,9 @@ param(
     [ValidateRange(1, 256)]
     [int]$Jobs = [Math]::Max(1, [Environment]::ProcessorCount),
     [switch]$OpenClassicInputTest,
+    [switch]$ClassicOutputTest,
+    [switch]$MouseInterval7p5,
+    [switch]$ClassicOutput7p5,
     [string]$SdkPath = $env:PICO_SDK_PATH,
     [string]$ToolchainPath = $env:PICO_TOOLCHAIN_PATH
 )
@@ -22,7 +25,16 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
+if ($MouseInterval7p5 -and -not $ClassicOutputTest) {
+    throw '-MouseInterval7p5 requires -ClassicOutputTest.'
+}
+if ($ClassicOutput7p5 -and -not $ClassicOutputTest) {
+    throw '-ClassicOutput7p5 requires -ClassicOutputTest.'
+}
 $tools = Join-Path $root '.tools'
+if ($ClassicOutputTest -and -not $PSBoundParameters.ContainsKey('BuildDirectory')) {
+    $BuildDirectory = 'build\classic-output'
+}
 if ([string]::IsNullOrWhiteSpace($SdkPath)) {
     $SdkPath = Join-Path $root '.deps\pico-sdk'
 }
@@ -66,6 +78,9 @@ $configureArguments = @(
     '-DPICO_BOARD=pico2_w',
     '-DPICO_PLATFORM=rp2350-arm-s',
     "-DHUB_CLASSIC_OPEN_TEST=$([int]$OpenClassicInputTest.IsPresent)",
+    "-DHUB_CLASSIC_OUTPUT_TEST=$([int]$ClassicOutputTest.IsPresent)",
+    "-DHUB_CLASSIC_MOUSE_7P5_TEST=$([int]$MouseInterval7p5.IsPresent)",
+    "-DHUB_CLASSIC_OUTPUT_7P5_TEST=$([int]$ClassicOutput7p5.IsPresent)",
     "-DPICO_SDK_PATH=$SdkPath",
     "-DPICO_TOOLCHAIN_PATH=$ToolchainPath",
     "-DPython3_EXECUTABLE=$python",

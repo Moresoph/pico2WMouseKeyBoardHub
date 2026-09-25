@@ -4,10 +4,12 @@
 
 #include "btstack.h"
 #include "hub_config.h"
+#include "hub_hid_report.h"
 #include "hub_latency.h"
 #include "hub_perf.h"
 #include "hub_output.h"
 #include "hub_output_store.h"
+#include "hub_output_timer.h"
 #include "hub_router.h"
 #include "hub_security.h"
 #include "hub.h"
@@ -17,6 +19,9 @@
 #define OUTPUT_SERVICE_INTERVAL_MS 5u
 #define OUTPUT_PUMP_BUDGET 8u
 #define OUTPUT_PUMP_YIELD_MS 1u
+#define MOUSE_RESERVE_SLOTS 4u
+#define MOUSE_HOLD_US 7500u
+#define MOUSE_IDLE_MS 100u
 #define RELEASE_KEYBOARD 1u
 #define RELEASE_MOUSE 2u
 #define RELEASE_BOTH (RELEASE_KEYBOARD | RELEASE_MOUSE)
@@ -26,32 +31,11 @@
 #define MOUSE_HANDLE ATT_CHARACTERISTIC_2A4D_03_VALUE_HANDLE
 #define MOUSE_CCCD ATT_CHARACTERISTIC_2A4D_03_CLIENT_CONFIGURATION_HANDLE
 
-/* IDs identify GATT report references; IDs are not part of report payloads. */
-static const uint8_t report_map[] = {
-    0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x01,
-    0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00, 0x25, 0x01,
-    0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
-    0x75, 0x08, 0x95, 0x01, 0x81, 0x03,
-    0x05, 0x08, 0x19, 0x01, 0x29, 0x05,
-    0x75, 0x01, 0x95, 0x05, 0x91, 0x02,
-    0x75, 0x03, 0x95, 0x01, 0x91, 0x03,
-    0x05, 0x07, 0x19, 0x00, 0x29, 0xff, 0x15, 0x00, 0x26, 0xff, 0x00,
-    0x75, 0x08, 0x95, 0x06, 0x81, 0x00, 0xc0,
-    0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x85, 0x02,
-    0x09, 0x01, 0xa1, 0x00,
-    0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01,
-    0x75, 0x01, 0x95, 0x05, 0x81, 0x02,
-    0x75, 0x03, 0x95, 0x01, 0x81, 0x03,
-    0x05, 0x01, 0x09, 0x30, 0x09, 0x31,
-    0x16, 0x00, 0x80, 0x26, 0xff, 0x7f,
-    0x75, 0x10, 0x95, 0x02, 0x81, 0x06,
-    0x09, 0x38, 0x15, 0x80, 0x25, 0x7f,
-    0x75, 0x08, 0x95, 0x01, 0x81, 0x06, 0xc0, 0xc0
-};
-
 typedef struct {
     uint8_t kind;
     bool timing_valid;
+    bool motion_only;
+    bool first_motion;
     uint32_t enqueued_us;
     union {
         uint8_t keyboard[8];
@@ -74,6 +58,7 @@ typedef struct {
     output_report_metrics_t reports[2];
     unsigned queue_highwater;
     uint32_t mouse_merges, releases, release_errors, registration_errors, budget_yields;
+    uint32_t motion_holds, motion_deadline_sends;
 } output_metrics_t;
 
 typedef struct {
@@ -90,6 +75,9 @@ typedef struct {
     bool yield_pending;
     bool retry_pending;
     bool ready_logged;
+    bool motion_seen;
+    bool motion_waiting;
+    uint32_t last_motion_ms;
     uint8_t key_size;
     uint8_t address_type;
     uint8_t leds;
@@ -124,6 +112,8 @@ static btstack_timer_source_t pump_timer;
 static btstack_context_callback_registration_t pump_registration;
 static output_metrics_t output_metrics[HUB_COMPUTER_COUNT];
 static bool low_latency;
+static bool mouse_buffering, motion_timer_armed;
+static uint32_t motion_timer_due_us;
 static bool continuation_registered;
 static bool pump_timer_armed;
 static unsigned active_slot;
@@ -138,6 +128,19 @@ static uint8_t advertising_status;
 static void request_send(computer_t *computer);
 static void progress_switch(void);
 static void schedule_continuation(computer_t *computer);
+static void motion_timer_ready(void);
+
+static void cancel_motion_timer(void) {
+    if (motion_timer_armed) hub_output_timer_cancel();
+    motion_timer_armed = false;
+}
+
+static void clear_motion_wait(computer_t *computer) {
+    computer->motion_waiting = false;
+    for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i)
+        if (computers[i].motion_waiting) return;
+    cancel_motion_timer();
+}
 
 static unsigned slot_of(const computer_t *computer) {
     return computer->slot;
@@ -187,6 +190,8 @@ uint16_t hub_output_active_handle(void) {
 }
 
 static void clear_queue(computer_t *computer) {
+    clear_motion_wait(computer);
+    computer->motion_seen = false;
     memset(computer->queue, 0, sizeof(computer->queue));
     computer->head = 0;
     computer->count = 0;
@@ -296,6 +301,41 @@ static void measure_notify(computer_t *computer, const output_event_t *event) {
     ++metrics->wait_bins[bin];
 }
 
+static bool reserved_motion(const computer_t *computer) {
+    if (!mouse_buffering || !computer->count || computer->release_pending) return false;
+    const output_event_t *head = &computer->queue[computer->head];
+    if (!head->motion_only || head->first_motion) return false;
+    /* A later key/button/wheel is a FIFO barrier: flush earlier motion first. */
+    for (unsigned i = 1; i < computer->count; ++i)
+        if (!computer->queue[(computer->head + i) % OUTPUT_QUEUE_LENGTH].motion_only) return false;
+    return true;
+}
+
+static bool hold_motion(computer_t *computer) {
+    if (!mouse_buffering) return false;
+    uint32_t now = hub_latency_now_us();
+    uint32_t age = computer->count ? now - computer->queue[computer->head].enqueued_us : 0;
+    if (!reserved_motion(computer) || age >= MOUSE_HOLD_US
+        || hci_number_free_acl_slots_for_handle(computer->handle) > (int)MOUSE_RESERVE_SLOTS) {
+        clear_motion_wait(computer);
+        return false;
+    }
+    if (!computer->motion_waiting) ++output_metrics[computer->slot].motion_holds;
+    computer->motion_waiting = true;
+    uint32_t delay = MOUSE_HOLD_US - age;
+    uint32_t due = now + delay;
+    if (motion_timer_armed && (int32_t)(motion_timer_due_us - due) <= 0) return true;
+    cancel_motion_timer();
+    motion_timer_due_us = due;
+    motion_timer_armed = hub_output_timer_schedule_us(delay, motion_timer_ready);
+    if (motion_timer_armed) return true;
+    mouse_buffering = false;
+    for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) computers[i].motion_waiting = false;
+    printf("[mouse-buffer] ERROR: deadline timer unavailable; experiment disabled,"
+           " baseline sending resumed\n");
+    return false;
+}
+
 static void can_send(void *context) {
     computer_t *computer = context;
     computer->send_registered = false;
@@ -308,6 +348,8 @@ static void can_send(void *context) {
     if (!release) {
         if (!hub_output_ready(slot_of(computer)) || switch_pending
             || slot_of(computer) != active_slot || computer->count == 0) return;
+        /* Credits may have changed since the ATT callback was requested. */
+        if (hold_motion(computer)) return;
         event = &computer->queue[computer->head];
         kind = event->kind;
         if (kind == RELEASE_KEYBOARD) {
@@ -322,6 +364,9 @@ static void can_send(void *context) {
             report[5] = (uint8_t)wheel;
         }
     }
+    bool deadline_send = !release && reserved_motion(computer)
+        && (uint32_t)(hub_latency_now_us() - event->enqueued_us) >= MOUSE_HOLD_US
+        && hci_number_free_acl_slots_for_handle(computer->handle) <= (int)MOUSE_RESERVE_SLOTS;
     uint8_t status = att_server_notify(computer->handle,
         kind == RELEASE_KEYBOARD ? KEYBOARD_HANDLE : MOUSE_HANDLE,
         report, kind == RELEASE_KEYBOARD ? 8 : 6);
@@ -338,6 +383,7 @@ static void can_send(void *context) {
     }
     computer->last_send_error = 0;
     computer->retry_pending = false;
+    if (deadline_send) ++output_metrics[computer->slot].motion_deadline_sends;
     ++computer->sent;
     if (kind == RELEASE_KEYBOARD) memcpy(computer->last_keyboard, report, 8);
     else memcpy(computer->last_mouse, report, 6);
@@ -349,6 +395,7 @@ static void can_send(void *context) {
         pop_event(computer);
     } else {
         measure_notify(computer, event);
+        event->first_motion = false;
         event->value.mouse.x -= dx;
         event->value.mouse.y -= dy;
         event->value.mouse.wheel -= wheel;
@@ -393,6 +440,7 @@ static void request_send(computer_t *computer) {
     computer->pumping = true;
     unsigned budget = low_latency ? OUTPUT_PUMP_BUDGET : 1u;
     while (budget && send_work(computer)) {
+        if (!sendable_release(computer) && hold_motion(computer)) break;
         --budget;
         uint32_t sent_before = computer->sent;
         computer->send_registered = true;
@@ -412,7 +460,18 @@ static void request_send(computer_t *computer) {
     }
     computer->pumping = false;
     if (low_latency && !budget && !computer->send_registered
-        && !computer->retry_pending && send_work(computer)) defer_pump(computer);
+        && !computer->retry_pending && !computer->motion_waiting
+        && send_work(computer)) defer_pump(computer);
+}
+
+static void motion_timer_ready(void) {
+    motion_timer_armed = false;
+    for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) {
+        computer_t *computer = &computers[i];
+        if (!computer->motion_waiting) continue;
+        computer->motion_waiting = false;
+        if (mouse_buffering) request_send(computer);
+    }
 }
 
 static void continue_pump(void *context) {
@@ -422,7 +481,7 @@ static void continue_pump(void *context) {
         computer_t *computer = &computers[i];
         bool pending = computer->continuation_pending;
         computer->continuation_pending = false;
-        if (low_latency && pending) request_send(computer);
+        if ((low_latency || mouse_buffering) && pending) request_send(computer);
     }
     /* base_execute_callbacks drains until empty. Budget exhaustion MUST use a
        timer, not enqueue this callback again and monopolize the same run. */
@@ -443,7 +502,35 @@ void hub_output_set_low_latency(bool enabled) {
     low_latency = enabled;
     for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) {
         if (enabled) schedule_continuation(&computers[i]);
-        else computers[i].continuation_pending = false;
+        else if (!mouse_buffering) computers[i].continuation_pending = false;
+    }
+}
+
+bool hub_output_set_mouse_buffering(bool enabled) {
+    mouse_buffering = enabled;
+    if (!enabled) {
+        for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) computers[i].motion_waiting = false;
+        cancel_motion_timer();
+    }
+    for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) request_send(&computers[i]);
+    hub_output_mouse_buffer_status();
+    return mouse_buffering == enabled;
+}
+
+void hub_output_mouse_buffer_status(void) {
+    printf("[mouse-buffer] enabled=%u reserve-free=%u hold-us=%u idle-ms=%u;"
+           " RAM-only, boot default ON; shared ACL credits, NOT mouse ACKs\n",
+           mouse_buffering, MOUSE_RESERVE_SLOTS, MOUSE_HOLD_US, MOUSE_IDLE_MS);
+    for (unsigned slot = 0; slot < HUB_COMPUTER_COUNT; ++slot) {
+        computer_t *computer = computer_for_slot(slot);
+        const output_metrics_t *metrics = &output_metrics[slot];
+        if (!computer && !metrics->motion_holds && !metrics->motion_deadline_sends) continue;
+        printf("[mouse-buffer] PC%u waiting=%u free-acl=%d hold-entries=%" PRIu32
+               " deadline-sends=%" PRIu32 "\n", slot + 1,
+               computer && computer->motion_waiting,
+               computer && computer->occupied
+                   ? hci_number_free_acl_slots_for_handle(computer->handle) : -1,
+               metrics->motion_holds, metrics->motion_deadline_sends);
     }
 }
 
@@ -465,6 +552,7 @@ bool hub_output_keyboard(const uint8_t report[8]) {
     unsigned tail = (computer->head + computer->count) % OUTPUT_QUEUE_LENGTH;
     output_event_t *event = &computer->queue[tail];
     event->kind = RELEASE_KEYBOARD;
+    event->motion_only = event->first_motion = false;
     memcpy(event->value.keyboard, report, 8);
     event->value.keyboard[1] = 0;
     ++computer->count;
@@ -473,30 +561,40 @@ bool hub_output_keyboard(const uint8_t report[8]) {
     return true;
 }
 
-static bool bounded_motion(int64_t x, int64_t y, int64_t wheel) {
-    /* Bound work as well as RAM: enormous deltas must not delay a button-up for
-       millions of notifications. Intermediate arithmetic cannot overflow int32. */
-    return x >= -32768 * 32 && x <= 32767 * 32
-        && y >= -32768 * 32 && y <= 32767 * 32
-        && wheel >= -128 * 32 && wheel <= 127 * 32;
-}
-
 bool hub_output_mouse(uint8_t buttons, int32_t dx, int32_t dy, int32_t wheel) {
     computer_t *computer = computer_for_slot(active_slot);
     if (switch_pending || !hub_output_ready(active_slot)) return false;
     buttons &= 0x1f;
-    if (!bounded_motion(dx, dy, wheel)) return queue_overflow(computer, "excessive mouse delta");
+    if (!hub_hid_motion_bounded(dx, dy, wheel)) return queue_overflow(computer, "excessive mouse delta");
+    uint8_t previous_buttons = computer->last_mouse[0];
+    for (unsigned i = computer->count; i > 0; --i) {
+        const output_event_t *previous = &computer->queue[(computer->head + i - 1) % OUTPUT_QUEUE_LENGTH];
+        if (previous->kind == RELEASE_MOUSE) {
+            previous_buttons = previous->value.mouse.buttons;
+            break;
+        }
+    }
+    bool pure_motion = !wheel && (dx || dy) && buttons == previous_buttons;
+    uint32_t now_ms = btstack_run_loop_get_time_ms();
+    bool first_motion = pure_motion && !computer->count && (!computer->motion_seen
+        || (uint32_t)(now_ms - computer->last_motion_ms) >= MOUSE_IDLE_MS);
+    if (dx || dy) {
+        computer->motion_seen = true;
+        computer->last_motion_ms = now_ms;
+    }
     if (computer->count != 0) {
         unsigned tail = (computer->head + computer->count - 1) % OUTPUT_QUEUE_LENGTH;
         output_event_t *event = &computer->queue[tail];
-        if (event->kind == RELEASE_MOUSE && event->value.mouse.buttons == buttons) {
+        if (event->kind == RELEASE_MOUSE && event->value.mouse.buttons == buttons
+            && (!mouse_buffering || (pure_motion && event->motion_only))) {
             int64_t x = (int64_t)event->value.mouse.x + dx;
             int64_t y = (int64_t)event->value.mouse.y + dy;
             int64_t w = (int64_t)event->value.mouse.wheel + wheel;
-            if (!bounded_motion(x, y, w)) return queue_overflow(computer, "mouse accumulation");
+            if (!hub_hid_motion_bounded(x, y, w)) return queue_overflow(computer, "mouse accumulation");
             event->value.mouse.x = (int32_t)x;
             event->value.mouse.y = (int32_t)y;
             event->value.mouse.wheel = (int32_t)w;
+            event->motion_only = event->motion_only && pure_motion;
             measure_enqueue(computer, event, true);
             request_send(computer);
             return true;
@@ -506,6 +604,8 @@ bool hub_output_mouse(uint8_t buttons, int32_t dx, int32_t dy, int32_t wheel) {
     unsigned tail = (computer->head + computer->count) % OUTPUT_QUEUE_LENGTH;
     output_event_t *event = &computer->queue[tail];
     event->kind = RELEASE_MOUSE;
+    event->motion_only = pure_motion;
+    event->first_motion = first_motion;
     event->value.mouse.buttons = buttons;
     event->value.mouse.x = dx;
     event->value.mouse.y = dy;
@@ -579,7 +679,7 @@ static uint16_t read_attribute(hci_con_handle_t handle, uint16_t attribute, uint
     if (error != 0) return ATT_READ_ERROR_CODE_OFFSET + error;
     switch (attribute) {
         case ATT_CHARACTERISTIC_2A4B_01_VALUE_HANDLE:
-            return att_read_callback_handle_blob(report_map, sizeof(report_map),
+            return att_read_callback_handle_blob(hub_hid_report_descriptor, sizeof(hub_hid_report_descriptor),
                                                 offset, buffer, buffer_size);
         case KEYBOARD_CCCD:
             return att_read_callback_handle_little_endian_16(computer->keyboard_cccd,
@@ -795,6 +895,13 @@ static void hci_event(uint8_t packet_type, uint16_t channel, uint8_t *packet, ui
     if (packet_type != HCI_EVENT_PACKET) return;
     computer_t *computer;
     switch (hci_event_packet_get_type(packet)) {
+        case HCI_EVENT_NUMBER_OF_COMPLETED_PACKETS:
+            /* Recheck after all HCI handlers, without a synchronous ATT spin. */
+            if (mouse_buffering) {
+                for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i)
+                    if (computers[i].motion_waiting) schedule_continuation(&computers[i]);
+            }
+            break;
         case HCI_EVENT_META_GAP:
             if (hci_event_gap_meta_get_subevent_code(packet) == GAP_SUBEVENT_LE_CONNECTION_COMPLETE)
                 connected(packet);
@@ -899,6 +1006,19 @@ static void security_event(uint8_t packet_type, uint16_t channel, uint8_t *packe
     if (computer == NULL) return;
     printf("[output] handle=0x%04x %s status=0x%02x\n", handle, operation, status);
     if (status != ERROR_CODE_SUCCESS) {
+        /* BTstack emits this before continuing a new Pairing Request when only
+           our side retains an LTK. Never treat it as authentication success. */
+        if (hci_event_packet_get_type(packet) == SM_EVENT_REENCRYPTION_COMPLETE
+            && status == ERROR_CODE_PIN_OR_KEY_MISSING
+            && hub_security_pairing_open() && hub_security_allow_pairing(handle)
+            && computer->slot == HUB_COMPUTER_COUNT && !computer->rejected
+            && !computer->disconnecting && !computer->authentication_complete
+            && !computer->identity_authenticated && gap_encryption_key_size(handle) == 0) {
+            require_release(computer);
+            printf("[output] peer lacks old BLE bond; explicit pairing window permits"
+                   " fresh pairing; still unauthenticated, original deadline retained\n");
+            return;
+        }
         reject_computer(computer, "pairing/reencryption failed");
         return;
     }
@@ -947,6 +1067,8 @@ void hub_output_init(void) {
     _Static_assert(HUB_COMPUTER_COUNT == 4, "This feasibility firmware has four PC slots");
     _Static_assert(sizeof(HUB_DEVICE_NAME) - 1 <= 29, "BLE scan-response name too long");
     low_latency = continuation_registered = pump_timer_armed = false;
+    mouse_buffering = true;
+    cancel_motion_timer();
     memset(output_metrics, 0, sizeof(output_metrics));
     pump_registration.callback = continue_pump;
     pump_registration.context = NULL;
@@ -1004,6 +1126,7 @@ void hub_output_latency_reset(void) {
 }
 
 void hub_output_latency_status(void) {
+    hub_output_mouse_buffer_status();
     printf("[latency output] mode=%s service-fallback=%ums burst-budget=%u yield-timer=%ums\n",
            low_latency ? "fast" : "baseline", OUTPUT_SERVICE_INTERVAL_MS,
            OUTPUT_PUMP_BUDGET, OUTPUT_PUMP_YIELD_MS);
@@ -1041,6 +1164,7 @@ void hub_output_latency_status(void) {
 }
 
 void hub_output_status(void) {
+    hub_output_mouse_buffer_status();
     printf("[output] selected=PC%u saved-selected=PC%u storage=%s switching=%u "
            "advertising-requested=%u last-adv-status=0x%02x\n",
            active_slot + 1, output_store.selected + 1,

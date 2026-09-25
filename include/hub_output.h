@@ -14,6 +14,9 @@ bool hub_output_switching(void);
 /* Call from the BTstack/async-context lock, like the other output APIs.
    Baseline (default) sends once per trigger; fast mode drains a bounded burst. */
 void hub_output_set_low_latency(bool enabled);
+/* BLE-only RAM experiment, on at boot; independent of latency mode. */
+bool hub_output_set_mouse_buffering(bool enabled);
+void hub_output_mouse_buffer_status(void);
 uint16_t hub_output_active_handle(void);
 /* MCU enqueue -> successful ATT notify, not radio delivery. Metrics belong to
    logical PCs across reconnects. Reset keeps queues/state; pre-reset queued

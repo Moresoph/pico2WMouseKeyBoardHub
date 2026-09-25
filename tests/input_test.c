@@ -779,7 +779,85 @@ static void test_radio_busy_covers_establishment_and_scans(void) {
     assert(hub_input_radio_busy());
 }
 
+static void test_classic_target_isolation_survives_pause(void) {
+    reset_fixture();
+    seed_target(0, true, 0, 1, 1);
+    seed_target(1, false, 1, 2, 2);
+    hub_input_start();
+    assert(hub_input_is_classic_target(inputs[0].address));
+    assert(!hub_input_is_classic_target(inputs[1].address));
+    assert(!hub_input_is_classic_target(NULL));
+    const uint8_t unknown[] = {1, 2, 3, 4, 5, 6};
+    assert(!hub_input_is_classic_target(unknown));
+    inputs[0].paused = true;
+    inputs[0].state = INPUT_FAILED;
+    assert(hub_input_is_classic_target(inputs[0].address));
+    assert(!hub_input_is_expected_classic(inputs[0].address));
+    inputs[0].remove = true;
+    inputs[0].state = INPUT_CLOSING;
+    assert(hub_input_is_classic_target(inputs[0].address));
+    inputs[0].selected = false;
+    assert(!hub_input_is_classic_target(inputs[0].address));
+}
+
+static void test_hids_flow_metadata(void) {
+    reset_fixture();
+    input_slot_t *slot = &inputs[0];
+    slot->selected = true;
+    slot->state = INPUT_READY;
+    slot->cid = 1;
+    slot->service_count = 1;
+    slot->roles = HUB_INPUT_ROLE_MOUSE;
+    assert(save_descriptor(slot, 0, mouse_map, sizeof(mouse_map)));
+    uint8_t packet[] = {HCI_EVENT_GATTSERVICE_META, 9, GATTSERVICE_SUBEVENT_HID_REPORT,
+                         1, 0, 0, 0, 2, 0, 0, 5};
+    uint8_t original[sizeof(packet)];
+    memcpy(original, packet, sizeof(packet));
+    clock_ms = 42;
+    input_hids_event(HCI_EVENT_GATTSERVICE_META, 0, packet, sizeof(packet));
+    assert(slot->flow.hids == 1 && slot->flow.parsed == 1 && slot->flow.mouse == 1);
+    assert(slot->flow.hids_at == 42 && !slot->flow.invalid && routed_mouse == 1);
+    assert(!memcmp(original, packet, sizeof(packet)));
+    packet[7] = 3; /* Truncated callback payload. */
+    input_hids_event(HCI_EVENT_PACKET, 0, packet, sizeof(packet));
+    assert(slot->flow.rejected == 1 && slot->flow.parsed == 1);
+    packet[7] = 1; /* Synthetic ID but missing required mouse payload. */
+    input_hids_event(HCI_EVENT_PACKET, 0, packet, sizeof(packet));
+    assert(slot->flow.parsed == 2 && slot->flow.invalid == 1);
+    slot->state = INPUT_DISCOVERING;
+    input_hids_event(HCI_EVENT_PACKET, 0, packet, sizeof(packet));
+    assert(slot->flow.hids == 4 && slot->flow.rejected == 2);
+    uint32_t before = unmatched_hids_reports;
+    packet[3] = 2;
+    input_hids_event(HCI_EVENT_PACKET, 0, packet, sizeof(packet));
+    assert(unmatched_hids_reports == before + 1 && slot->flow.hids == 4);
+}
+
+static void test_ready_ble_mouse_identification(void) {
+    reset_fixture();
+    input_slot_t *slot = &inputs[0];
+    slot->selected = true;
+    slot->handle = 0x40;
+    slot->roles = HUB_INPUT_ROLE_BOTH;
+    slot->state = INPUT_DISCOVERING;
+    assert(!hub_input_is_ble_mouse_ready(0x40));
+    slot->state = INPUT_READY;
+    assert(hub_input_is_ble_mouse_ready(0x40));
+    assert(!hub_input_is_ble_mouse_ready(0x41));
+    assert(!hub_input_is_ble_mouse_ready(HCI_CON_HANDLE_INVALID));
+    slot->roles = HUB_INPUT_ROLE_KEYBOARD;
+    assert(!hub_input_is_ble_mouse_ready(0x40));
+    slot->roles = HUB_INPUT_ROLE_MOUSE;
+    slot->classic = true;
+    assert(!hub_input_is_ble_mouse_ready(0x40));
+    slot->classic = false;
+    slot->state = INPUT_CLOSING;
+    assert(!hub_input_is_ble_mouse_ready(0x40));
+}
+
 int main(void) {
+    test_ready_ble_mouse_identification();
+    test_hids_flow_metadata();
     test_records_and_policy();
     test_empty_boot_and_window();
     test_boot_privacy_and_backoff();
@@ -797,6 +875,7 @@ int main(void) {
     test_manual_pause_does_not_auto_resume();
     test_secure_image_does_not_activate_saved_open_input();
     test_radio_busy_covers_establishment_and_scans();
-    puts("input tests: 17 groups passed (production state machine and SDK HID parser)");
+    test_classic_target_isolation_survives_pause();
+    puts("input tests: 20 groups passed (production state machine and SDK HID parser)");
     return 0;
 }

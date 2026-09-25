@@ -22,6 +22,11 @@
 #include "hub_security_policy.h"
 #include "hub_latency.h"
 #include "hub_perf.h"
+#include "hub_output_probe.h"
+#if HUB_CLASSIC_OUTPUT_TEST
+#include "hub_classic_output.h"
+#include "hub_classic_mux.h"
+#endif
 
 typedef enum {
     LINK_CLASSIC,
@@ -99,6 +104,13 @@ static void refresh_pairing_mode(void) {
         just_works_pairing_mode = false;
         computer_pairing_policy = false;
         hub_security_configure(HUB_SECURITY_INPUTS);
+#if HUB_CLASSIC_OUTPUT_TEST
+        gap_ssp_set_io_capability(HUB_CLASSIC_OPEN_TEST
+            ? SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT : SSP_IO_CAPABILITY_DISPLAY_YES_NO);
+        gap_ssp_set_authentication_requirement(HUB_CLASSIC_OPEN_TEST
+            ? SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_NO_BONDING
+            : SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING);
+#endif
         if (was_keyboard) {
             hub_router_release_all();
             printf("[security] keyboard pairing ended; release all keys/buttons to resume\n");
@@ -134,7 +146,16 @@ bool hub_security_allow_pairing(uint16_t handle) {
     if (hub_input_is_connection(handle)) {
         return !computer_pairing_policy && hub_input_allow_pairing(handle);
     }
+#if HUB_CLASSIC_OUTPUT_TEST
+    for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i) {
+        if (links[i].used && links[i].handle == handle && links[i].role == LINK_CLASSIC) {
+            return hub_classic_output_allow_pairing(links[i].address);
+        }
+    }
+    return false;
+#else
     return hub_security_pairing_open();
+#endif
 }
 
 bool hub_security_input_pairing_blocked(void) {
@@ -196,8 +217,9 @@ static void print_link_counts(void) {
     for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i) {
         if (links[i].used) ++counts[links[i].role];
     }
-    printf("[links] total=%u classic=%u le-central=%u le-peripheral=%u (goal: 6)\n",
-           counts[0] + counts[1] + counts[2], counts[0], counts[1], counts[2]);
+    printf("[links] total=%u classic=%u le-central=%u le-peripheral=%u (goal: %u)\n",
+           counts[0] + counts[1] + counts[2], counts[0], counts[1], counts[2],
+           HUB_CLASSIC_OUTPUT_TEST ? 3u : 6u);
 }
 
 static void track_link(uint16_t handle, link_role_t role, const bd_addr_t address) {
@@ -224,6 +246,12 @@ static bool auth_allowed(const auth_request_t *request) {
     if (request->kind == AUTH_LE_CONFIRM || request->kind == AUTH_LE_PASSKEY) {
         return hub_security_allow_pairing(request->handle);
     }
+#if HUB_CLASSIC_OUTPUT_TEST
+    if (hub_classic_output_is_peer(request->address)) {
+        return request->kind == AUTH_CLASSIC_CONFIRM
+            && hub_classic_output_allow_pairing(request->address);
+    }
+#endif
     return hub_input_is_expected_classic(request->address);
 }
 
@@ -252,6 +280,9 @@ static void decline_auth(auth_request_t *request) {
 
 static void close_pairing_window(const char *reason) {
     pairing_enabled = false;
+#if HUB_CLASSIC_OUTPUT_TEST
+    hub_classic_output_pairing_changed(false);
+#endif
     abort_keyboard_capture(reason);
     for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i) {
         auth_request_t *request = &auth_requests[i];
@@ -259,6 +290,12 @@ static void close_pairing_window(const char *reason) {
             && !hub_input_is_connection(request->handle)) {
             decline_auth(request);
         }
+#if HUB_CLASSIC_OUTPUT_TEST
+        else if (request->kind != AUTH_NONE
+                 && hub_classic_output_is_peer(request->address)) {
+            decline_auth(request);
+        }
+#endif
     }
     refresh_pairing_mode();
     printf("[security] PC pairing closed: %s\n", reason);
@@ -479,6 +516,11 @@ static void controller_event(uint8_t packet_type, uint16_t channel,
                 hub_input_start();
                 cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
                 printf("\nPico 2 W Bluetooth Hub %s ready. Enter help.\n", PICO_PROGRAM_VERSION_STRING);
+#if HUB_CLASSIC_OUTPUT_TEST
+                gap_local_bd_addr(address);
+                printf("[classic-output] local address=%s; one encrypted PC only\n",
+                       bd_addr_to_str(address));
+#endif
                 if (HUB_CLASSIC_OPEN_TEST) {
                     printf("[open-test] Classic Level 0, mode 2; only saved explicit bridge authorizations restore\n");
                 }
@@ -538,6 +580,13 @@ static void controller_event(uint8_t packet_type, uint16_t channel,
                 hub_pairing_note("open-test-PIN-refused", 0, result);
                 break;
             }
+#if HUB_CLASSIC_OUTPUT_TEST
+            if (hub_classic_output_is_peer(address)) {
+                printf("[security] Classic PC requires SSP; legacy PIN refused\n");
+                gap_pin_code_negative(address);
+                break;
+            }
+#endif
             request_auth(AUTH_CLASSIC_PIN, HCI_CON_HANDLE_INVALID, address, 0);
             break;
         case HCI_EVENT_IO_CAPABILITY_RESPONSE:
@@ -552,6 +601,14 @@ static void controller_event(uint8_t packet_type, uint16_t channel,
             break;
         case HCI_EVENT_USER_CONFIRMATION_REQUEST:
             hci_event_user_confirmation_request_get_bd_addr(packet, address);
+#if HUB_CLASSIC_OUTPUT_TEST
+            if (just_works_pairing_mode && hub_classic_output_allow_pairing(address)) {
+                int result = gap_ssp_confirmation_response(address);
+                printf("[security] selected Classic PC %s: JustWorks consent (no MITM), reply=0x%02x; encryption still required\n",
+                       bd_addr_to_str(address), result);
+                break;
+            }
+#endif
             if (hub_input_open_test_peer(address) || (hub_input_is_expected_classic(address)
                 && classic_peer_io(address) == SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT)) {
                 printf("[security] selected Classic peer %s: Just Works accepted (no MITM)\n",
@@ -614,18 +671,30 @@ static bool parse_signed(const char *text, long min, long max, long *value) {
 }
 
 static void print_help(void) {
+#if HUB_CLASSIC_OUTPUT_TEST
+    printf("\n[experiment] SINGLE PC1 Classic HID output; BLE PC advertising and multi-PC switching disabled.\n"
+           "  classic target <address>   Authorize this PC's Bluetooth adapter (not the keyboard)\n"
+           "  pair justworks             Open Classic PC enrollment; then add the hub from the PC\n");
+#endif
     printf(
         "\nCommands (computer/input slots are 1-based):\n"
         "  help | status | bonds | diag | latency\n"
         "  latency fast|normal|reset  Runtime latency tuning / measurement reset\n"
         "  latency trace              RAM timing/link history (no input payloads)\n"
+        "  mouse-buffer on|off|status BLE motion-credit experiment; RAM-only, default on\n"
         "  diag                       Replay recent pairing metadata (no PIN/key values)\n"
         "  enroll | enroll stop       Timed automatic keyboard/mouse enrollment\n"
         "  inputs reset               Forget both inputs, then enroll replacements\n"
         "  input forget <1|2>         Forget only that input, preserve the other\n"
+#if !HUB_CLASSIC_OUTPUT_TEST
         "  pair keyboard              Pair a PC using an already-connected keyboard\n"
+#endif
         "  pair justworks             Pair one PC without code entry (encrypted, no MITM)\n"
+#if HUB_CLASSIC_OUTPUT_TEST
+        "  pair off                   Close the Classic PC window (120 seconds)\n"
+#else
         "  pair on | pair off         Console pairing / close window (120 seconds)\n"
+#endif
         "  confirm <ticket> yes|no     Verify numbers on both devices first\n"
         "  passkey <ticket> <123456>   Supply a six-digit remote passkey\n"
         "  pin <ticket> <PIN>          Legacy Classic PIN, 1..16 characters\n"
@@ -636,13 +705,23 @@ static void print_help(void) {
         "  connect <1|2> classic <AA:BB:CC:DD:EE:FF>\n"
         "  connect <1|2> ble public|random <AA:BB:CC:DD:EE:FF>\n"
         "  disconnect <1|2>\n"
+#if HUB_CLASSIC_OUTPUT_TEST
+        "  select 1                   Only PC1 exists in this experiment\n"
+#else
         "  select <1..4>              Keep all PC connections established\n"
+#endif
+        "  output-test 2500|7500      30s motion generator; only the selected PC may be connected\n"
+        "  output-test stop|status   Stop or inspect the temporary output diagnostic\n"
         "  tap <HID-code>             EXPLICIT test key, e.g. tap 0x04 = A\n"
         "  move <dx> <dy>             EXPLICIT test mouse motion, +/-1000\n"
         "  release                    Emergency all-keys/buttons release\n"
         "  unbond classic|public|random <address>  Requires no live links\n"
         "  bootsel                    Reboot to USB firmware drive\n"
+#if HUB_CLASSIC_OUTPUT_TEST
+        "Ctrl+Alt+Right/Left has no second PC to select in this experiment.\n"
+#else
         "Shortcut: Ctrl+Alt+Right/Left, then release all keys/buttons.\n"
+#endif
         "BOOTSEL while running: short=enroll; hold 8 seconds=input-only reset.\n\n");
 }
 
@@ -740,11 +819,47 @@ static bool test_input_allowed(void) {
         return false;
     }
     for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i) {
+#if HUB_CLASSIC_OUTPUT_TEST
+        if (links[i].used && links[i].role == LINK_CLASSIC
+            && links[i].handle == hub_output_active_handle()) continue;
+#endif
         if (links[i].used && links[i].role != LINK_LE_PERIPHERAL) {
             printf("[console] disconnect physical input peers before using tap/move\n");
             return false;
         }
     }
+    return true;
+}
+
+static bool probe_timer_armed;
+static void probe_timer_ready(async_context_t *context, async_at_time_worker_t *worker) {
+    (void)context;
+    (void)worker;
+    probe_timer_armed = false;
+    hub_output_probe_poll();
+}
+static async_at_time_worker_t probe_worker = { .do_work = probe_timer_ready };
+
+bool hub_output_probe_schedule_us(uint32_t delay_us) {
+    if (probe_timer_armed) return false;
+    probe_timer_armed = async_context_add_at_time_worker_at(cyw43_arch_async_context(),
+        &probe_worker, delayed_by_us(get_absolute_time(), delay_us));
+    return probe_timer_armed;
+}
+
+void hub_output_probe_cancel_timer(void) {
+    if (probe_timer_armed)
+        async_context_remove_at_time_worker(cyw43_arch_async_context(), &probe_worker);
+    probe_timer_armed = false;
+}
+
+bool hub_output_probe_allowed(void) {
+    if (!working || boot_pending || hub_security_pairing_open()
+        || hub_security_capture_active() || hub_input_radio_busy()) return false;
+    uint16_t pc = hub_output_active_handle();
+    if (pc == HCI_CON_HANDLE_INVALID) return false;
+    for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i)
+        if (links[i].used && links[i].handle != pc) return false;
     return true;
 }
 
@@ -768,6 +883,18 @@ static void console_command(char *line) {
         printf("[console] reboot already pending\n");
         return;
     }
+    if (hub_output_probe_active()) {
+        if (strcmp(args[0], "release") == 0 || strcmp(args[0], "bootsel") == 0)
+            hub_output_probe_stop();
+        else if (strcmp(args[0], "output-test") != 0 && strcmp(args[0], "status") != 0
+            && !(strcmp(args[0], "mouse-buffer") == 0 && argc == 2
+                && (strcmp(args[1], "off") == 0 || strcmp(args[1], "status") == 0))
+            && !(strcmp(args[0], "latency") == 0 && (argc == 1
+                || (argc == 2 && strcmp(args[1], "trace") == 0)))) {
+            printf("[output-test] stop the running test before other console commands\n");
+            return;
+        }
+    }
     if (strcmp(args[0], "help") == 0 && argc == 1) {
         print_help();
         return;
@@ -786,6 +913,21 @@ static void console_command(char *line) {
         return;
     }
     unsigned long number;
+    if (strcmp(args[0], "mouse-buffer") == 0 && argc == 2) {
+        if (strcmp(args[1], "status") == 0) { hub_output_mouse_buffer_status(); return; }
+        if (strcmp(args[1], "on") == 0 || strcmp(args[1], "off") == 0) {
+            hub_output_set_mouse_buffering(strcmp(args[1], "on") == 0);
+            return;
+        }
+    }
+    if (strcmp(args[0], "output-test") == 0 && argc == 2) {
+        if (strcmp(args[1], "stop") == 0) { hub_output_probe_stop(); return; }
+        if (strcmp(args[1], "status") == 0) { hub_output_probe_status(); return; }
+        if (parse_uint(args[1], 7500, 10, &number)) {
+            hub_output_probe_start((uint32_t)number);
+            return;
+        }
+    }
     if (strcmp(args[0], "latency") == 0) {
         if (argc == 1) { hub_latency_status(); return; }
         if (argc == 2 && strcmp(args[1], "fast") == 0) { hub_latency_set_fast(true); return; }
@@ -795,6 +937,7 @@ static void console_command(char *line) {
     }
     if (strcmp(args[0], "status") == 0 && argc == 1) {
         printf("[status] firmware=%s\n", PICO_PROGRAM_VERSION_STRING);
+        printf("[status] output=%s\n", HUB_CLASSIC_OUTPUT_TEST ? "Classic HID (single-PC experiment)" : "BLE HOGP");
         printf("[status] uptime-ms=%" PRIu32 " pairing=%s mode=%s keyboard-ready=%u passkey-pending=%u\n",
                btstack_run_loop_get_time_ms(),
                hub_security_pairing_open() ? "open" : "closed",
@@ -850,7 +993,26 @@ static void console_command(char *line) {
             return;
         }
     }
+#if HUB_CLASSIC_OUTPUT_TEST
+    if (strcmp(args[0], "classic") == 0 && argc == 3 && strcmp(args[1], "target") == 0) {
+        bd_addr_t address;
+        if (strlen(args[2]) != 17 || !sscanf_bd_addr(args[2], address)) {
+            printf("[classic-output] invalid PC Bluetooth address\n");
+        } else if (hub_security_pairing_open()) {
+            printf("[classic-output] close pair off before changing the target\n");
+        } else if (!hub_classic_output_set_target(address)) {
+            printf("[classic-output] target rejected; saved PCs/inputs were not replaced\n");
+        }
+        return;
+    }
+#endif
     if (strcmp(args[0], "pair") == 0 && argc == 2) {
+#if HUB_CLASSIC_OUTPUT_TEST
+        if (strcmp(args[1], "off") != 0 && strcmp(args[1], "justworks") != 0) {
+            printf("[classic-output] this experiment supports pair justworks or pair off only\n");
+            return;
+        }
+#endif
         if (HUB_CLASSIC_OPEN_TEST && !hub_input_open_bridge_enabled()
             && strcmp(args[1], "off") != 0 && strcmp(args[1], "justworks") != 0) {
             printf("[open-test] connect the Level 0 keyboard and explicitly enable bridge on first\n");
@@ -872,10 +1034,19 @@ static void console_command(char *line) {
             keyboard_pairing_mode = use_keyboard;
             just_works_pairing_mode = use_just_works;
             computer_pairing_policy = true;
+#if HUB_CLASSIC_OUTPUT_TEST
+            gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
+            gap_ssp_set_authentication_requirement(
+                SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING);
+#else
             hub_security_configure(use_just_works ? HUB_SECURITY_PC_JUST_WORKS
                 : use_keyboard ? HUB_SECURITY_PC_KEYBOARD : HUB_SECURITY_PC_CONSOLE);
+#endif
             pairing_deadline = btstack_run_loop_get_time_ms() + HUB_PAIRING_WINDOW_MS;
             pairing_enabled = true;
+#if HUB_CLASSIC_OUTPUT_TEST
+            hub_classic_output_pairing_changed(true);
+#endif
             if (use_keyboard) hub_router_release_all();
             printf("[security] PC pairing open for 120 seconds, mode=%s; close with pair off\n",
                    use_just_works ? "JustWorks (encrypted, no code entry, no MITM)"
@@ -988,7 +1159,20 @@ static void console_command(char *line) {
         else if (strcmp(args[1], "public") == 0) type = BD_ADDR_TYPE_LE_PUBLIC;
         else if (strcmp(args[1], "random") == 0) type = BD_ADDR_TYPE_LE_RANDOM;
         else goto invalid;
-        gap_delete_bonding(type, address);
+        if (type == BD_ADDR_TYPE_ACL) {
+            /* gap_delete_bonding only removes LE database entries in this SDK. */
+            gap_drop_link_key_for_bd_addr(address);
+            link_key_t key;
+            link_key_type_t key_type = INVALID_LINK_KEY;
+            bool remains = gap_get_link_key_for_bd_addr(address, key, &key_type);
+            memset(key, 0, sizeof(key));
+            if (remains) {
+                printf("[security] Classic bond removal failed for %s\n", bd_addr_to_str(address));
+                return;
+            }
+        } else {
+            gap_delete_bonding(type, address);
+        }
         printf("[security] removed local bond for %s; also remove it on the peer\n",
                bd_addr_to_str(address));
         return;
@@ -1031,6 +1215,11 @@ static void console_poll(btstack_timer_source_t *timer) {
     if (pairing_enabled && !hub_security_pairing_open()) {
         close_pairing_window("window expired");
     }
+#if HUB_CLASSIC_OUTPUT_TEST
+    if (pairing_enabled && hub_output_ready(0)) {
+        close_pairing_window("encrypted Classic PC ready");
+    }
+#endif
     if (keyboard_pairing_mode && pairing_enabled && !hub_input_keyboard_ready()) {
         close_pairing_window("no ready keyboard");
     }
@@ -1065,7 +1254,7 @@ int main(void) {
     gatt_client_init();
     hub_security_configure(HUB_SECURITY_INPUTS);
     gap_set_local_name(HUB_DEVICE_NAME);
-    gap_set_class_of_device(0x000100);
+    gap_set_class_of_device(HUB_CLASSIC_OUTPUT_TEST ? 0x0025c0 : 0x000100);
     gap_discoverable_control(0);
     gap_connectable_control(1);
     gap_set_bondable_mode(1);
@@ -1091,8 +1280,14 @@ int main(void) {
     hci_add_event_handler(&hci_registration);
     sm_registration.callback = security_event;
     sm_add_event_handler(&sm_registration);
+#if HUB_CLASSIC_OUTPUT_TEST
+    hub_classic_mux_init();
+#endif
     hub_output_init();
     hub_input_init();
+#if HUB_CLASSIC_OUTPUT_TEST
+    if (!hub_classic_mux_start()) panic("Classic HID service mux initialization failed");
+#endif
     hub_latency_init();
     hub_perf_init();
     btstack_run_loop_set_timer_handler(&console_timer, console_poll);

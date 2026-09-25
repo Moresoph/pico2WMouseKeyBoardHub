@@ -28,7 +28,7 @@ bool hub_output_identity_valid(uint8_t type, const uint8_t address[6]) {
 static bool fail(hub_output_store_t *store, const char *reason) {
     store->fault = true;
     printf("[output-store] %s; OUTPUT LOCKED, no slot reassignment/fallback. "
-           "Inspect/repair PHO1 storage then restart; bond DB left untouched\n", reason);
+           "Inspect/repair " HUB_OUTPUT_STORE_NAME " storage then restart; bond DB left untouched\n", reason);
     return false;
 }
 
@@ -104,13 +104,13 @@ bool hub_output_store_load(hub_output_store_t *store) {
     int length = tlv->get_tag(context, HUB_OUTPUT_STORE_TAG, NULL, 0);
     if (length == 0) {
         store->loaded = true;
-        printf("[output-store] PHO1 absent: selected PC1; slots may be claimed only "
-               "by bonded, encrypted peripheral PC connections\n");
+        printf("[output-store] " HUB_OUTPUT_STORE_NAME " absent: selected PC1; slots may be claimed only "
+               "by bonded, encrypted PC connections\n");
         return true;
     }
     if (length != HUB_OUTPUT_STORE_BYTES
         || tlv->get_tag(context, HUB_OUTPUT_STORE_TAG, record, sizeof(record)) != length
-        || !decode(store, record)) return fail(store, "Malformed/unsupported PHO1 record");
+        || !decode(store, record)) return fail(store, "Malformed/unsupported " HUB_OUTPUT_STORE_NAME " record");
     printf("[output-store] restored identities and selected PC%u\n", store->selected + 1);
     return true;
 }
@@ -123,10 +123,10 @@ static bool commit(hub_output_store_t *store, const hub_output_store_t *next) {
     uint8_t record[HUB_OUTPUT_STORE_BYTES], readback[HUB_OUTPUT_STORE_BYTES];
     encode(next, record);
     if (tlv->store_tag(context, HUB_OUTPUT_STORE_TAG, record, sizeof(record)) != 0)
-        return fail(store, "PHO1 write failed");
+        return fail(store, HUB_OUTPUT_STORE_NAME " write failed");
     if (tlv->get_tag(context, HUB_OUTPUT_STORE_TAG, NULL, 0) != sizeof(record)
         || tlv->get_tag(context, HUB_OUTPUT_STORE_TAG, readback, sizeof(readback)) != sizeof(readback)
-        || memcmp(record, readback, sizeof(record))) return fail(store, "PHO1 readback failed");
+        || memcmp(record, readback, sizeof(record))) return fail(store, HUB_OUTPUT_STORE_NAME " readback failed");
     *store = *next;
     return true;
 }

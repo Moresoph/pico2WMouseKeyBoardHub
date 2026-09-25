@@ -12,6 +12,9 @@
 #include "l2cap.h"
 #include "hub_config.h"
 #include "hub_latency.h"
+#if HUB_CLASSIC_OUTPUT_TEST
+#include "hub_input.h"
+#endif
 
 #define PERF_CONTROL_HISTORY 32u
 #define PERF_SLOW_HISTORY 32u
@@ -62,7 +65,27 @@ typedef struct {
 } perf_credits_t;
 
 typedef struct {
+    uint16_t handle, length;
+    uint32_t count, at_ms;
+} perf_attribute_t;
+
+typedef struct {
+    uint8_t opcode;
+    bool incoming;
+    uint32_t count, first_ms, last_ms;
+} perf_att_opcode_t;
+
+typedef struct {
+    uint32_t packets, at_ms, malformed, fragmented, att, notifications, other_attributes;
+    uint32_t tx_packets, tx_malformed, tx_fragmented, other_opcodes;
+    uint8_t last_opcode;
+    perf_attribute_t attributes[4];
+    perf_att_opcode_t opcodes[16];
+} perf_receive_t;
+
+typedef struct {
     bool connected;
+    bool input_side;
     uint16_t handle;
     uint8_t transport;
     uint8_t role;
@@ -73,6 +96,7 @@ typedef struct {
     uint16_t latency;
     uint16_t timeout;
     perf_credits_t credits;
+    perf_receive_t receive;
 } perf_link_t;
 
 typedef struct {
@@ -241,7 +265,8 @@ static void perf_input_boundary(void) {
 }
 
 static void perf_connect(uint16_t handle, uint8_t transport, uint8_t role,
-                          uint16_t interval, uint16_t latency, uint16_t timeout) {
+                          uint16_t interval, uint16_t latency, uint16_t timeout,
+                          bool input_side) {
     perf_link_t *link = perf_find_link(handle);
     if (!link) {
         for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i) {
@@ -254,6 +279,7 @@ static void perf_connect(uint16_t handle, uint8_t transport, uint8_t role,
     }
     memset(link, 0, sizeof(*link));
     link->connected = true;
+    link->input_side = input_side;
     link->handle = handle;
     link->transport = transport;
     link->role = role;
@@ -265,7 +291,7 @@ static void perf_connect(uint16_t handle, uint8_t transport, uint8_t role,
     link->latency = latency;
     link->timeout = timeout;
     ++totals.connects;
-    if (transport == PERF_CLASSIC || role == HCI_ROLE_MASTER) perf_input_boundary();
+    if (input_side) perf_input_boundary();
     perf_event_t event = perf_event(PERF_CONNECT, handle, link->connected_at);
     event.minimum = event.maximum = interval;
     event.latency = latency;
@@ -296,6 +322,75 @@ void hub_perf_input_report(unsigned input, bool mouse) {
     }
     ++metric->reports;
     perf_clock_set(&metric->clock, now_us, now_ms);
+}
+
+static void perf_acl_packet(const uint8_t *packet, uint16_t size, bool incoming) {
+    if (!perf_initialized || !packet || size < 4) return;
+    uint16_t header = little_endian_read_16(packet, 0);
+    perf_link_t *link = perf_find_link(header & 0x0fffu);
+    if (!link || link->transport != PERF_LE || !link->input_side) return;
+    perf_receive_t *rx = &link->receive;
+    uint32_t now = btstack_run_loop_get_time_ms();
+    uint32_t *malformed = incoming ? &rx->malformed : &rx->tx_malformed;
+    uint32_t *fragmented = incoming ? &rx->fragmented : &rx->tx_fragmented;
+    if (incoming) {
+        ++rx->packets;
+        rx->at_ms = now;
+    } else ++rx->tx_packets;
+    if (little_endian_read_16(packet, 2) != size - 4u) {
+        ++*malformed;
+        return;
+    }
+    /* Do not reconstruct or retain HID contents. Fragmented PDUs are counted
+       separately so a missing unfragmented-notification count is not overclaimed. */
+    unsigned boundary = (header >> 12) & 3u;
+    if (boundary == 1u) { ++*fragmented; return; }
+    if (size < 8) { ++*malformed; return; }
+    uint16_t length = little_endian_read_16(packet, 4);
+    if (length > size - 8u) { ++*fragmented; return; }
+    if (length != size - 8u) { ++*malformed; return; }
+    if (little_endian_read_16(packet, 6) != L2CAP_CID_ATTRIBUTE_PROTOCOL) return;
+    if (!length) { ++*malformed; return; }
+    if (incoming) {
+        ++rx->att;
+        rx->last_opcode = packet[8];
+    }
+    if (packet[8] != ATT_HANDLE_VALUE_NOTIFICATION && packet[8] != ATT_HANDLE_VALUE_INDICATION) {
+        for (unsigned i = 0; i < 16; ++i) {
+            perf_att_opcode_t *entry = &rx->opcodes[i];
+            if (entry->count && (entry->opcode != packet[8] || entry->incoming != incoming)) continue;
+            if (!entry->count) entry->first_ms = now;
+            entry->opcode = packet[8];
+            entry->incoming = incoming;
+            entry->last_ms = now;
+            ++entry->count;
+            return;
+        }
+        ++rx->other_opcodes;
+        return;
+    }
+    if (!incoming) return;
+    if (length < 3) { ++rx->malformed; return; }
+    ++rx->notifications;
+    uint16_t attribute = little_endian_read_16(packet, 9);
+    for (unsigned i = 0; i < 4; ++i) {
+        perf_attribute_t *entry = &rx->attributes[i];
+        if (entry->count && entry->handle != attribute) continue;
+        entry->handle = attribute;
+        entry->length = length - 3u;
+        entry->at_ms = rx->at_ms;
+        ++entry->count;
+        return;
+    }
+    ++rx->other_attributes;
+}
+
+void hub_perf_acl_receive(const uint8_t *packet, uint16_t size) {
+    perf_acl_packet(packet, size, true);
+}
+
+void hub_perf_acl_transmit(const uint8_t *packet, uint16_t size) {
+    perf_acl_packet(packet, size, false);
 }
 
 void hub_perf_output_wait(uint16_t handle, unsigned slot, bool mouse, uint32_t wait_us) {
@@ -407,7 +502,13 @@ static void perf_hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *pac
                 || hci_event_connection_complete_get_link_type(packet) != 1) break;
             {
                 uint16_t handle = hci_event_connection_complete_get_connection_handle(packet);
-                perf_connect(handle, PERF_CLASSIC, gap_get_role(handle), 0, 0, 0);
+                bool input_side = true;
+#if HUB_CLASSIC_OUTPUT_TEST
+                bd_addr_t address;
+                hci_event_connection_complete_get_bd_addr(packet, address);
+                input_side = hub_input_is_classic_target(address);
+#endif
+                perf_connect(handle, PERF_CLASSIC, gap_get_role(handle), 0, 0, 0, input_side);
             }
             break;
         case HCI_EVENT_META_GAP:
@@ -419,7 +520,8 @@ static void perf_hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *pac
                          PERF_LE, gap_subevent_le_connection_complete_get_role(packet),
                          gap_subevent_le_connection_complete_get_conn_interval(packet),
                          gap_subevent_le_connection_complete_get_conn_latency(packet),
-                         gap_subevent_le_connection_complete_get_supervision_timeout(packet));
+                         gap_subevent_le_connection_complete_get_supervision_timeout(packet),
+                         gap_subevent_le_connection_complete_get_role(packet) == HCI_ROLE_MASTER);
             break;
         case HCI_EVENT_DISCONNECTION_COMPLETE: {
             if (size < 6) { ++totals.malformed; break; }
@@ -434,7 +536,7 @@ static void perf_hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *pac
             ++totals.disconnects;
             if (event.count == 0x28) ++totals.instant_passed;
             if (link) {
-                if (link->transport == PERF_CLASSIC || link->role == HCI_ROLE_MASTER) perf_input_boundary();
+                if (link->input_side) perf_input_boundary();
                 memset(link, 0, sizeof(*link));
             }
             break;
@@ -530,6 +632,7 @@ void hub_perf_reset(void) {
     memset(&unknown_gate, 0, sizeof(unknown_gate));
     for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i) {
         memset(&perf_links[i].credits, 0, sizeof(perf_links[i].credits));
+        memset(&perf_links[i].receive, 0, sizeof(perf_links[i].receive));
     }
     control_next = control_count = slow_next = slow_count = 0;
     dump_next = dump_count = 0;
@@ -629,9 +732,11 @@ void hub_perf_status(void) {
     printf("[trace] HCI completed-packet counts are aggregate controller credits, including other ACL traffic.\n");
     printf("[trace] NOT per-mouse ACKs, end-to-end latency, host display time, RF retransmissions, or per-report controller residence.\n");
     printf("[trace] credit generations follow observed handle lifetimes; HCI credits alone cannot identify a report or a stale credit after handle reuse.\n");
-    printf("[trace] topology: LE central=input-side, LE peripheral=PC-side, Classic ACL=input-side; observed-PC is learned from timed submissions.\n");
+    printf("[trace] topology: LE central=input-side, LE peripheral=PC-side, Classic ACL=%s; observed-PC is learned from timed submissions.\n",
+           HUB_CLASSIC_OUTPUT_TEST ? "input OR PC" : "input-side");
     printf("[trace] input gaps include >100ms long/ambiguous gaps (idle OR delay); no activity inference. Input slots are not mapped to handles.\n");
-    printf("[trace] output waits cover timed ordinary events through successful ATT submission only; slot summaries span generations.\n");
+    printf("[trace] output waits cover timed ordinary events through successful %s submission only; slot summaries span generations.\n",
+           HUB_CLASSIC_OUTPUT_TEST ? "L2CAP" : "ATT");
     printf("[trace] input/credit spans >=~71min use coarse ms clock; durations assume <one 32-bit ms wrap (~49d).\n");
     printf("[trace] input/credit gaps, output waits and loop lateness retain printing stalls; nothing is subtracted or rebaselined.\n");
     printf("[trace] completed-dumps=%" PRIu32 " retained=%u/%u; full spans include the closing line; current span appears next time\n",
@@ -672,6 +777,36 @@ void hub_perf_status(void) {
         printf(" inter-credit-gap ");
         perf_print_samples(&link->credits.gaps, "us");
         printf(" coarse=%" PRIu32 "\n", link->credits.coarse_gaps);
+        if (link->transport == PERF_LE && link->input_side) {
+            const perf_receive_t *rx = &link->receive;
+            printf("[trace RX] handle=0x%04x gen=%" PRIu32 " ACL=%" PRIu32
+                   " ATT=%" PRIu32 " unfragmented-notify/indicate=%" PRIu32
+                   " fragmented=%" PRIu32 " malformed=%" PRIu32 " last-ATT=0x%02x"
+                   " other-attributes=%" PRIu32,
+                   link->handle, link->generation, rx->packets, rx->att, rx->notifications,
+                   rx->fragmented, rx->malformed, rx->last_opcode, rx->other_attributes);
+            if (rx->packets) printf(" last-ACL-age=%" PRIu32 "ms", now - rx->at_ms);
+            printf("; before GATT/HID dispatch, no payloads\n");
+            for (unsigned j = 0; j < 4; ++j) {
+                const perf_attribute_t *entry = &rx->attributes[j];
+                if (!entry->count) continue;
+                printf("[trace RX] attribute=0x%04x notifications=%" PRIu32
+                       " last-length=%u last-age=%" PRIu32 "ms\n",
+                       entry->handle, entry->count, entry->length, now - entry->at_ms);
+            }
+            printf("[trace ATT] TX-ACL=%" PRIu32 " fragmented=%" PRIu32
+                   " malformed=%" PRIu32 " untracked-opcodes=%" PRIu32
+                   "; complete control-PDU opcodes only, no attribute values\n",
+                   rx->tx_packets, rx->tx_fragmented, rx->tx_malformed, rx->other_opcodes);
+            for (unsigned j = 0; j < 16; ++j) {
+                const perf_att_opcode_t *entry = &rx->opcodes[j];
+                if (!entry->count) continue;
+                printf("[trace ATT] %s opcode=0x%02x count=%" PRIu32
+                       " first=%" PRIu32 "ms last=%" PRIu32 "ms\n",
+                       entry->incoming ? "RX" : "TX", entry->opcode, entry->count,
+                       entry->first_ms, entry->last_ms);
+            }
+        }
     }
     for (unsigned i = 0; i < HUB_INPUT_COUNT; ++i) {
         for (unsigned j = 0; j < 2; ++j) {
@@ -689,8 +824,9 @@ void hub_perf_status(void) {
     for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) {
         for (unsigned j = 0; j < 2; ++j) {
             const perf_output_t *metric = &perf_outputs[i][j];
-            printf("[trace] PC=%u %s slow(>=10ms)=%" PRIu32 " queue-to-ATT ",
-                   i + 1, j ? "mouse" : "keyboard", metric->slow);
+            printf("[trace] PC=%u %s slow(>=10ms)=%" PRIu32 " queue-to-%s ",
+                   i + 1, j ? "mouse" : "keyboard", metric->slow,
+                   HUB_CLASSIC_OUTPUT_TEST ? "L2CAP" : "ATT");
             perf_print_samples(&metric->waits, "us");
             if (metric->waits.count) {
                 printf(" last-handle=0x%04x gen=%" PRIu32 " age=%" PRIu32 "ms",

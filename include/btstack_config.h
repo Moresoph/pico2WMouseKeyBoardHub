@@ -35,7 +35,13 @@
 #define HCI_OUTGOING_PRE_BUFFER_SIZE 4
 #define HCI_ACL_PAYLOAD_SIZE (1691 + 4)
 #define HCI_ACL_CHUNK_SIZE_ALIGNMENT 4
+#if defined(HUB_CLASSIC_OUTPUT_TEST) && HUB_CLASSIC_OUTPUT_TEST
+/* CYW43439 reports eight Classic ACL buffers. BTstack also clamps to the
+   controller's reported capacity; BLE-output builds keep their original cap. */
+#define MAX_NR_CONTROLLER_ACL_BUFFERS 8
+#else
 #define MAX_NR_CONTROLLER_ACL_BUFFERS 3
+#endif
 #define MAX_NR_CONTROLLER_SCO_PACKETS 0
 #define ENABLE_HCI_CONTROLLER_TO_HOST_FLOW_CONTROL
 #define HCI_HOST_ACL_PACKET_LEN 1024

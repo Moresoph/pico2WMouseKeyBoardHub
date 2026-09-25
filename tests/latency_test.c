@@ -3,16 +3,26 @@
 #include "..\src\hub_latency.c"
 
 static uint32_t milliseconds, microseconds;
-static uint16_t active_handle;
+static uint16_t active_handle, mouse_handle;
 static bool pairing_busy, input_busy, output_fast;
 static uint16_t unencrypted_handle;
 static unsigned resets, updates, requests;
 static unsigned perf_reports, perf_resets, perf_requests, perf_timeouts;
-static uint16_t changed_handle, minimum_requested, maximum_requested, latency_requested;
+static uint16_t changed_handle, minimum_requested, maximum_requested, latency_requested, timeout_requested;
 static int request_error;
 static uint8_t setting[9];
 static int setting_length;
 static bool fail_save;
+static le_connection_parameter_range_t parameter_range;
+static unsigned range_writes;
+
+void gap_get_connection_parameter_range(le_connection_parameter_range_t *range) {
+    *range = parameter_range;
+}
+void gap_set_connection_parameter_range(le_connection_parameter_range_t *range) {
+    parameter_range = *range;
+    ++range_writes;
+}
 
 static int read_setting(void *context, uint32_t tag, uint8_t *data, uint32_t size) {
     (void)context;
@@ -51,6 +61,7 @@ void l2cap_add_event_handler(btstack_packet_callback_registration_t *handler) { 
 bool hub_security_input_pairing_blocked(void) { return pairing_busy; }
 bool hub_input_radio_busy(void) { return input_busy; }
 bool hub_input_is_connection(uint16_t handle) { return handle == 1; }
+bool hub_input_is_ble_mouse_ready(uint16_t handle) { return handle == mouse_handle; }
 uint16_t hub_output_active_handle(void) { return active_handle; }
 void hub_output_set_low_latency(bool enabled) { output_fast = enabled; }
 void hub_output_latency_reset(void) { ++resets; }
@@ -68,19 +79,20 @@ void hub_perf_parameter_request(uint16_t handle, bool fast, uint16_t minimum, ui
 int gap_update_connection_parameters(hci_con_handle_t handle, uint16_t minimum,
                                      uint16_t maximum, uint16_t latency, uint16_t timeout) {
     ++updates; changed_handle = handle; minimum_requested = minimum;
-    maximum_requested = maximum; latency_requested = latency; (void)timeout;
+    maximum_requested = maximum; latency_requested = latency; timeout_requested = timeout;
     return request_error;
 }
 int gap_request_connection_parameter_update(hci_con_handle_t handle, uint16_t minimum,
                                              uint16_t maximum, uint16_t latency, uint16_t timeout) {
     ++requests; changed_handle = handle; minimum_requested = minimum;
-    maximum_requested = maximum; latency_requested = latency; (void)timeout;
+    maximum_requested = maximum; latency_requested = latency; timeout_requested = timeout;
     return request_error;
 }
 
 static void reset(void) {
     milliseconds = microseconds = 0;
     active_handle = HCI_CON_HANDLE_INVALID;
+    mouse_handle = HCI_CON_HANDLE_INVALID;
     pairing_busy = input_busy = output_fast = false;
     unencrypted_handle = HCI_CON_HANDLE_INVALID;
     resets = updates = requests = 0;
@@ -89,6 +101,8 @@ static void reset(void) {
     setting_length = 0;
     fail_save = false;
     hub_latency_init();
+    parameter_range = (le_connection_parameter_range_t){6, 3200, 0, 500, 10, 3200};
+    range_writes = 0;
     uint8_t state[] = {BTSTACK_EVENT_STATE, 1, HCI_STATE_WORKING};
     event_handler(HCI_EVENT_PACKET, 0, state, sizeof(state));
 }
@@ -341,8 +355,85 @@ static void test_peer_updates_block_requests_and_preserve_fast_mouse(void) {
     updated(1, 0, 6);
     event_handler(HCI_EVENT_PACKET, 0, applied, sizeof(applied));
     for (unsigned i = 0; i < 40; ++i) tick();
-    assert(updates == 1); /* Do not fight the peer's later power-saving update. */
+    assert(updates == (HUB_CLASSIC_OUTPUT_TEST ? 2u : 1u));
 }
+
+#if HUB_CLASSIC_OUTPUT_TEST
+static void test_zero_latency_guard_rejects_peer_power_saving(void) {
+    reset();
+    connect_link(1, HCI_ROLE_MASTER);
+    assert(hub_latency_set_fast(true));
+    assert(!range_writes); /* Preserve the initial interval negotiation. */
+    settle();
+    updated(1, 0, 9);
+    assert(zero_latency_guard && parameter_range.le_conn_latency_max == 0);
+    assert(parameter_range.le_conn_interval_min == 6 && parameter_range.le_conn_interval_max == 3200);
+    assert(parameter_range.le_supervision_timeout_max == 3200);
+    uint8_t l2cap[] = {L2CAP_EVENT_CONNECTION_PARAMETER_UPDATE_REQUEST, 10,
+                       1, 0, 6, 0, 9, 0, 44, 0, 216, 0};
+    uint8_t hci[] = {HCI_EVENT_LE_META, 11, HCI_SUBEVENT_LE_REMOTE_CONNECTION_PARAMETER_REQUEST,
+                     1, 0, 6, 0, 9, 0, 44, 0, 216, 0};
+    event_handler(HCI_EVENT_PACKET, 0, l2cap, sizeof(l2cap));
+    event_handler(HCI_EVENT_PACKET, 0, hci, sizeof(hci));
+    assert(rejected_latency_requests == 2 && !find_link(1)->remote_pending);
+    for (unsigned i = 0; i < 160; ++i) tick();
+    assert(updates == 1 && !perf_timeouts && range_writes == 1);
+    hub_latency_reset();
+    assert(zero_latency_guard && !rejected_latency_requests);
+    l2cap[8] = 0;
+    event_handler(HCI_EVENT_PACKET, 0, l2cap, sizeof(l2cap));
+    assert(find_link(1)->remote_pending); /* Valid latency=0 updates still serialize. */
+    updated(1, 0, 9);
+    fail_save = true;
+    assert(!hub_latency_set_fast(false) && zero_latency_guard);
+    fail_save = false;
+    assert(hub_latency_set_fast(false) && !zero_latency_guard);
+    assert(parameter_range.le_conn_latency_max == 500 && range_writes == 2);
+    assert(hub_latency_set_fast(true) && zero_latency_guard);
+    uint8_t gone[] = {HCI_EVENT_DISCONNECTION_COMPLETE, 4, 0, 1, 0, 0x13};
+    event_handler(HCI_EVENT_PACKET, 0, gone, sizeof(gone));
+    assert(!zero_latency_guard && parameter_range.le_conn_latency_max == 500);
+}
+
+static void test_input_zero_latency_reassertion_is_bounded(void) {
+    reset();
+    connect_link(1, HCI_ROLE_MASTER);
+    assert(hub_latency_set_fast(true));
+    settle();
+    updated(1, 0, 9);
+    uint32_t first_request = find_link(1)->request_at;
+    uint8_t applied[] = {HCI_EVENT_LE_META, 10, HCI_SUBEVENT_LE_CONNECTION_UPDATE_COMPLETE,
+                         0, 1, 0, 9, 0, 44, 0, 216, 0};
+    event_handler(HCI_EVENT_PACKET, 0, applied, sizeof(applied));
+    assert(find_link(1)->reassert_zero);
+    while ((uint32_t)(milliseconds - first_request) < LATENCY_INPUT_REASSERT_MS - 250u) tick();
+    assert(updates == 1);
+    input_busy = true;
+    tick();
+    assert(updates == 1);
+    input_busy = false;
+    for (unsigned i = 0; i < 7; ++i) tick();
+    assert(updates == 1);
+    request_error = ERROR_CODE_COMMAND_DISALLOWED;
+    tick();
+    assert(updates == 2 && latency_requested == 0 && maximum_requested == 9);
+    assert(!find_link(1)->reassert_zero);
+    for (unsigned i = 0; i < 120; ++i) tick();
+    assert(updates == 2); /* A rejected request does not become a retry storm. */
+    request_error = 0;
+    event_handler(HCI_EVENT_PACKET, 0, applied, sizeof(applied));
+    settle();
+    assert(updates == 3 && find_link(1)->pending);
+    updated(1, 0, 9);
+    assert(!find_link(1)->reassert_zero);
+    assert(hub_latency_set_fast(false));
+    settle();
+    unsigned before = updates;
+    event_handler(HCI_EVENT_PACKET, 0, applied, sizeof(applied));
+    for (unsigned i = 0; i < 80; ++i) tick();
+    assert(updates == before); /* Normal mode allows the saved low-power policy. */
+}
+#endif
 
 static void test_quiet_window_wrap_and_measurement_reset(void) {
     reset();
@@ -399,6 +490,73 @@ static void test_satisfied_pc_does_not_restore_or_repeat_on_switch(void) {
     assert(!find_link(2)->tuned && !find_link(3)->tuned);
 }
 
+#if HUB_CLASSIC_MOUSE_7P5_TEST
+static void test_mouse_interval_only(void) {
+    reset();
+    connect_link(1, HCI_ROLE_MASTER);
+    connect_link(2, HCI_ROLE_SLAVE);
+    active_handle = 2;
+    uint8_t applied[] = {HCI_EVENT_LE_META, 10, HCI_SUBEVENT_LE_CONNECTION_UPDATE_COMPLETE,
+                         0, 1, 0, 9, 0, 44, 0, 216, 0};
+    event_handler(HCI_EVENT_PACKET, 0, applied, sizeof(applied));
+    settle();
+    assert(!updates && !requests); /* Not a ready mouse yet. */
+    mouse_handle = 1;
+    input_busy = true;
+    settle();
+    assert(!updates);
+    input_busy = false;
+    unencrypted_handle = 1;
+    settle();
+    assert(!updates);
+    unencrypted_handle = HCI_CON_HANDLE_INVALID;
+    settle();
+    assert(updates == 1 && !requests && changed_handle == 1);
+    assert(minimum_requested == 6 && maximum_requested == 6);
+    assert(latency_requested == 44 && timeout_requested == 216);
+    assert(!fast_mode && !output_fast && !zero_latency_guard && !range_writes);
+    applied[6] = 6;
+    event_handler(HCI_EVENT_PACKET, 0, applied, sizeof(applied));
+    uint32_t first_request = find_link(1)->request_at;
+    hub_latency_reset();
+    settle();
+    assert(updates == 1 && find_link(1)->interval == 6);
+    applied[6] = 9;
+    event_handler(HCI_EVENT_PACKET, 0, applied, sizeof(applied));
+    while ((uint32_t)(milliseconds - first_request) < LATENCY_INPUT_REASSERT_MS - 250u) tick();
+    assert(updates == 1);
+    request_error = ERROR_CODE_COMMAND_DISALLOWED;
+    tick();
+    assert(updates == 2 && !find_link(1)->pending);
+    for (unsigned i = 0; i < 100; ++i) tick();
+    assert(updates == 2); /* Rejection alone never starts a retry storm. */
+    request_error = 0;
+    event_handler(HCI_EVENT_PACKET, 0, applied, sizeof(applied));
+    settle();
+    assert(updates == 3 && find_link(1)->pending);
+    for (unsigned i = 0; i < 100; ++i) tick();
+    assert(updates == 3 && perf_timeouts == 1);
+    uint8_t gone[] = {HCI_EVENT_DISCONNECTION_COMPLETE, 4, 0, 1, 0, 0x13};
+    event_handler(HCI_EVENT_PACKET, 0, gone, sizeof(gone));
+    connect_link(1, HCI_ROLE_MASTER);
+    applied[6] = 6;
+    event_handler(HCI_EVENT_PACKET, 0, applied, sizeof(applied));
+    settle();
+    assert(updates == 3 && find_link(1)->satisfied == 1); /* Already at 7.5ms. */
+    assert(!requests && !zero_latency_guard);
+
+    assert(hub_latency_set_fast(true));
+    settle();
+    assert(updates == 4 && latency_requested == 0);
+    updated(1, 0, 6);
+    active_handle = HCI_CON_HANDLE_INVALID;
+    assert(hub_latency_set_fast(false));
+    settle();
+    assert(updates == 5 && minimum_requested == 6 && maximum_requested == 6);
+    assert(latency_requested == 44 && timeout_requested == 216 && !zero_latency_guard);
+}
+#endif
+
 int main(void) {
     test_targeted_fast_and_restore();
     test_refusal_timeout_and_pairing();
@@ -413,6 +571,15 @@ int main(void) {
     test_quiet_window_wrap_and_measurement_reset();
     test_peer_timeout_and_disconnect_release_global_guard();
     test_satisfied_pc_does_not_restore_or_repeat_on_switch();
+#if HUB_CLASSIC_OUTPUT_TEST
+    test_zero_latency_guard_rejects_peer_power_saving();
+    test_input_zero_latency_reassertion_is_bounded();
+#else
+    assert(range_writes == 0);
+#endif
+#if HUB_CLASSIC_MOUSE_7P5_TEST
+    test_mouse_interval_only();
+#endif
     puts("All runtime BLE latency policy/telemetry tests passed.");
     return 0;
 }

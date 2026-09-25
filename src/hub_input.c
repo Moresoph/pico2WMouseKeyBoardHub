@@ -63,6 +63,10 @@ typedef struct {
 } input_descriptor_t;
 
 typedef struct {
+    uint32_t hids, hids_at, rejected, parsed, invalid, ignored, mouse, keyboard;
+} input_flow_t;
+
+typedef struct {
     bool selected;
     bool classic;
     bool remove;
@@ -85,6 +89,7 @@ typedef struct {
     bool open_test;
     bool forwarding_authorized;
     uint32_t test_reports;
+    input_flow_t flow;
     uint8_t bond_address_type;
     bd_addr_t bond_address;
     uint8_t roles;
@@ -150,6 +155,7 @@ typedef struct {
 } input_scan_peer_t;
 static input_scan_peer_t scan_peers[INPUT_SCAN_PEERS];
 static unsigned next_scan_peer;
+static uint32_t unmatched_hids_reports;
 
 static void input_hid_event(uint8_t, uint16_t, uint8_t *, uint16_t);
 static void input_hids_event(uint8_t, uint16_t, uint8_t *, uint16_t);
@@ -770,6 +776,7 @@ static void handle_report(input_slot_t *slot, uint8_t service,
         if (!input_forwarding_allowed(slot)) return;
     }
     const input_descriptor_t *descriptor = &slot->descriptors[service];
+    ++slot->flow.parsed;
     input_report_t *report = NULL;
     if (!length) goto invalid;
     uint16_t id = descriptor->report_ids ? data[0] : HID_REPORT_ID_UNDEFINED;
@@ -804,20 +811,25 @@ static void handle_report(input_slot_t *slot, uint8_t service,
         }
     }
     if (keyboard_present && (slot->roles & HUB_INPUT_ROLE_KEYBOARD)) {
+        ++slot->flow.keyboard;
         hub_latency_input_report(slot_index(slot), false);
         memcpy(report->keys, keys, sizeof(keys));
         send_keyboard(slot);
     }
     if (mouse_present && (slot->roles & HUB_INPUT_ROLE_MOUSE)) {
+        ++slot->flow.mouse;
         hub_latency_input_report(slot_index(slot), true);
         report->buttons = buttons;
         buttons = 0;
         for (unsigned i = 0; i < slot->report_count; ++i) buttons |= slot->reports[i].buttons;
         hub_router_mouse(slot_index(slot), buttons, dx, dy, wheel);
     }
+    if (!(keyboard_present && (slot->roles & HUB_INPUT_ROLE_KEYBOARD))
+        && !(mouse_present && (slot->roles & HUB_INPUT_ROLE_MOUSE))) ++slot->flow.ignored;
     return;
 
 invalid:
+    ++slot->flow.invalid;
     if (!slot->warned_report) {
         printf("[input %u] malformed/unknown HID report: service=%u bytes=%u\n",
                slot_index(slot) + 1, service, length);
@@ -839,6 +851,7 @@ static void discover_le(input_slot_t *slot) {
     if (slot->classic || slot->state != INPUT_SECURITY || slot->remove ||
         !gap_encryption_key_size(slot->handle)) return;
     slot->state = INPUT_DISCOVERING;
+    memset(&slot->flow, 0, sizeof(slot->flow));
     slot->deadline = btstack_run_loop_get_time_ms() + INPUT_DISCOVERY_MS;
     uint8_t status = hids_host_connect(slot->handle, input_hids_event,
                                        HID_PROTOCOL_MODE_REPORT, &slot->cid);
@@ -1176,7 +1189,11 @@ static void input_hids_event(uint8_t packet_type, uint16_t channel,
     if ((packet_type != HCI_EVENT_PACKET && packet_type != HCI_EVENT_GATTSERVICE_META) ||
         size < 5 || packet[0] != HCI_EVENT_GATTSERVICE_META) return;
     input_slot_t *slot = slot_for_cid(false, little_endian_read_16(packet, 3));
-    if (!slot) return;
+    if (!slot) {
+        if (hci_event_gattservice_meta_get_subevent_code(packet) == GATTSERVICE_SUBEVENT_HID_REPORT)
+            ++unmatched_hids_reports;
+        return;
+    }
     switch (hci_event_gattservice_meta_get_subevent_code(packet)) {
         case GATTSERVICE_SUBEVENT_HID_SERVICE_CONNECTED: {
             if (size < 8) return;
@@ -1212,12 +1229,18 @@ static void input_hids_event(uint8_t packet_type, uint16_t channel,
             break;
         }
         case GATTSERVICE_SUBEVENT_HID_REPORT: {
-            if (size < 9 || slot->state != INPUT_READY) break;
+            ++slot->flow.hids;
+            slot->flow.hids_at = btstack_run_loop_get_time_ms();
+            if (size < 9 || slot->state != INPUT_READY) {
+                ++slot->flow.rejected;
+                break;
+            }
             uint8_t service = gattservice_subevent_hid_report_get_service_index(packet);
             uint8_t id = gattservice_subevent_hid_report_get_report_id(packet);
             uint16_t length = gattservice_subevent_hid_report_get_report_len(packet);
             const uint8_t *report = gattservice_subevent_hid_report_get_report(packet);
             if (service >= slot->service_count || length > size - 9u || !length || report[0] != id) {
+                ++slot->flow.rejected;
                 release_input(slot);
                 break;
             }
@@ -1228,6 +1251,7 @@ static void input_hids_event(uint8_t packet_type, uint16_t channel,
              */
             if (!slot->descriptors[service].report_ids) {
                 if (id) {
+                    ++slot->flow.rejected;
                     input_error(slot, "BLE Report Reference/Map mismatch",
                                 ERROR_CODE_UNSUPPORTED_FEATURE_OR_PARAMETER_VALUE);
                     break;
@@ -2047,6 +2071,16 @@ bool hub_input_is_connection(uint16_t handle) {
     return slot_for_handle(handle) != NULL;
 }
 
+bool hub_input_is_ble_mouse_ready(uint16_t handle) {
+    const input_slot_t *slot = slot_for_handle(handle);
+    return slot && !slot->classic && slot->state == INPUT_READY
+        && (slot->roles & HUB_INPUT_ROLE_MOUSE) != 0;
+}
+
+bool hub_input_is_classic_target(const uint8_t address[6]) {
+    return address != NULL && slot_for_classic_address(address) != NULL;
+}
+
 bool hub_input_is_expected_classic(const uint8_t address[6]) {
     input_slot_t *slot = slot_for_classic_address(address);
     // Main uses this predicate for address-only PIN/SSP events before HID opens.
@@ -2101,6 +2135,8 @@ void hub_input_status(void) {
            enrollment_active ? "active" : enrollment_pending ? "deferred" : "closed", forgetting);
     printf("[input] reconnect-backoff-max=%u ms BLE-reconnect-attempt=%u ms\n",
            INPUT_RETRY_MAX_MS, INPUT_RECONNECT_ATTEMPT_MS);
+    printf("[input-flow] unmatched-HIDS-reports=%" PRIu32 " since boot; no payload logging\n",
+           unmatched_hids_reports);
     for (unsigned i = 0; i < HUB_INPUT_COUNT; ++i) {
         input_slot_t *slot = &inputs[i];
         if (!slot->selected) {
@@ -2123,6 +2159,17 @@ void hub_input_status(void) {
                "security-complete=%u descriptor-valid=%u (0xff=not observed)\n",
                i + 1, slot->last_auth_status, slot->last_hid_status,
                slot->last_disconnect_reason, slot->security_complete, slot->hid_validated);
+        if (!slot->classic) {
+            const input_flow_t *flow = &slot->flow;
+            printf("[input-flow %u] since HID discovery: callbacks=%" PRIu32 " rejected=%" PRIu32
+                   " parsed=%" PRIu32 " invalid=%" PRIu32 " ignored=%" PRIu32
+                   " mouse=%" PRIu32 " keyboard=%" PRIu32,
+                   i + 1, flow->hids, flow->rejected, flow->parsed, flow->invalid,
+                   flow->ignored, flow->mouse, flow->keyboard);
+            if (flow->hids) printf(" last-callback-age=%" PRIu32 "ms",
+                                  btstack_run_loop_get_time_ms() - flow->hids_at);
+            printf("\n");
+        }
         if (slot->open_test) {
             printf("[open-test] input %u reports=%" PRIu32 " encryption-key=%u forwarding=%s saved-target=%u\n",
                    i + 1, slot->test_reports, slot->handle == HCI_CON_HANDLE_INVALID

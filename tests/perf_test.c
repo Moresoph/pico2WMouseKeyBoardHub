@@ -28,6 +28,14 @@ static unsigned registrations, l2cap_registrations, timer_sets, timer_adds;
 static btstack_packet_callback_registration_t *registered;
 static btstack_packet_callback_registration_t *l2cap_registered;
 static hci_role_t classic_role;
+static bool classic_input;
+
+#if HUB_CLASSIC_OUTPUT_TEST
+bool hub_input_is_classic_target(const uint8_t address[6]) {
+    (void)address;
+    return classic_input;
+}
+#endif
 
 uint32_t hub_latency_now_us(void) { return microseconds; }
 uint32_t btstack_run_loop_get_time_ms(void) { return milliseconds; }
@@ -62,6 +70,7 @@ static void reset_test(void) {
     registrations = l2cap_registrations = timer_sets = timer_adds = 0;
     registered = l2cap_registered = NULL;
     classic_role = HCI_ROLE_MASTER;
+    classic_input = true;
     printed_length = print_calls = 0;
     printed[0] = 0;
     hub_perf_init();
@@ -556,7 +565,133 @@ static void test_dump_boundaries_and_print_interference(void) {
     assert(!dump_history[0].duration_us && perf_find_link(1));
 }
 
+#if HUB_CLASSIC_OUTPUT_TEST
+static void test_classic_pc_preserves_input_baseline(void) {
+    reset_test();
+    hub_perf_input_report(0, true);
+    classic_input = false;
+    connect_classic(7, 0, 1);
+    assert(!perf_find_link(7)->input_side && !totals.input_boundaries);
+    assert(perf_inputs[0][1].clock.valid);
+    hub_perf_output_wait(7, 0, true, 400);
+    hub_perf_status();
+    assert(strstr(printed, "Classic ACL=input OR PC"));
+    assert(strstr(printed, "queue-to-L2CAP"));
+    assert(!strstr(printed, "queue-to-ATT"));
+    disconnect_link(7, 0, 0x13);
+    assert(perf_inputs[0][1].clock.valid && !totals.input_boundaries);
+    classic_input = true;
+    connect_classic(7, 0, 1);
+    assert(perf_find_link(7)->input_side && totals.input_boundaries == 1);
+    assert(!perf_inputs[0][1].clock.valid);
+}
+#endif
+
+static void test_raw_receive_metadata(void) {
+    reset_test();
+    connect_le(0x40, HCI_ROLE_MASTER);
+    uint8_t packet[] = {0x40, 0x20, 8, 0, 4, 0, 4, 0, 0x1b, 0x2a, 0, 0x77};
+    uint8_t original[sizeof(packet)];
+    memcpy(original, packet, sizeof(packet));
+    advance_ms(10);
+    hub_perf_acl_receive(packet, sizeof(packet));
+    perf_receive_t *rx = &perf_find_link(0x40)->receive;
+    assert(rx->packets == 1 && rx->att == 1 && rx->notifications == 1);
+    assert(rx->attributes[0].handle == 0x2a && rx->attributes[0].length == 1);
+    assert(rx->attributes[0].at_ms == 10 && !memcmp(packet, original, sizeof(packet)));
+    assert(!print_calls); /* No hot-path printing or payload retention. */
+    packet[8] = ATT_HANDLE_VALUE_INDICATION;
+    hub_perf_acl_receive(packet, sizeof(packet));
+    assert(rx->attributes[0].count == 2 && rx->notifications == 2);
+    for (uint8_t attribute = 0x2b; attribute < 0x2f; ++attribute) {
+        packet[9] = attribute;
+        hub_perf_acl_receive(packet, sizeof(packet));
+    }
+    assert(rx->other_attributes == 1);
+    packet[1] = 0x10; /* Continuation: not an ATT header. */
+    hub_perf_acl_receive(packet, sizeof(packet));
+    packet[1] = 0x20;
+    packet[4] = 16; /* Partial first fragment: do not inspect its payload. */
+    hub_perf_acl_receive(packet, sizeof(packet));
+    assert(rx->fragmented == 2 && rx->notifications == 6);
+    packet[4] = 4;
+    hub_perf_acl_receive(packet, sizeof(packet) - 1);
+    assert(rx->malformed == 1);
+    packet[6] = 6; /* SMP, never classify or retain keys. */
+    hub_perf_acl_receive(packet, sizeof(packet));
+    assert(rx->att == 6);
+    packet[6] = 4;
+    packet[8] = ATT_READ_RESPONSE;
+    hub_perf_acl_receive(packet, sizeof(packet));
+    assert(rx->att == 7 && rx->notifications == 6);
+    hub_perf_status();
+    assert(strstr(printed, "unfragmented-notify/indicate=6"));
+    assert(strstr(printed, "attribute=0x002a notifications=2"));
+    hub_perf_reset();
+    assert(!rx->packets && !rx->attributes[0].count);
+    disconnect_link(0x40, 0, 0x13);
+    hub_perf_acl_receive(original, sizeof(original));
+    connect_le(0x40, HCI_ROLE_SLAVE); /* PC-side LE must not count as input RX. */
+    hub_perf_acl_receive(original, sizeof(original));
+    assert(!perf_find_link(0x40)->receive.packets);
+    disconnect_link(0x40, 0, 0x13);
+    connect_classic(0x40, 0, 1);
+    hub_perf_acl_receive(original, sizeof(original));
+    assert(!perf_find_link(0x40)->receive.packets);
+}
+
+static void test_att_control_directions(void) {
+    reset_test();
+    connect_le(0x40, HCI_ROLE_MASTER);
+    uint8_t request[] = {0x40, 0x20, 7, 0, 3, 0, 4, 0, 0x02, 0x17, 0};
+    uint8_t original[sizeof(request)];
+    memcpy(original, request, sizeof(request));
+    advance_ms(217);
+    hub_perf_acl_receive(request, sizeof(request));
+    perf_receive_t *rx = &perf_find_link(0x40)->receive;
+    assert(rx->opcodes[0].incoming && rx->opcodes[0].opcode == 0x02);
+    assert(rx->opcodes[0].count == 1 && rx->opcodes[0].first_ms == 217);
+    hub_perf_acl_transmit(request, sizeof(request));
+    assert(!rx->opcodes[1].incoming && rx->opcodes[1].opcode == 0x02);
+    assert(rx->packets == 1 && rx->tx_packets == 1 && rx->att == 1);
+    assert(!memcmp(request, original, sizeof(request)));
+    request[8] = 0x03;
+    advance_ms(1);
+    hub_perf_acl_transmit(request, sizeof(request));
+    assert(rx->opcodes[2].opcode == 0x03 && rx->opcodes[2].last_ms == 218);
+    advance_ms(1);
+    hub_perf_acl_transmit(request, sizeof(request));
+    assert(rx->opcodes[2].count == 2 && rx->opcodes[2].first_ms == 218);
+    request[1] = 0x10;
+    hub_perf_acl_transmit(request, sizeof(request));
+    assert(rx->tx_fragmented == 1 && !rx->fragmented);
+    request[1] = 0x20;
+    hub_perf_acl_transmit(request, sizeof(request) - 1);
+    assert(rx->tx_malformed == 1 && !rx->malformed);
+    request[6] = 6;
+    hub_perf_acl_transmit(request, sizeof(request));
+    assert(rx->opcodes[2].count == 2); /* SMP values are never inspected. */
+    request[6] = 4;
+    for (unsigned i = 4; i < 20; ++i) {
+        request[8] = (uint8_t)i;
+        hub_perf_acl_transmit(request, sizeof(request));
+    }
+    assert(rx->other_opcodes == 3 && !print_calls);
+    hub_perf_status();
+    assert(strstr(printed, "RX opcode=0x02 count=1 first=217ms"));
+    assert(strstr(printed, "TX opcode=0x03 count=2 first=218ms last=219ms"));
+    hub_perf_reset();
+    assert(!rx->tx_packets && !rx->opcodes[0].count && !rx->other_opcodes);
+    disconnect_link(0x40, 0, 0x13);
+    hub_perf_acl_transmit(original, sizeof(original));
+    connect_le(0x40, HCI_ROLE_SLAVE);
+    hub_perf_acl_transmit(original, sizeof(original));
+    assert(!perf_find_link(0x40)->receive.tx_packets);
+}
+
 int main(void) {
+    test_att_control_directions();
+    test_raw_receive_metadata();
     test_transport_lifecycle_and_reuse();
     test_classic_role_change_and_full_table();
     test_batched_completions_and_malformed_events();
@@ -568,6 +703,9 @@ int main(void) {
     test_scheduler_lateness_and_wrap();
     test_credit_clock_wrap_and_status();
     test_dump_boundaries_and_print_interference();
+#if HUB_CLASSIC_OUTPUT_TEST
+    test_classic_pc_preserves_input_baseline();
+#endif
     puts("hub_perf: all tests passed");
     return 0;
 }

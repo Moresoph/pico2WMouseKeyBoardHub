@@ -40,6 +40,13 @@ foreach ($suite in @('router', 'passkey', 'button', 'smp_decode', 'classic_decod
     if ($LASTEXITCODE -ne 0) { throw "$suite tests failed: $LASTEXITCODE" }
 }
 
+$output = Join-Path $outputDirectory 'hub_output_probe_tests.exe'
+& $compiler -Wall -Werror "-I$(Join-Path $root 'include')" `
+    (Join-Path $root 'tests\output_probe_test.c') -o $output
+if ($LASTEXITCODE -ne 0) { throw "Output probe compilation failed: $LASTEXITCODE" }
+& $output
+if ($LASTEXITCODE -ne 0) { throw "Output probe tests failed: $LASTEXITCODE" }
+
 if ([string]::IsNullOrWhiteSpace($SdkPath)) { $SdkPath = Join-Path $root '.deps\pico-sdk' }
 $btstack = Join-Path $SdkPath 'lib\btstack\src'
 $hidParser = Join-Path $btstack 'btstack_hid_parser.c'
@@ -86,3 +93,43 @@ $output = Join-Path $outputDirectory 'hub_perf_tests.exe'
 if ($LASTEXITCODE -ne 0) { throw "Performance recorder compilation failed: $LASTEXITCODE" }
 & $output
 if ($LASTEXITCODE -ne 0) { throw "Performance recorder tests failed: $LASTEXITCODE" }
+$output = Join-Path $outputDirectory 'hub_classic_perf_tests.exe'
+& $compiler -Wall -Werror -DENABLE_BLE=1 -DENABLE_CLASSIC=1 -DHUB_CLASSIC_OUTPUT_TEST=1 `
+    "-I$(Join-Path $root 'include')" "-I$btstack" `
+    (Join-Path $root 'tests\perf_test.c') $util -o $output
+if ($LASTEXITCODE -ne 0) { throw "Classic performance recorder compilation failed: $LASTEXITCODE" }
+& $output
+if ($LASTEXITCODE -ne 0) { throw "Classic performance recorder tests failed: $LASTEXITCODE" }
+$output = Join-Path $outputDirectory 'hub_classic_latency_tests.exe'
+& $compiler -Wall -Werror -DENABLE_BLE=1 -DENABLE_CLASSIC=1 -DHUB_CLASSIC_OUTPUT_TEST=1 `
+    "-I$(Join-Path $root 'include')" "-I$btstack" `
+    (Join-Path $root 'tests\latency_test.c') $util -o $output
+if ($LASTEXITCODE -ne 0) { throw "Classic latency policy compilation failed: $LASTEXITCODE" }
+& $output
+if ($LASTEXITCODE -ne 0) { throw "Classic latency policy tests failed: $LASTEXITCODE" }
+$output = Join-Path $outputDirectory 'hub_mouse_interval_tests.exe'
+& $compiler -Wall -Werror -DENABLE_BLE=1 -DENABLE_CLASSIC=1 `
+    -DHUB_CLASSIC_OUTPUT_TEST=1 -DHUB_CLASSIC_MOUSE_7P5_TEST=1 `
+    "-I$(Join-Path $root 'include')" "-I$btstack" `
+    (Join-Path $root 'tests\latency_test.c') $util -o $output
+if ($LASTEXITCODE -ne 0) { throw "Mouse interval trial compilation failed: $LASTEXITCODE" }
+& $output
+if ($LASTEXITCODE -ne 0) { throw "Mouse interval trial tests failed: $LASTEXITCODE" }
+foreach ($suite in @('classic_mux', 'classic_output', 'classic_output_7p5')) {
+    $output = Join-Path $outputDirectory "hub_${suite}_tests.exe"
+    $source = if ($suite -eq 'classic_output_7p5') { 'classic_output' } else { $suite }
+    $pacingTrial = [int]($suite -eq 'classic_output_7p5')
+    & $compiler -Wall -Werror -DENABLE_BLE=1 -DENABLE_CLASSIC=1 `
+        -DHUB_CLASSIC_OUTPUT_TEST=1 -DHUB_CLASSIC_OPEN_TEST=1 `
+        "-DHUB_CLASSIC_OUTPUT_7P5_TEST=$pacingTrial" `
+        "-I$(Join-Path $root 'include')" "-I$btstack" `
+        "-I$(Join-Path $root 'tests\output_stubs')" `
+        (Join-Path $root "tests\${source}_test.c") $util -o $output
+    if ($LASTEXITCODE -ne 0) { throw "$suite compilation failed: $LASTEXITCODE" }
+    $log = & $output 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $log | Write-Output
+        throw "$suite tests failed: $LASTEXITCODE"
+    }
+    $log | Select-Object -Last 1
+}
