@@ -689,7 +689,170 @@ static void test_att_control_directions(void) {
     assert(!perf_find_link(0x40)->receive.tx_packets);
 }
 
+static void test_protocol_diagnostics(void) {
+    reset_test();
+    connect_le(0x40, HCI_ROLE_MASTER);
+    uint32_t generation = perf_find_link(0x40)->generation;
+    hub_perf_input_phase(0, 0x40, HUB_PERF_INPUT_SECURED, 0);
+    hub_perf_hids_cccd(0x40, 0x30, false, 0);
+    hub_perf_hids_cccd(0x40, 0x30, true, ATT_ERROR_INSUFFICIENT_ENCRYPTION);
+    uint8_t error[] = {0x40, 0x20, 9, 0, 5, 0, 4, 0, 1, 0x12, 0x31, 0, 0x0f};
+    uint8_t original[sizeof(error)];
+    memcpy(original, error, sizeof(error));
+    hub_perf_acl_receive(error, sizeof(error));
+    hub_perf_acl_transmit(error, sizeof(error));
+    assert(protocol_count == 5 && protocol_history[3].generation == generation);
+    assert(protocol_history[3].minimum == 0x12 && protocol_history[3].maximum == 0x31);
+    assert(protocol_history[3].status == 0x0f && protocol_history[3].fast && !protocol_history[4].fast);
+    assert(!memcmp(original, error, sizeof(error)) && !print_calls);
+    /* Opcode-table saturation must not hide the next error or subscription result. */
+    for (unsigned i = 0; i < 16; ++i) {
+        perf_find_link(0x40)->receive.opcodes[i].count = 1;
+        perf_find_link(0x40)->receive.opcodes[i].opcode = 0x7f;
+    }
+    hub_perf_acl_receive(error, sizeof(error));
+    assert(protocol_count == 6 && perf_find_link(0x40)->receive.other_opcodes == 1);
+    hub_perf_status();
+    assert(strstr(printed, "phase=encrypted"));
+    assert(strstr(printed, "report-handle=0x0030 ATT-completion=0x0f"));
+    assert(strstr(printed, "RX request=0x12 attribute=0x0031 ATT-status=0x0f"));
+    disconnect_link(0x40, 0, 0x13);
+    connect_le(0x40, HCI_ROLE_MASTER);
+    hub_perf_input_phase(0, 0x40, HUB_PERF_INPUT_READY, 0);
+    assert(protocol_history[6].generation != generation);
+    for (unsigned i = 0; i < PERF_PROTOCOL_HISTORY; ++i)
+        hub_perf_hids_cccd(0x40, 0x30, true, 0);
+    assert(protocol_count == PERF_PROTOCOL_HISTORY && protocol_evicted == 7);
+    hub_perf_reset();
+    assert(!protocol_count && !protocol_evicted && perf_find_link(0x40));
+}
+
+static void mode_change(uint16_t handle, uint8_t status, uint8_t mode, uint16_t interval) {
+    uint8_t event[8] = {HCI_EVENT_MODE_CHANGE, 6};
+    event[2] = status;
+    little_endian_store_16(event, 3, handle);
+    event[5] = mode;
+    little_endian_store_16(event, 6, interval);
+    uint8_t original[sizeof(event)];
+    memcpy(original, event, sizeof(event));
+    emit(event, sizeof(event));
+    assert(!memcmp(event, original, sizeof(event)));
+}
+
+static void subrating(uint16_t handle, uint8_t status, uint16_t tx, uint16_t rx,
+                      uint16_t remote, uint16_t local) {
+    uint8_t event[13] = {HCI_EVENT_SNIFF_SUBRATING, 11};
+    event[2] = status;
+    little_endian_store_16(event, 3, handle);
+    little_endian_store_16(event, 5, tx);
+    little_endian_store_16(event, 7, rx);
+    little_endian_store_16(event, 9, remote);
+    little_endian_store_16(event, 11, local);
+    uint8_t original[sizeof(event)];
+    memcpy(original, event, sizeof(event));
+    emit(event, sizeof(event));
+    assert(!memcmp(event, original, sizeof(event)));
+}
+
+static void test_passive_classic_modes(void) {
+    reset_test();
+    connect_classic(1, 0, 1);
+    connect_le(2, HCI_ROLE_MASTER);
+    perf_classic_mode_t *mode = &perf_find_link(1)->classic;
+    assert(!mode->known && !mode->subrating_known && mode->mode_status == 0xff);
+    hub_perf_classic_status();
+    assert(strstr(printed, "mode=unknown") && strstr(printed, "no successful Mode Change"));
+    assert(!strstr(printed, "handle=0x0002"));
+    printed_length = print_calls = 0;
+    printed[0] = 0;
+    advance_ms(100);
+    subrating(1, 0, 216, 324, 16, 32);
+    assert(mode->subrating_known && !mode->known); /* SSR does not imply current Sniff. */
+    assert(mode->max_tx_latency == 216 && mode->max_rx_latency == 324);
+    assert(mode->min_remote_timeout == 16 && mode->min_local_timeout == 32);
+    assert(mode->subrating_at == 100 && mode->subrating_events == 1);
+    assert(last_control()->kind == PERF_CLASSIC_SUBRATING && last_control()->fast);
+    mode_change(1, 0, 2, 108);
+    assert(mode->known && mode->mode == 2 && mode->interval == 108 && mode->mode_at == 100);
+    assert(mode->mode_events == 1 && last_control()->count == 2 && last_control()->fast);
+    uint32_t generation = perf_find_link(1)->generation;
+    assert(last_control()->generation == generation && last_control()->transport == PERF_CLASSIC);
+    advance_ms(17);
+    mode_change(1, 0x0c, 0, 0);
+    subrating(1, 0x0c, 0, 0, 0, 0);
+    assert(mode->mode == 2 && mode->interval == 108 && mode->mode_at == 100);
+    assert(mode->max_rx_latency == 324 && mode->subrating_at == 100);
+    assert(mode->mode_status == 0x0c && mode->subrating_status == 0x0c);
+    assert(mode->mode_events == 2 && mode->subrating_events == 2 && !last_control()->fast);
+    mode_change(1, 0, 4, 0); /* Reserved modes cannot replace known state. */
+    assert(totals.malformed == 1 && mode->mode == 2 && !last_control()->fast);
+    mode_change(2, 0, 2, 108); /* Never attach Classic data to an LE link. */
+    subrating(2, 0, 216, 324, 16, 32);
+    assert(!perf_find_link(2)->classic.known && !perf_find_link(2)->classic.subrating_known);
+    assert(!perf_find_link(2)->classic.mode_events && !last_control()->fast);
+    mode_change(0x55, 0, 2, 108);
+    subrating(0x55, 0, 216, 324, 16, 32);
+    assert(last_control()->generation == 0 && !last_control()->fast);
+    assert(!print_calls);
+    hub_perf_status();
+    assert(strstr(printed, "Classic-mode-change") && strstr(printed, "Classic-sniff-subrating"));
+    assert(strstr(printed, "interval=108(0.625ms) interval-us=67500"));
+    assert(strstr(printed, "NOT applied to tracked state"));
+    assert(strstr(printed, "max-tx=216 max-rx=324 min-remote-timeout=16 min-local-timeout=32"));
+    assert(strstr(printed, "NOT proof of current sniff mode"));
+    perf_classic_mode_t saved = *mode;
+    unsigned sets = timer_sets, adds = timer_adds;
+    hub_perf_reset();
+    assert(!memcmp(&saved, mode, sizeof(saved)) && !control_count);
+    assert(timer_sets == sets && timer_adds == adds && perf_find_link(1)->generation == generation);
+    mode_change(1, 0, 0, 0);
+    assert(mode->known && mode->mode == 0 && !mode->interval);
+    assert(mode->subrating_known); /* Retain last-success parameters, not an "enabled" bit. */
+    mode_change(1, 0, 1, 80);
+    assert(mode->mode == 1 && mode->interval == 80);
+    mode_change(1, 0, 3, 160);
+    assert(mode->mode == 3 && mode->interval == 160);
+    milliseconds = UINT32_MAX - 4u;
+    mode_change(1, 0, 2, 65534);
+    advance_ms(10);
+    printed_length = print_calls = 0;
+    printed[0] = 0;
+    hub_perf_classic_status();
+    assert(strstr(printed, "interval-us=40958750") && strstr(printed, "observed-age=10ms"));
+    for (unsigned i = 0; i < PERF_CONTROL_HISTORY + 2u; ++i) mode_change(1, 0, 2, 108);
+    assert(control_count == PERF_CONTROL_HISTORY && control_evicted);
+    assert(mode->interval == 108); /* Snapshot survives bounded-history eviction. */
+    disconnect_link(1, 0, 0x13);
+    mode_change(1, 0, 2, 108);
+    assert(!last_control()->generation && !last_control()->fast);
+    connect_classic(1, 0, 1);
+    mode = &perf_find_link(1)->classic;
+    assert(perf_find_link(1)->generation != generation);
+    assert(!mode->known && !mode->subrating_known && !mode->mode_events);
+    assert(mode->mode_status == 0xff && mode->subrating_status == 0xff);
+}
+
+static void test_malformed_classic_modes(void) {
+    reset_test();
+    connect_classic(1, 0, 1);
+    uint8_t mode[8] = {HCI_EVENT_MODE_CHANGE, 6, 0, 1, 0, 2, 108, 0};
+    uint8_t ssr[13] = {HCI_EVENT_SNIFF_SUBRATING, 11, 0, 1, 0};
+    unsigned controls = control_count;
+    for (unsigned size = 0; size < sizeof(mode); ++size) emit(mode, size);
+    for (unsigned size = 0; size < sizeof(ssr); ++size) emit(ssr, size);
+    mode[1] = 5;
+    ssr[1] = 10;
+    emit(mode, sizeof(mode));
+    emit(ssr, sizeof(ssr));
+    assert(totals.malformed == sizeof(mode) + sizeof(ssr) + 2u);
+    assert(control_count == controls && !perf_find_link(1)->classic.known);
+    assert(!perf_find_link(1)->classic.subrating_known && !print_calls);
+}
+
 int main(void) {
+    test_passive_classic_modes();
+    test_malformed_classic_modes();
+    test_protocol_diagnostics();
     test_att_control_directions();
     test_raw_receive_metadata();
     test_transport_lifecycle_and_reuse();

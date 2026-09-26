@@ -18,6 +18,10 @@ static unsigned flash_writes;
 static unsigned connects, disconnects, pairing_requests, scan_starts, inquiry_starts;
 static unsigned incoming_accepts, incoming_declines;
 static unsigned connect_cancels;
+static uint8_t classic_accept_policy, role_request_status;
+static unsigned role_requests, role_queries;
+static hci_role_t classic_role;
+static bd_addr_t role_request_address;
 static uint8_t connected_type;
 static bd_addr_t connected_address;
 static uint8_t flash_records[2][HUB_INPUT_TARGET_BYTES + 1u];
@@ -33,6 +37,9 @@ static bool classic_key_present[8];
 static int handle_index[8];
 static unsigned released[2], routed_keyboard, routed_mouse;
 static unsigned ready_notifications[2];
+static unsigned mouse_activity_calls;
+static uint16_t mouse_activity_handle;
+static unsigned hogp_started[2], hogp_stopped[2], phases[HUB_PERF_INPUT_CONNECT_FAILED + 1];
 static unsigned iterator_index;
 static const uint8_t keyboard_map[] = {
     0x05, 0x01, 0x09, 0x06, 0xa1, 0x01,
@@ -84,6 +91,28 @@ void btstack_run_loop_set_timer_handler(btstack_timer_source_t *timer, void (*ha
 }
 bool hub_security_input_pairing_blocked(void) { return pc_pairing; }
 void hub_latency_input_report(unsigned input, bool mouse) { (void)input; (void)mouse; }
+void hub_latency_mouse_activity(uint16_t handle) {
+    ++mouse_activity_calls;
+    mouse_activity_handle = handle;
+}
+void hub_hogp_init(void) {
+    memset(hogp_started, 0, sizeof(hogp_started));
+    memset(hogp_stopped, 0, sizeof(hogp_stopped));
+    memset(phases, 0, sizeof(phases));
+}
+void hub_hogp_start(unsigned input, uint16_t handle) { (void)handle; ++hogp_started[input]; }
+void hub_hogp_stop(unsigned input) { ++hogp_stopped[input]; }
+void hub_hogp_tick(void) {}
+void hub_hogp_status(unsigned input) { (void)input; }
+void hub_perf_input_phase(unsigned input, uint16_t handle, hub_perf_input_phase_t phase, uint8_t status) {
+    (void)handle; (void)status; assert(input < 2); ++phases[phase];
+}
+void gap_set_connection_parameters(uint16_t interval, uint16_t window, uint16_t min_interval,
+                                  uint16_t max_interval, uint16_t latency, uint16_t timeout,
+                                  uint16_t min_ce, uint16_t max_ce) {
+    assert(interval == 0x60 && window == 0x30 && min_interval == 8 && max_interval == 24);
+    assert(latency == 4 && timeout == 72 && min_ce == 0 && max_ce == 0);
+}
 void hub_router_input_disconnected(unsigned i) { ++released[i]; }
 void hub_router_input_connected(unsigned i) { ++ready_notifications[i]; }
 void hub_router_keyboard(unsigned i, const uint8_t report[8]) { (void)i; (void)report; ++routed_keyboard; }
@@ -91,6 +120,18 @@ void hub_router_mouse(unsigned i, uint8_t b, int32_t x, int32_t y, int32_t w) {
     (void)i; (void)b; (void)x; (void)y; (void)w; ++routed_mouse;
 }
 void hci_add_event_handler(btstack_packet_callback_registration_t *registration) { (void)registration; }
+void hci_set_master_slave_policy(uint8_t policy) { classic_accept_policy = policy; }
+hci_role_t gap_get_role(hci_con_handle_t handle) {
+    assert(handle != HCI_CON_HANDLE_INVALID);
+    ++role_queries;
+    return classic_role;
+}
+uint8_t gap_request_role(const bd_addr_t address, hci_role_t role) {
+    assert(role == HCI_ROLE_MASTER);
+    ++role_requests;
+    memcpy(role_request_address, address, sizeof(bd_addr_t));
+    return role_request_status;
+}
 void sm_add_event_handler(btstack_packet_callback_registration_t *registration) { (void)registration; }
 void sm_bonding_decline(hci_con_handle_t handle) { (void)handle; }
 void sm_request_pairing(hci_con_handle_t handle) { (void)handle; ++pairing_requests; }
@@ -199,6 +240,8 @@ static void reset_fixture(void) {
     memset(corrupt_target, 0, sizeof(corrupt_target));
     memset(released, 0, sizeof(released));
     memset(ready_notifications, 0, sizeof(ready_notifications));
+    mouse_activity_calls = 0;
+    mouse_activity_handle = HCI_CON_HANDLE_INVALID;
     for (unsigned i = 0; i < 8; ++i) {
         le_db[i].type = BD_ADDR_TYPE_UNKNOWN;
         handle_index[i] = -1;
@@ -209,6 +252,11 @@ static void reset_fixture(void) {
     connects = disconnects = pairing_requests = scan_starts = inquiry_starts = 0;
     incoming_accepts = incoming_declines = 0;
     connect_cancels = 0;
+    classic_accept_policy = 0xff;
+    role_request_status = 0;
+    role_requests = role_queries = 0;
+    classic_role = HCI_ROLE_MASTER;
+    memset(role_request_address, 0, sizeof(role_request_address));
     input_started = enrollment_active = enrollment_pending = false;
     establishing = pending_candidate = -1;
     forgetting = candidate_count = 0;
@@ -619,12 +667,15 @@ static void test_ready_notification_once(void) {
         assert(save_descriptor(slot, 0, keyboard_map, sizeof(keyboard_map)));
         input_ready(slot);
         assert(!ready_notifications[0]);
+        assert(!hogp_started[0]);
         slot->security_complete = true;
         input_ready(slot);
         assert(ready_notifications[0] == 1);
         input_ready(slot);
         tick(100);
         assert(ready_notifications[0] == 1 && !ready_notifications[1]);
+        assert(hogp_started[0] == (transport ? 0u : 1u));
+        assert(phases[HUB_PERF_INPUT_READY] == (transport ? 0u : 1u));
 
         close_input(slot, ERROR_CODE_CONNECTION_TIMEOUT, true);
         finish_disconnect(slot);
@@ -638,6 +689,8 @@ static void test_ready_notification_once(void) {
         input_ready(slot);
         input_ready(slot);
         assert(ready_notifications[0] == 2 && !ready_notifications[1]);
+        assert(hogp_started[0] == (transport ? 0u : 2u));
+        assert(hogp_stopped[0] == (transport ? 0u : 1u));
     }
 }
 
@@ -806,6 +859,7 @@ static void test_hids_flow_metadata(void) {
     slot->selected = true;
     slot->state = INPUT_READY;
     slot->cid = 1;
+    slot->handle = 0x41;
     slot->service_count = 1;
     slot->roles = HUB_INPUT_ROLE_MOUSE;
     assert(save_descriptor(slot, 0, mouse_map, sizeof(mouse_map)));
@@ -817,7 +871,9 @@ static void test_hids_flow_metadata(void) {
     input_hids_event(HCI_EVENT_GATTSERVICE_META, 0, packet, sizeof(packet));
     assert(slot->flow.hids == 1 && slot->flow.parsed == 1 && slot->flow.mouse == 1);
     assert(slot->flow.hids_at == 42 && !slot->flow.invalid && routed_mouse == 1);
+    assert(phases[HUB_PERF_INPUT_FIRST_HID] == 1 && phases[HUB_PERF_INPUT_FIRST_ROUTED] == 1);
     assert(!memcmp(original, packet, sizeof(packet)));
+    assert(mouse_activity_calls == 1 && mouse_activity_handle == 0x41);
     packet[7] = 3; /* Truncated callback payload. */
     input_hids_event(HCI_EVENT_PACKET, 0, packet, sizeof(packet));
     assert(slot->flow.rejected == 1 && slot->flow.parsed == 1);
@@ -831,6 +887,34 @@ static void test_hids_flow_metadata(void) {
     packet[3] = 2;
     input_hids_event(HCI_EVENT_PACKET, 0, packet, sizeof(packet));
     assert(unmatched_hids_reports == before + 1 && slot->flow.hids == 4);
+    assert(phases[HUB_PERF_INPUT_FIRST_HID] == 1 && phases[HUB_PERF_INPUT_FIRST_ROUTED] == 1);
+    assert(mouse_activity_calls == 1);
+    slot->state = INPUT_READY;
+    slot->classic = true;
+    const uint8_t motion[] = {5};
+    handle_report(slot, 0, motion, sizeof(motion));
+    assert(mouse_activity_calls == 1);
+    slot->classic = false;
+    memset(slot->reports, 0, sizeof(slot->reports));
+    slot->report_count = 0;
+    slot->roles = HUB_INPUT_ROLE_KEYBOARD;
+    assert(save_descriptor(slot, 0, keyboard_map, sizeof(keyboard_map)));
+    handle_report(slot, 0, motion, sizeof(motion));
+    assert(mouse_activity_calls == 1);
+}
+
+static void test_hids_failure_never_starts_companion(void) {
+    reset_fixture();
+    input_slot_t *slot = &inputs[0];
+    slot->selected = slot->stored = slot->security_complete = true;
+    slot->state = INPUT_DISCOVERING;
+    slot->handle = 0;
+    slot->cid = 2;
+    uint8_t packet[] = {HCI_EVENT_GATTSERVICE_META, 6, GATTSERVICE_SUBEVENT_HID_SERVICE_CONNECTED,
+                       2, 0, ERROR_CODE_UNSPECIFIED_ERROR, HID_PROTOCOL_MODE_REPORT, 1};
+    input_hids_event(HCI_EVENT_PACKET, 0, packet, sizeof(packet));
+    assert(slot->state == INPUT_CLOSING && !slot->cid && slot->last_hid_status == ERROR_CODE_UNSPECIFIED_ERROR);
+    assert(!hogp_started[0] && !ready_notifications[0] && !phases[HUB_PERF_INPUT_READY]);
 }
 
 static void test_ready_ble_mouse_identification(void) {
@@ -855,7 +939,120 @@ static void test_ready_ble_mouse_identification(void) {
     assert(!hub_input_is_ble_mouse_ready(0x40));
 }
 
+static void classic_acl_event(input_slot_t *slot, uint16_t handle, uint8_t status, uint8_t type) {
+    uint8_t packet[13] = {HCI_EVENT_CONNECTION_COMPLETE, 11};
+    packet[2] = status;
+    little_endian_store_16(packet, 3, handle);
+    reverse_bd_addr(slot->address, &packet[5]);
+    packet[11] = type;
+    input_hci_event(HCI_EVENT_PACKET, 0, packet, sizeof(packet));
+}
+
+static void test_classic_central_preference(void) {
+    reset_fixture();
+    assert(classic_accept_policy ==
+           (HUB_CLASSIC_INPUT_CENTRAL && !HUB_CLASSIC_OUTPUT_TEST ? 0 : 1));
+    input_slot_t *slot = &inputs[0];
+    slot->selected = slot->classic = slot->stored = true;
+    slot->address[0] = 0xc1;
+    slot->address[5] = 1;
+    slot->state = INPUT_CONNECTING;
+    slot->deadline = clock_ms + INPUT_CONNECT_MS;
+
+    classic_role = HCI_ROLE_SLAVE;
+    classic_acl_event(slot, 0x40, ERROR_CODE_PAGE_TIMEOUT, 1);
+    classic_acl_event(slot, 0x40, 0, 0); /* SCO is not an input ACL. */
+    assert(!role_requests && !role_queries && slot->handle == HCI_CON_HANDLE_INVALID);
+    slot->selected = false;
+    classic_acl_event(slot, 0x40, 0, 1); /* Unknown/PC address: no policy request. */
+    slot->selected = true;
+    slot->classic = false;
+    classic_acl_event(slot, 0x40, 0, 1); /* BLE target with same bytes is not Classic. */
+    assert(!role_requests && !role_queries && slot->handle == HCI_CON_HANDLE_INVALID);
+    slot->classic = true;
+    classic_acl_event(slot, 0x40, 0, 1);
+    assert(role_requests == (HUB_CLASSIC_INPUT_CENTRAL ? 1u : 0u));
+    assert(slot->classic_central_requested == (bool)HUB_CLASSIC_INPUT_CENTRAL);
+    assert(slot->state == INPUT_CONNECTING && slot->handle == 0x40);
+    assert(!flash_writes && !disconnects && !slot->pairing_authorized);
+    if (HUB_CLASSIC_INPUT_CENTRAL) {
+        assert(!memcmp(role_request_address, slot->address, sizeof(bd_addr_t)));
+    }
+    classic_acl_event(slot, 0x40, 0, 1);
+    unsigned requests = role_requests;
+    assert(requests == (HUB_CLASSIC_INPUT_CENTRAL ? 1u : 0u));
+
+    uint8_t changed[10] = {HCI_EVENT_ROLE_CHANGE, 8, 0};
+    reverse_bd_addr(slot->address, &changed[3]);
+    changed[9] = HCI_ROLE_MASTER;
+    input_hci_event(HCI_EVENT_PACKET, 0, changed, sizeof(changed));
+    changed[9] = HCI_ROLE_SLAVE;
+    input_hci_event(HCI_EVENT_PACKET, 0, changed, sizeof(changed));
+    changed[2] = ERROR_CODE_COMMAND_DISALLOWED;
+    input_hci_event(HCI_EVENT_PACKET, 0, changed, sizeof(changed));
+    input_hci_event(HCI_EVENT_PACKET, 0, changed, sizeof(changed) - 1);
+    uint8_t command[6] = {HCI_EVENT_COMMAND_STATUS, 4, ERROR_CODE_COMMAND_DISALLOWED, 1};
+    little_endian_store_16(command, 4, HCI_OPCODE_HCI_SWITCH_ROLE_COMMAND);
+    input_hci_event(HCI_EVENT_PACKET, 0, command, sizeof(command));
+    tick(1000);
+    assert(role_requests == requests && slot->state == INPUT_CONNECTING);
+
+    uint8_t disconnected[6] = {HCI_EVENT_DISCONNECTION_COMPLETE, 4, 0};
+    little_endian_store_16(disconnected, 3, 0x40);
+    input_hci_event(HCI_EVENT_PACKET, 0, disconnected, sizeof(disconnected));
+    assert(!slot->classic_central_requested && slot->handle == HCI_CON_HANDLE_INVALID);
+    slot->state = INPUT_CONNECTING;
+    role_request_status = ERROR_CODE_COMMAND_DISALLOWED;
+    classic_acl_event(slot, 0x40, 0, 1); /* Reused handle is a new ACL lifetime. */
+    assert(role_requests == requests + (HUB_CLASSIC_INPUT_CENTRAL ? 1u : 0u));
+    assert(slot->state == INPUT_CONNECTING && !slot->auth_failed);
+    requests = role_requests;
+    classic_acl_event(slot, 0x40, 0, 1);
+    assert(role_requests == requests); /* Even rejected submissions are not looped. */
+
+    input_slot_t *other = &inputs[1];
+    other->selected = other->classic = true;
+    memcpy(other->address, slot->address, sizeof(bd_addr_t));
+    other->address[5] = 2;
+    other->state = INPUT_CONNECTING;
+    classic_role = HCI_ROLE_MASTER;
+    classic_acl_event(other, 0x41, 0, 1);
+    assert(!other->classic_central_requested && role_requests == requests);
+    classic_role = HCI_ROLE_INVALID;
+    classic_acl_event(other, 0x41, 0, 1);
+    assert(role_requests == requests);
+    classic_role = HCI_ROLE_SLAVE;
+    other->paused = true;
+    classic_acl_event(other, 0x41, 0, 1);
+    assert(other->state == INPUT_CLOSING && role_requests == requests);
+    other->paused = false;
+    other->state = INPUT_CLOSING;
+    classic_acl_event(other, 0x41, 0, 1);
+    assert(role_requests == requests);
+    other->state = INPUT_CONNECTING;
+    other->remove = true;
+    classic_acl_event(other, 0x41, 0, 1);
+    assert(role_requests == requests);
+    other->remove = false;
+    other->state = INPUT_CONNECTING;
+    other->auth_failed = true;
+    classic_acl_event(other, 0x41, 0, 1);
+    assert(role_requests == requests);
+    other->auth_failed = false;
+    other->state = INPUT_CONNECTING;
+    other->open_test = true;
+    role_request_status = 0;
+    classic_acl_event(other, 0x41, 0, 1);
+    assert(role_requests == requests + (HUB_CLASSIC_INPUT_CENTRAL ? 1u : 0u));
+    if (HUB_CLASSIC_INPUT_CENTRAL) {
+        assert(!memcmp(role_request_address, other->address, sizeof(bd_addr_t)));
+    }
+    assert(!other->forwarding_authorized && !flash_writes);
+}
+
 int main(void) {
+    test_classic_central_preference();
+    test_hids_failure_never_starts_companion();
     test_ready_ble_mouse_identification();
     test_hids_flow_metadata();
     test_records_and_policy();
@@ -876,6 +1073,6 @@ int main(void) {
     test_secure_image_does_not_activate_saved_open_input();
     test_radio_busy_covers_establishment_and_scans();
     test_classic_target_isolation_survives_pause();
-    puts("input tests: 20 groups passed (production state machine and SDK HID parser)");
+    puts("input tests: 22 groups passed (production state machine and SDK HID parser)");
     return 0;
 }

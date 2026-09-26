@@ -19,6 +19,7 @@
 #define PERF_CONTROL_HISTORY 32u
 #define PERF_SLOW_HISTORY 32u
 #define PERF_DUMP_HISTORY 4u
+#define PERF_PROTOCOL_HISTORY 96u
 #define PERF_TIMER_MS 25u
 #define PERF_SAMPLE_MS 250u
 #define PERF_INPUT_SLOW_US 20000u
@@ -31,7 +32,9 @@
 enum {
     PERF_CONNECT, PERF_DISCONNECT, PERF_PARAMETERS, PERF_REQUEST, PERF_TIMEOUT,
     PERF_ROLE, PERF_INPUT_GAP, PERF_OUTPUT_WAIT, PERF_CREDITS, PERF_LOOP,
-    PERF_REMOTE_HCI, PERF_REMOTE_L2CAP, PERF_L2CAP_RESPONSE
+    PERF_REMOTE_HCI, PERF_REMOTE_L2CAP, PERF_L2CAP_RESPONSE,
+    PERF_INPUT_PHASE, PERF_HIDS_CCCD, PERF_ATT_ERROR,
+    PERF_CLASSIC_MODE, PERF_CLASSIC_SUBRATING
 };
 enum { PERF_TRANSPORT_UNKNOWN, PERF_CLASSIC, PERF_LE };
 
@@ -84,6 +87,13 @@ typedef struct {
 } perf_receive_t;
 
 typedef struct {
+    bool known, subrating_known;
+    uint8_t mode, mode_status, subrating_status;
+    uint16_t interval, max_tx_latency, max_rx_latency, min_remote_timeout, min_local_timeout;
+    uint32_t mode_at, subrating_at, mode_events, subrating_events;
+} perf_classic_mode_t;
+
+typedef struct {
     bool connected;
     bool input_side;
     uint16_t handle;
@@ -97,6 +107,7 @@ typedef struct {
     uint16_t timeout;
     perf_credits_t credits;
     perf_receive_t receive;
+    perf_classic_mode_t classic;
 } perf_link_t;
 
 typedef struct {
@@ -173,10 +184,13 @@ static perf_input_t perf_inputs[HUB_INPUT_COUNT][2];
 static perf_output_t perf_outputs[HUB_COMPUTER_COUNT][2];
 static perf_event_t control_history[PERF_CONTROL_HISTORY];
 static perf_event_t slow_history[PERF_SLOW_HISTORY];
+static perf_event_t protocol_history[PERF_PROTOCOL_HISTORY];
 static perf_dump_t dump_history[PERF_DUMP_HISTORY];
 static unsigned control_next, control_count, slow_next, slow_count;
 static unsigned dump_next, dump_count;
 static uint32_t control_evicted, slow_evicted;
+static unsigned protocol_next, protocol_count;
+static uint32_t protocol_evicted;
 static uint32_t next_generation;
 static uint32_t reset_at, timer_due;
 static perf_totals_t totals;
@@ -242,6 +256,31 @@ static void perf_control_push(perf_event_t event) {
     else ++control_evicted;
 }
 
+static void perf_protocol_push(perf_event_t event) {
+    protocol_history[protocol_next] = event;
+    protocol_next = (protocol_next + 1u) % PERF_PROTOCOL_HISTORY;
+    if (protocol_count < PERF_PROTOCOL_HISTORY) ++protocol_count;
+    else ++protocol_evicted;
+}
+
+void hub_perf_input_phase(unsigned input, uint16_t handle, hub_perf_input_phase_t phase, uint8_t status) {
+    if (!perf_initialized || input >= HUB_INPUT_COUNT || (unsigned)phase > HUB_PERF_INPUT_CONNECT_FAILED) return;
+    perf_event_t event = perf_event(PERF_INPUT_PHASE, handle, btstack_run_loop_get_time_ms());
+    event.slot = (uint8_t)input;
+    event.count = (uint32_t)phase;
+    event.status = status;
+    perf_protocol_push(event);
+}
+
+void hub_perf_hids_cccd(uint16_t handle, uint16_t report_handle, bool completed, uint8_t status) {
+    if (!perf_initialized) return;
+    perf_event_t event = perf_event(PERF_HIDS_CCCD, handle, btstack_run_loop_get_time_ms());
+    event.minimum = report_handle;
+    event.fast = completed;
+    event.status = status;
+    perf_protocol_push(event);
+}
+
 static void perf_slow_push(perf_event_t event, perf_gate_t *gate) {
     if (gate->valid && (uint32_t)(event.at_ms - gate->at_ms) < PERF_SAMPLE_MS) {
         ++totals.slow_suppressed;
@@ -290,6 +329,7 @@ static void perf_connect(uint16_t handle, uint8_t transport, uint8_t role,
     link->interval = interval;
     link->latency = latency;
     link->timeout = timeout;
+    link->classic.mode_status = link->classic.subrating_status = 0xff;
     ++totals.connects;
     if (input_side) perf_input_boundary();
     perf_event_t event = perf_event(PERF_CONNECT, handle, link->connected_at);
@@ -354,6 +394,15 @@ static void perf_acl_packet(const uint8_t *packet, uint16_t size, bool incoming)
     if (incoming) {
         ++rx->att;
         rx->last_opcode = packet[8];
+    }
+    if (packet[8] == ATT_ERROR_RESPONSE) {
+        if (length != 5u) { ++*malformed; return; }
+        perf_event_t event = perf_event(PERF_ATT_ERROR, link->handle, now);
+        event.fast = incoming;
+        event.minimum = packet[9];
+        event.maximum = little_endian_read_16(packet, 10);
+        event.status = packet[12];
+        perf_protocol_push(event);
     }
     if (packet[8] != ATT_HANDLE_VALUE_NOTIFICATION && packet[8] != ATT_HANDLE_VALUE_INDICATION) {
         for (unsigned i = 0; i < 16; ++i) {
@@ -583,6 +632,57 @@ static void perf_hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *pac
         case HCI_EVENT_NUMBER_OF_COMPLETED_PACKETS:
             perf_completed(packet, size);
             break;
+        case HCI_EVENT_MODE_CHANGE: {
+            if (size < 8) { ++totals.malformed; break; }
+            uint16_t handle = hci_event_mode_change_get_handle(packet);
+            perf_event_t event = perf_event(PERF_CLASSIC_MODE, handle, btstack_run_loop_get_time_ms());
+            event.status = hci_event_mode_change_get_status(packet);
+            event.count = hci_event_mode_change_get_mode(packet);
+            event.minimum = hci_event_mode_change_get_interval(packet);
+            perf_link_t *link = perf_find_link(handle);
+            if (link && link->transport == PERF_CLASSIC) {
+                perf_classic_mode_t *mode = &link->classic;
+                ++mode->mode_events;
+                mode->mode_status = (uint8_t)event.status;
+                if (!event.status && event.count <= 3) {
+                    mode->known = true;
+                    mode->mode = (uint8_t)event.count;
+                    mode->interval = event.minimum;
+                    mode->mode_at = event.at_ms;
+                    event.fast = true;
+                }
+            }
+            if (!event.status && event.count > 3) ++totals.malformed;
+            perf_control_push(event);
+            break;
+        }
+        case HCI_EVENT_SNIFF_SUBRATING: {
+            if (size < 13) { ++totals.malformed; break; }
+            uint16_t handle = hci_event_sniff_subrating_get_handle(packet);
+            perf_event_t event = perf_event(PERF_CLASSIC_SUBRATING, handle, btstack_run_loop_get_time_ms());
+            event.status = hci_event_sniff_subrating_get_status(packet);
+            event.minimum = hci_event_sniff_subrating_get_max_tx_latency(packet);
+            event.maximum = hci_event_sniff_subrating_get_max_rx_latency(packet);
+            event.latency = hci_event_sniff_subrating_get_min_remote_timeout(packet);
+            event.timeout = hci_event_sniff_subrating_get_min_local_timeout(packet);
+            perf_link_t *link = perf_find_link(handle);
+            if (link && link->transport == PERF_CLASSIC) {
+                perf_classic_mode_t *mode = &link->classic;
+                ++mode->subrating_events;
+                mode->subrating_status = (uint8_t)event.status;
+                if (!event.status) {
+                    mode->subrating_known = true;
+                    mode->max_tx_latency = event.minimum;
+                    mode->max_rx_latency = event.maximum;
+                    mode->min_remote_timeout = event.latency;
+                    mode->min_local_timeout = event.timeout;
+                    mode->subrating_at = event.at_ms;
+                    event.fast = true;
+                }
+            }
+            perf_control_push(event);
+            break;
+        }
         case HCI_EVENT_ROLE_CHANGE:
             if (size < 10) { ++totals.malformed; break; }
             if (packet[2]) break;
@@ -626,6 +726,7 @@ void hub_perf_reset(void) {
     memset(perf_outputs, 0, sizeof(perf_outputs));
     memset(control_history, 0, sizeof(control_history));
     memset(slow_history, 0, sizeof(slow_history));
+    memset(protocol_history, 0, sizeof(protocol_history));
     memset(dump_history, 0, sizeof(dump_history));
     memset(&loop_lateness, 0, sizeof(loop_lateness));
     memset(&loop_gate, 0, sizeof(loop_gate));
@@ -637,6 +738,8 @@ void hub_perf_reset(void) {
     control_next = control_count = slow_next = slow_count = 0;
     dump_next = dump_count = 0;
     control_evicted = slow_evicted = 0;
+    protocol_next = protocol_count = 0;
+    protocol_evicted = 0;
     reset_at = btstack_run_loop_get_time_ms();
 }
 
@@ -662,6 +765,51 @@ static const char *perf_role_name(unsigned role) {
     return role == HCI_ROLE_MASTER ? "central" : role == HCI_ROLE_SLAVE ? "peripheral" : "unknown";
 }
 
+static const char *perf_classic_mode_name(unsigned mode) {
+    static const char *const names[] = {"active", "hold", "sniff", "park"};
+    return mode < 4 ? names[mode] : "unknown";
+}
+
+static void perf_print_classic_link(const perf_link_t *link, uint32_t now) {
+    const perf_classic_mode_t *mode = &link->classic;
+    printf("[classic-mode] handle=0x%04x gen=%" PRIu32 " side=%s Pico-role=%s mode=%s",
+           link->handle, link->generation, link->input_side ? "input" : "PC",
+           perf_role_name(link->role), mode->known ? perf_classic_mode_name(mode->mode) : "unknown");
+    if (mode->known) {
+        printf(" interval=%u(0.625ms) interval-us=%" PRIu32 " observed-age=%" PRIu32 "ms",
+               mode->interval, (uint32_t)mode->interval * 625u, now - mode->mode_at);
+    } else {
+        printf(" (no successful Mode Change observed; not inferred from report gaps)");
+    }
+    printf(" events-since-connect=%" PRIu32 " last-status=0x%02x (ff=not observed)\n",
+           mode->mode_events, mode->mode_status);
+    printf("[classic-subrating] handle=0x%04x gen=%" PRIu32, link->handle, link->generation);
+    if (mode->subrating_known) {
+        printf(" last-success max-tx=%u max-rx=%u min-remote-timeout=%u min-local-timeout=%u"
+               " (all 0.625ms units) observed-age=%" PRIu32 "ms",
+               mode->max_tx_latency, mode->max_rx_latency, mode->min_remote_timeout,
+               mode->min_local_timeout, now - mode->subrating_at);
+    } else {
+        printf(" unknown (no successful Sniff Subrating event observed)");
+    }
+    printf(" events-since-connect=%" PRIu32 " last-status=0x%02x; NOT proof of current sniff mode\n",
+           mode->subrating_events, mode->subrating_status);
+}
+
+void hub_perf_classic_status(void) {
+    uint32_t now = btstack_run_loop_get_time_ms();
+    printf("[classic-mode] passive HCI observations only; failures retain last successful state;"
+           " intervals are NOT HID report periods or end-to-end latency\n");
+    unsigned count = 0;
+    for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i) {
+        const perf_link_t *link = &perf_links[i];
+        if (!link->connected || link->transport != PERF_CLASSIC) continue;
+        ++count;
+        perf_print_classic_link(link, now);
+    }
+    if (!count) printf("[classic-mode] no tracked Classic ACL links\n");
+}
+
 static void perf_print_samples(const perf_samples_t *samples, const char *unit) {
     if (!samples->count) {
         printf("samples=0 timings=n/a");
@@ -676,7 +824,9 @@ static void perf_print_event(const perf_event_t *event) {
     static const char *names[] = {"connect", "disconnect", "applied-update", "parameter-request",
                                   "parameter-timeout", "role", "input-gap", "output-wait",
                                   "controller-credits", "loop-late", "peer-HCI-parameter-request",
-                                  "peer-L2CAP-parameter-request", "peer-L2CAP-parameter-response"};
+                                  "peer-L2CAP-parameter-request", "peer-L2CAP-parameter-response",
+                                  "input-phase", "HIDS-CCCD", "ATT-error-response",
+                                  "Classic-mode-change", "Classic-sniff-subrating"};
     printf("[trace] t=%" PRIu32 "ms %s", event->at_ms, names[event->kind]);
     if (event->handle != HCI_CON_HANDLE_INVALID) {
         printf(" handle=0x%04x gen=%" PRIu32 " %s/%s",
@@ -719,6 +869,29 @@ static void perf_print_event(const perf_event_t *event) {
         }
     } else if (event->kind == PERF_LOOP) {
         printf(" lateness=%" PRIu64 "ms", event->value);
+    } else if (event->kind == PERF_INPUT_PHASE) {
+        static const char *const phases[] = {
+            "encrypted", "HID-discovery-start", "HID-ready", "first-HID-callback",
+            "first-router-submission", "HOGP-companion-done", "reconnect-backoff",
+            "connect-start", "connect-failed"
+        };
+        printf(" input=%u phase=%s status=0x%02x", event->slot + 1u, phases[event->count], event->status);
+    } else if (event->kind == PERF_HIDS_CCCD) {
+        printf(" report-handle=0x%04x %s=0x%02x", event->minimum,
+               event->fast ? "ATT-completion" : "local-submit", event->status);
+    } else if (event->kind == PERF_ATT_ERROR) {
+        printf(" %s request=0x%02x attribute=0x%04x ATT-status=0x%02x",
+               event->fast ? "RX" : "TX", event->minimum, event->maximum, event->status);
+    } else if (event->kind == PERF_CLASSIC_MODE) {
+        printf(" status=0x%02x reported-mode=%s(%u) interval=%u(0.625ms) interval-us=%" PRIu32
+               " %s", event->status, perf_classic_mode_name(event->count), (unsigned)event->count,
+               event->minimum, (uint32_t)event->minimum * 625u,
+               event->fast ? "observed" : "NOT applied to tracked state");
+    } else if (event->kind == PERF_CLASSIC_SUBRATING) {
+        printf(" status=0x%02x max-tx=%u max-rx=%u min-remote-timeout=%u min-local-timeout=%u"
+               " (all 0.625ms units) %s; does not establish current mode",
+               event->status, event->minimum, event->maximum, event->latency, event->timeout,
+               event->fast ? "observed" : "NOT applied to tracked state");
     }
     printf("\n");
 }
@@ -777,6 +950,7 @@ void hub_perf_status(void) {
         printf(" inter-credit-gap ");
         perf_print_samples(&link->credits.gaps, "us");
         printf(" coarse=%" PRIu32 "\n", link->credits.coarse_gaps);
+        if (link->transport == PERF_CLASSIC) perf_print_classic_link(link, now);
         if (link->transport == PERF_LE && link->input_side) {
             const perf_receive_t *rx = &link->receive;
             printf("[trace RX] handle=0x%04x gen=%" PRIu32 " ACL=%" PRIu32
@@ -848,6 +1022,13 @@ void hub_perf_status(void) {
     }
     for (unsigned i = 0; i < slow_count; ++i) {
         perf_print_event(&slow_history[(slow_next + PERF_SLOW_HISTORY - slow_count + i) % PERF_SLOW_HISTORY]);
+    }
+    printf("[trace] protocol-history=%u/%u evicted=%" PRIu32
+           "; control metadata only; ATT 0x0a can be normal end-of-discovery\n",
+           protocol_count, PERF_PROTOCOL_HISTORY, protocol_evicted);
+    for (unsigned i = 0; i < protocol_count; ++i) {
+        perf_print_event(&protocol_history[(protocol_next + PERF_PROTOCOL_HISTORY - protocol_count + i)
+                                         % PERF_PROTOCOL_HISTORY]);
     }
     printf("[trace] dump-body-end t=%" PRIu32 "ms; full return-time boundary retained in RAM\n",
            btstack_run_loop_get_time_ms());

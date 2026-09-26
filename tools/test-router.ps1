@@ -54,13 +54,18 @@ $util = Join-Path $btstack 'btstack_util.c'
 if (-not (Test-Path -LiteralPath $hidParser) -or -not (Test-Path -LiteralPath $util)) {
     throw 'SDK HID parser missing for input tests. Run bootstrap.ps1 or pass -SdkPath.'
 }
-$output = Join-Path $outputDirectory 'hub_input_tests.exe'
-& $compiler -Wall -Werror -DENABLE_BLE=1 -DENABLE_CLASSIC=1 `
-    "-I$(Join-Path $root 'include')" "-I$btstack" `
-    (Join-Path $root 'tests\input_test.c') $hidParser $util -o $output
-if ($LASTEXITCODE -ne 0) { throw "Input test compilation failed: $LASTEXITCODE" }
-& $output
-if ($LASTEXITCODE -ne 0) { throw "Input tests failed: $LASTEXITCODE" }
+foreach ($classicOutput in @(0, 1)) {
+    foreach ($central in @(0, 1)) {
+        $output = Join-Path $outputDirectory "hub_input_${classicOutput}_${central}_tests.exe"
+        & $compiler -Wall -Werror -DENABLE_BLE=1 -DENABLE_CLASSIC=1 `
+            "-DHUB_CLASSIC_OUTPUT_TEST=$classicOutput" "-DHUB_CLASSIC_INPUT_CENTRAL=$central" `
+            "-I$(Join-Path $root 'include')" "-I$btstack" `
+            (Join-Path $root 'tests\input_test.c') $hidParser $util -o $output
+        if ($LASTEXITCODE -ne 0) { throw "Input variant $classicOutput/$central compilation failed: $LASTEXITCODE" }
+        & $output
+        if ($LASTEXITCODE -ne 0) { throw "Input variant $classicOutput/$central tests failed: $LASTEXITCODE" }
+    }
+}
 $output = Join-Path $outputDirectory 'hub_open_input_tests.exe'
 & $compiler -Wall -Werror -DENABLE_BLE=1 -DENABLE_CLASSIC=1 -DHUB_CLASSIC_OPEN_TEST=1 `
     "-I$(Join-Path $root 'include')" "-I$btstack" `
@@ -78,6 +83,7 @@ if ($LASTEXITCODE -ne 0) { throw "Security profile compilation failed: $LASTEXIT
 if ($LASTEXITCODE -ne 0) { throw "Security profile tests failed: $LASTEXITCODE" }
 
 & (Join-Path $root 'tests\test-hci-reconnect.ps1') -SdkPath $SdkPath
+& (Join-Path $root 'tests\test-hogp.ps1') -SdkPath $SdkPath
 & (Join-Path $root 'tests\test-output.ps1') -SdkPath $SdkPath
 $output = Join-Path $outputDirectory 'hub_latency_tests.exe'
 & $compiler -Wall -Werror -DENABLE_BLE=1 -DENABLE_CLASSIC=1 `

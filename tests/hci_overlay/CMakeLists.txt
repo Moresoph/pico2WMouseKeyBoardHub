@@ -8,6 +8,7 @@ if(NOT DEFINED PICO_BTSTACK_PATH)
 endif()
 set(PICO_SDK_VERSION_STRING "2.3.1")
 include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/HubBtstackReconnect.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/HubBtstackHids.cmake")
 
 if(HUB_OVERLAY_TEST_CASE STREQUAL "sdk")
     set(PICO_SDK_VERSION_STRING "2.3.2")
@@ -21,6 +22,14 @@ elseif(HUB_OVERLAY_TEST_CASE STREQUAL "anchor_missing")
     hub_hci_find_once("one" "two" unused)
 elseif(HUB_OVERLAY_TEST_CASE STREQUAL "anchor_duplicate")
     hub_hci_find_once("one one" "one" unused)
+endif()
+
+if(HUB_OVERLAY_TEST_CASE STREQUAL "hids_hash")
+    file(READ "${PICO_BTSTACK_PATH}/src/ble/gatt-service/hids_host.c" changed_source)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/changed_hids.c" "${changed_source}\n/* unexpected change */\n")
+    hub_generate_patched_hids("${CMAKE_CURRENT_BINARY_DIR}/changed_hids.c"
+        "${CMAKE_CURRENT_BINARY_DIR}/unexpected.c")
+    message(FATAL_ERROR "FAIL_OPEN: changed HIDS source accepted")
 endif()
 
 add_library(pico_btstack_base INTERFACE)
@@ -38,8 +47,27 @@ if(NOT actual STREQUAL expected)
     message(FATAL_ERROR "Overlay did not preserve and replace target sources exactly: ${actual}")
 endif()
 
+if(HUB_OVERLAY_TEST_CASE STREQUAL "hids_sdk")
+    set(PICO_SDK_VERSION_STRING "2.3.2")
+endif()
+add_library(pico_btstack_ble INTERFACE)
+target_sources(pico_btstack_ble INTERFACE
+    "${PICO_BTSTACK_PATH}/src/ble/gatt_client.c" "${PICO_BTSTACK_PATH}/src/ble/gatt-service/hids_host.c")
+if(HUB_OVERLAY_TEST_CASE STREQUAL "hids_missing")
+    set_property(TARGET pico_btstack_ble PROPERTY INTERFACE_SOURCES "${PICO_BTSTACK_PATH}/src/ble/gatt_client.c")
+elseif(HUB_OVERLAY_TEST_CASE STREQUAL "hids_duplicate")
+    target_sources(pico_btstack_ble INTERFACE "${PICO_BTSTACK_PATH}/src/ble/gatt-service/hids_host.c")
+endif()
+hub_patch_btstack_hids()
+get_target_property(actual pico_btstack_ble INTERFACE_SOURCES)
+set(expected "${PICO_BTSTACK_PATH}/src/ble/gatt_client.c;${CMAKE_CURRENT_BINARY_DIR}/generated/btstack/hids_host.c")
+if(NOT actual STREQUAL expected)
+    message(FATAL_ERROR "HIDS overlay did not preserve and replace target sources exactly: ${actual}")
+endif()
+
 if(NOT DEFINED HUB_OVERLAY_TEST_CASE)
-    foreach(case IN ITEMS sdk hash missing duplicate anchor_missing anchor_duplicate)
+    foreach(case IN ITEMS sdk hash missing duplicate anchor_missing anchor_duplicate
+            hids_sdk hids_hash hids_missing hids_duplicate)
         add_test(NAME hci_overlay_reject_${case}
             COMMAND "${CMAKE_COMMAND}" "-DSOURCE_DIR=${CMAKE_CURRENT_LIST_DIR}"
                 "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/${case}"

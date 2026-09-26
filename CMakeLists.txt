@@ -9,9 +9,10 @@ if(NOT EXISTS "${PICO_SDK_PATH}/external/pico_sdk_import.cmake")
 endif()
 include("${PICO_SDK_PATH}/external/pico_sdk_import.cmake")
 
-project(pico_bt_hub VERSION 0.4.3 LANGUAGES C CXX ASM)
+project(pico_bt_hub VERSION 0.4.10 LANGUAGES C CXX ASM)
 option(HUB_CLASSIC_OPEN_TEST "Enable Classic Level 0 inputs with explicit forwarding authorization" OFF)
 option(HUB_CLASSIC_OUTPUT_TEST "Experimental single-PC Classic HID output instead of BLE" OFF)
+option(HUB_CLASSIC_INPUT_CENTRAL "Prefer Pico Central on Classic HID input links" ON)
 option(HUB_CLASSIC_MOUSE_7P5_TEST "Request mouse-only 7.5ms interval in Classic normal mode" OFF)
 option(HUB_CLASSIC_OUTPUT_7P5_TEST "Use 7.5ms ordinary Classic output pacing instead of 2.5ms" OFF)
 if(HUB_CLASSIC_MOUSE_7P5_TEST AND NOT HUB_CLASSIC_OUTPUT_TEST)
@@ -25,6 +26,8 @@ set(CMAKE_CXX_STANDARD 17)
 pico_sdk_init()
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/HubBtstackReconnect.cmake")
 hub_patch_btstack_reconnect()
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/HubBtstackHids.cmake")
+hub_patch_btstack_hids()
 if(HUB_CLASSIC_OUTPUT_TEST)
     include("${CMAKE_CURRENT_LIST_DIR}/cmake/HubBtstackClassicMux.cmake")
     hub_patch_btstack_classic_mux()
@@ -42,6 +45,7 @@ add_executable(pico_bt_hub
     src/hub_output_timer.c
     src/hub_output_store.c
     src/hub_input.c
+    src/hub_hogp.c
     src/hub_router.c
     src/hub_passkey.c
     src/hub_button.c
@@ -67,6 +71,7 @@ target_compile_options(pico_bt_hub PRIVATE -Wall -Wextra)
 target_compile_definitions(pico_bt_hub PRIVATE
     HUB_CLASSIC_OPEN_TEST=$<BOOL:${HUB_CLASSIC_OPEN_TEST}>
     HUB_CLASSIC_OUTPUT_TEST=$<BOOL:${HUB_CLASSIC_OUTPUT_TEST}>
+    HUB_CLASSIC_INPUT_CENTRAL=$<BOOL:${HUB_CLASSIC_INPUT_CENTRAL}>
     HUB_CLASSIC_MOUSE_7P5_TEST=$<BOOL:${HUB_CLASSIC_MOUSE_7P5_TEST}>
     HUB_CLASSIC_OUTPUT_7P5_TEST=$<BOOL:${HUB_CLASSIC_OUTPUT_7P5_TEST}>
     PICO_STDIO_USB_CONNECT_WAIT_TIMEOUT_MS=0

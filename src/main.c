@@ -681,6 +681,9 @@ static void print_help(void) {
         "  help | status | bonds | diag | latency\n"
         "  latency fast|normal|reset  Runtime latency tuning / measurement reset\n"
         "  latency trace              RAM timing/link history (no input payloads)\n"
+        "  latency classic            Passive Classic mode / Sniff Subrating snapshot\n"
+        "  latency mouse-active on|off|status  BLE activity-triggered latency=0; boot ON with fast\n"
+        "  latency pc-standby on|off|status  Inactive BLE PCs request 15ms; default off\n"
         "  mouse-buffer on|off|status BLE motion-credit experiment; RAM-only, default on\n"
         "  diag                       Replay recent pairing metadata (no PIN/key values)\n"
         "  enroll | enroll stop       Timed automatic keyboard/mouse enrollment\n"
@@ -934,6 +937,21 @@ static void console_command(char *line) {
         if (argc == 2 && strcmp(args[1], "normal") == 0) { hub_latency_set_fast(false); return; }
         if (argc == 2 && strcmp(args[1], "reset") == 0) { hub_latency_reset(); return; }
         if (argc == 2 && strcmp(args[1], "trace") == 0) { hub_perf_status(); return; }
+        if (argc == 2 && strcmp(args[1], "classic") == 0) { hub_perf_classic_status(); return; }
+        if (argc == 3 && strcmp(args[1], "pc-standby") == 0) {
+            if (strcmp(args[2], "status") == 0) { hub_latency_pc_standby_status(); return; }
+            if (strcmp(args[2], "on") == 0 || strcmp(args[2], "off") == 0) {
+                hub_latency_set_pc_standby(strcmp(args[2], "on") == 0);
+                return;
+            }
+        }
+        if (argc == 3 && strcmp(args[1], "mouse-active") == 0) {
+            if (strcmp(args[2], "status") == 0) { hub_latency_mouse_active_status(); return; }
+            if (strcmp(args[2], "on") == 0 || strcmp(args[2], "off") == 0) {
+                hub_latency_set_mouse_active(strcmp(args[2], "on") == 0);
+                return;
+            }
+        }
     }
     if (strcmp(args[0], "status") == 0 && argc == 1) {
         printf("[status] firmware=%s\n", PICO_PROGRAM_VERSION_STRING);
@@ -950,6 +968,8 @@ static void console_command(char *line) {
                gap_get_security_level(), gap_get_security_mode(), HUB_CLASSIC_OPEN_TEST);
         printf("[status] open-input-bridge=%u\n", hub_input_open_bridge_enabled());
         print_link_counts();
+        hub_latency_mouse_active_status();
+        hub_latency_pc_standby_status();
         hub_output_status();
         hub_input_status();
         hub_router_status();

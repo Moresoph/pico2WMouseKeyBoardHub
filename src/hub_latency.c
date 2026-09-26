@@ -19,21 +19,25 @@
 
 #define LATENCY_FAST_INTERVAL_MIN 6u
 #define LATENCY_FAST_INTERVAL_MAX 12u
+#define LATENCY_PC_STANDBY_INTERVAL 12u
 #define LATENCY_REQUEST_TIMEOUT_MS 5000u
 #define LATENCY_SETTLE_MS 2000u
 #define LATENCY_INPUT_REASSERT_MS 10000u
+#define LATENCY_MOUSE_ACTIVITY_MS 1000u
 #define LATENCY_SETTINGS_TAG 0x50484c31u /* PHL1 */
 
 typedef struct {
     bool connected;
     bool attempted;
     bool requested_fast;
+    bool requested_standby;
     bool requested_mouse_interval;
     bool reassert_interval;
     bool pending;
     bool remote_pending;
     bool tuned;
     bool reassert_zero;
+    bool mouse_activity_pending;
     uint8_t role;
     uint16_t handle;
     uint16_t interval;
@@ -45,8 +49,10 @@ typedef struct {
     uint32_t connected_at;
     uint32_t request_at;
     uint32_t remote_request_at;
+    uint32_t mouse_activity_at;
     unsigned requests;
     unsigned satisfied;
+    unsigned mouse_active_requests;
 } latency_link_t;
 
 typedef struct {
@@ -65,6 +71,8 @@ static btstack_packet_callback_registration_t registration;
 static btstack_packet_callback_registration_t l2cap_registration;
 static btstack_timer_source_t timer;
 static bool fast_mode;
+static bool mouse_active_mode;
+static bool pc_standby_mode;
 static bool working;
 static uint32_t radio_activity_at;
 static uint16_t observed_active;
@@ -147,6 +155,93 @@ static latency_link_t *find_link(uint16_t handle) {
         if (links[i].connected && links[i].handle == handle) return &links[i];
     }
     return NULL;
+}
+
+void hub_latency_mouse_activity(uint16_t handle) {
+    if (HUB_CLASSIC_OUTPUT_TEST || !mouse_active_mode || !fast_mode) return;
+    latency_link_t *link = find_link(handle);
+    if (!link || link->role != HCI_ROLE_MASTER || !link->latency
+        || !hub_input_is_ble_mouse_ready(handle)) return;
+    link->mouse_activity_pending = true;
+    link->mouse_activity_at = btstack_run_loop_get_time_ms();
+}
+
+void hub_latency_mouse_active_status(void) {
+    printf("[mouse-active] enabled=%u supported=%u fast=%u; RAM-only, boot default ON in BLE fast mode;"
+           " recent-report=%ums retry-spacing>=%ums; requests latency=0 only,"
+           " interval/timeout retained, peer power-saving updates allowed\n",
+           mouse_active_mode, !HUB_CLASSIC_OUTPUT_TEST, fast_mode,
+           LATENCY_MOUSE_ACTIVITY_MS, LATENCY_INPUT_REASSERT_MS);
+    for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i) {
+        const latency_link_t *link = &links[i];
+        if (!link->connected || link->role != HCI_ROLE_MASTER
+            || !hub_input_is_ble_mouse_ready(link->handle)) continue;
+        printf("[mouse-active] handle=0x%04x latency=%u activity-pending=%u requests=%u"
+               " update-pending=%u peer-pending=%u\n",
+               link->handle, link->latency, link->mouse_activity_pending,
+               link->mouse_active_requests, link->pending, link->remote_pending);
+    }
+}
+
+bool hub_latency_set_mouse_active(bool enabled) {
+    if (HUB_CLASSIC_OUTPUT_TEST) {
+        printf("[mouse-active] unsupported by the Classic output experiment; unchanged\n");
+        return false;
+    }
+    if (enabled && (!fast_mode || hub_security_input_pairing_blocked())) {
+        printf("[mouse-active] finish pairing and enable latency fast first; unchanged\n");
+        return false;
+    }
+    if (mouse_active_mode != enabled) {
+        mouse_active_mode = enabled;
+        for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i)
+            links[i].mouse_activity_pending = false;
+    }
+    printf("[mouse-active] %s; %s\n", enabled ? "ON" : "OFF",
+           enabled ? "waiting for new mouse reports; no immediate update"
+                   : "future activity requests disabled; in-flight/actual parameters retained");
+    return true;
+}
+
+void hub_latency_pc_standby_status(void) {
+    uint16_t active = hub_output_active_handle();
+    printf("[pc-standby] enabled=%u supported=%u fast=%u; RAM-only, boot default OFF;"
+           " ready standby PCs request 15ms/latency=0; selected PC requests 7.5ms;"
+           " applied values depend on PC acceptance\n",
+           pc_standby_mode, !HUB_CLASSIC_OUTPUT_TEST, fast_mode);
+    for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i) {
+        const latency_link_t *link = &links[i];
+        if (!link->connected || link->role != HCI_ROLE_SLAVE) continue;
+        bool ready = hub_output_is_ready_connection(link->handle);
+        uint32_t interval_us = (uint32_t)link->interval * 1250u;
+        printf("[pc-standby] handle=0x%04x ready=%u selected=%u requested-standby=%u"
+               " actual-interval=%" PRIu32 ".%03" PRIu32 "ms latency=%u timeout=%ums"
+               " applied-15ms=%u pending=%u peer-pending=%u\n",
+               link->handle, ready, link->handle == active, link->requested_standby,
+               interval_us / 1000u, interval_us % 1000u, link->latency, link->timeout * 10u,
+               link->interval == LATENCY_PC_STANDBY_INTERVAL && !link->latency,
+               link->pending, link->remote_pending);
+    }
+}
+
+bool hub_latency_set_pc_standby(bool enabled) {
+    if (HUB_CLASSIC_OUTPUT_TEST) {
+        printf("[pc-standby] unsupported by the Classic output experiment; unchanged\n");
+        return false;
+    }
+    if (enabled && (!fast_mode || hub_security_input_pairing_blocked())) {
+        printf("[pc-standby] finish pairing and enable latency fast first; unchanged\n");
+        return false;
+    }
+    if (pc_standby_mode != enabled) {
+        pc_standby_mode = enabled;
+        radio_activity_at = btstack_run_loop_get_time_ms();
+    }
+    printf("[pc-standby] %s; %s; updates remain serialized and require PC acceptance\n",
+           enabled ? "ON" : "OFF",
+           enabled ? "waiting for ready PCs and a quiet window"
+                   : "standby PCs will be requested back to baseline; selected PC stays fast");
+    return true;
 }
 
 void hub_latency_input_report(unsigned input, bool mouse) {
@@ -233,18 +328,28 @@ static void event_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
             link->interval = hci_subevent_le_connection_update_complete_get_conn_interval(packet);
             link->latency = hci_subevent_le_connection_update_complete_get_conn_latency(packet);
             link->timeout = hci_subevent_le_connection_update_complete_get_supervision_timeout(packet);
+            if (!link->latency) link->mouse_activity_pending = false;
             if (HUB_CLASSIC_MOUSE_7P5_TEST && !local_pending && link->requested_mouse_interval)
                 link->reassert_interval = link->interval != LATENCY_FAST_INTERVAL_MIN;
             if (HUB_CLASSIC_OUTPUT_TEST && fast_mode && link->role == HCI_ROLE_MASTER
                 && hub_input_is_connection(link->handle)) {
                 link->reassert_zero = link->latency != 0;
             }
+            if (link->tuned && !link->requested_fast && !link->requested_standby
+                && !link->requested_mouse_interval
+                && link->interval == link->baseline_interval
+                && link->latency == link->baseline_latency
+                && link->timeout == link->baseline_timeout) link->tuned = false;
             if (!link->tuned) {
                 link->baseline_interval = link->interval;
                 link->baseline_latency = link->latency;
                 link->baseline_timeout = link->timeout;
             }
             print_link(link);
+            if (local_pending && link->requested_standby
+                && (link->interval != LATENCY_PC_STANDBY_INTERVAL || link->latency != 0))
+                printf("[pc-standby] handle=0x%04x PC applied different parameters;"
+                       " no automatic retry\n", link->handle);
         }
     } else if (packet[0] == HCI_EVENT_DISCONNECTION_COMPLETE && size >= 6 && packet[2] == 0) {
         latency_link_t *link = find_link(hci_event_disconnection_complete_get_connection_handle(packet));
@@ -305,6 +410,9 @@ static void update_parameters(void) {
     for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i) {
         latency_link_t *link = &links[i];
         if (!link->connected) continue;
+        if (link->mouse_activity_pending
+            && (uint32_t)(now - link->mouse_activity_at) > LATENCY_MOUSE_ACTIVITY_MS)
+            link->mouse_activity_pending = false;
         if (link->pending && (uint32_t)(now - link->request_at) >= LATENCY_REQUEST_TIMEOUT_MS) {
             link->pending = false;
             radio_activity_at = now;
@@ -324,11 +432,18 @@ static void update_parameters(void) {
     if (busy) radio_activity_at = now;
     if (!working || busy || pending || (uint32_t)(now - radio_activity_at) < LATENCY_SETTLE_MS) return;
 
-    for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i) {
-        latency_link_t *link = &links[i];
-        if (!link->connected) continue;
+    /* Promote the newly selected PC before slowing the old one. */
+    latency_link_t *priority = pc_standby_mode ? find_link(active) : NULL;
+    for (unsigned i = 0; i <= MAX_NR_HCI_CONNECTIONS; ++i) {
+        latency_link_t *link = i == 0 ? priority : &links[i - 1u];
+        if (!link || !link->connected || (i && link == priority)) continue;
+        if (pc_standby_mode && link->role == HCI_ROLE_SLAVE
+            && (active == HCI_CON_HANDLE_INVALID || !hub_output_is_ready_connection(link->handle)))
+            continue;
         bool desired = fast_mode && ((link->role == HCI_ROLE_MASTER && hub_input_is_connection(link->handle))
             || (link->role == HCI_ROLE_SLAVE && link->handle == active));
+        bool standby = pc_standby_mode && fast_mode && link->role == HCI_ROLE_SLAVE
+            && link->handle != active;
         bool mouse_interval = HUB_CLASSIC_MOUSE_7P5_TEST && !fast_mode
             && link->role == HCI_ROLE_MASTER && hub_input_is_ble_mouse_ready(link->handle);
         bool reassert = HUB_CLASSIC_OUTPUT_TEST && desired && link->reassert_zero
@@ -336,13 +451,20 @@ static void update_parameters(void) {
             && (!link->requests || (uint32_t)(now - link->request_at) >= LATENCY_INPUT_REASSERT_MS);
         bool reassert_interval = mouse_interval && link->reassert_interval
             && (!link->requests || (uint32_t)(now - link->request_at) >= LATENCY_INPUT_REASSERT_MS);
-        if (link->attempted && desired == link->requested_fast
-            && mouse_interval == link->requested_mouse_interval && !reassert && !reassert_interval) continue;
+        bool policy_satisfied = link->attempted && desired == link->requested_fast
+            && standby == link->requested_standby
+            && mouse_interval == link->requested_mouse_interval && !reassert && !reassert_interval;
+        bool mouse_active = !HUB_CLASSIC_OUTPUT_TEST && mouse_active_mode && desired && policy_satisfied
+            && link->role == HCI_ROLE_MASTER && hub_input_is_ble_mouse_ready(link->handle)
+            && link->latency != 0 && link->mouse_activity_pending
+            && (!link->requests || (uint32_t)(now - link->request_at) >= LATENCY_INPUT_REASSERT_MS);
+        if (policy_satisfied && !mouse_active) continue;
         link->reassert_zero = false;
         link->reassert_interval = false;
-        if (!desired && !mouse_interval && !link->tuned) {
+        if (!desired && !standby && !mouse_interval && !link->tuned) {
             link->attempted = true;
             link->requested_fast = false;
+            link->requested_standby = false;
             link->requested_mouse_interval = false;
             continue;
         }
@@ -356,6 +478,12 @@ static void update_parameters(void) {
         if (desired && link->role == HCI_ROLE_SLAVE) maximum = minimum;
         uint16_t latency = desired ? 0 : link->baseline_latency;
         uint16_t timeout = desired ? 200 : link->baseline_timeout;
+        if (standby) {
+            minimum = maximum = LATENCY_PC_STANDBY_INTERVAL;
+            latency = 0;
+            /* At latency 0, supervision timeout must exceed two intervals. */
+            timeout = link->timeout > LATENCY_PC_STANDBY_INTERVAL / 4u ? link->timeout : 200;
+        }
         if (mouse_interval) {
             minimum = maximum = LATENCY_FAST_INTERVAL_MIN;
             /* This trial changes interval only. A prior fast-mode tune still
@@ -365,15 +493,23 @@ static void update_parameters(void) {
                 timeout = link->timeout;
             }
         }
+        if (mouse_active) {
+            minimum = maximum = link->interval;
+            timeout = link->timeout;
+            link->mouse_activity_pending = false;
+            ++link->mouse_active_requests;
+        }
         link->attempted = true;
         link->requested_fast = desired;
+        link->requested_standby = standby;
         link->requested_mouse_interval = mouse_interval;
         if (link->interval >= minimum && link->interval <= maximum && link->latency == latency
             && (desired || link->timeout == timeout)) {
-            if (!desired) link->tuned = false;
+            if (!desired && !standby) link->tuned = false;
             ++link->satisfied;
             printf("[latency] handle=0x%04x %s parameters already satisfied; no request\n",
-                   link->handle, desired ? "fast" : mouse_interval ? "mouse-7.5ms" : "baseline");
+                   link->handle, desired ? "fast" : standby ? "standby-15ms"
+                       : mouse_interval ? "mouse-7.5ms" : "baseline");
             continue;
         }
         ++link->requests;
@@ -384,11 +520,14 @@ static void update_parameters(void) {
         radio_activity_at = now;
         hub_perf_parameter_request(link->handle, desired, minimum, maximum, latency, timeout, status);
         printf("[latency] %s request handle=0x%04x interval-units=%u..%u latency=%u result=0x%02x\n",
-               desired ? "low-latency" : mouse_interval ? "mouse-7.5ms interval-only" : "restore-baseline", link->handle,
+               mouse_active ? "mouse-active latency-only" : desired ? "low-latency"
+                   : standby ? "standby-15ms"
+                   : mouse_interval ? "mouse-7.5ms interval-only" : "restore-baseline", link->handle,
                minimum, maximum, latency, status);
         if (!status) {
             link->pending = true;
-            link->tuned = desired;
+            /* Keep the original baseline until restoration actually succeeds. */
+            link->tuned = desired || standby || link->tuned;
         }
         /* Wait for completion (or timeout) and a quiet window before another link. */
         break;
@@ -421,6 +560,8 @@ bool hub_latency_set_fast(bool enabled) {
         }
     }
     fast_mode = enabled;
+    if (!enabled && mouse_active_mode) hub_latency_set_mouse_active(false);
+    if (!enabled && pc_standby_mode) hub_latency_set_pc_standby(false);
 #if HUB_CLASSIC_OUTPUT_TEST
     update_zero_latency_guard();
 #endif
@@ -433,6 +574,8 @@ bool hub_latency_set_fast(bool enabled) {
 void hub_latency_status(void) {
     printf("[latency] mode=%s; MCU queue timing is NOT end-to-end latency or radio delivery time\n",
            fast_mode ? "fast" : "normal");
+    hub_latency_mouse_active_status();
+    hub_latency_pc_standby_status();
     if (HUB_CLASSIC_MOUSE_7P5_TEST) {
         printf("[latency] mouse interval trial: normal mode requests exact 7.500ms for ready BLE mice;"
                " peripheral latency/timeout retained; reassert only after peer changes,"
@@ -471,6 +614,8 @@ void hub_latency_status(void) {
 
 void hub_latency_reset(void) {
     memset(timing, 0, sizeof(timing));
+    for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i)
+        links[i].mouse_active_requests = 0;
 #if HUB_CLASSIC_OUTPUT_TEST
     rejected_latency_requests = 0;
 #endif
@@ -487,10 +632,13 @@ void hub_latency_init(void) {
     memset(links, 0, sizeof(links));
     memset(timing, 0, sizeof(timing));
     fast_mode = false;
+    mouse_active_mode = false;
+    pc_standby_mode = false;
     working = false;
     radio_activity_at = btstack_run_loop_get_time_ms();
     observed_active = HCI_CON_HANDLE_INVALID;
     load_mode();
+    mouse_active_mode = !HUB_CLASSIC_OUTPUT_TEST && fast_mode;
     registration.callback = event_handler;
     hci_add_event_handler(&registration);
     l2cap_registration.callback = event_handler;

@@ -4,6 +4,7 @@
 
 int main(void) {
     assert(HUB_CLASSIC_OPEN_TEST);
+    test_classic_central_preference();
     reset_fixture();
     seed_target(0, false, 1, 3, 1);
     hub_input_start();

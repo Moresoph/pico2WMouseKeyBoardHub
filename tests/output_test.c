@@ -360,6 +360,8 @@ static void ready_peer(unsigned handle, int index, bool private_addr) {
     pump();
     computer_t *computer = computer_for_handle((hci_con_handle_t)handle);
     assert(computer && computer->slot < 4 && hub_output_ready(computer->slot));
+    assert(hub_output_is_ready_connection((uint16_t)handle));
+    assert(!hub_output_is_ready_connection(HCI_CON_HANDLE_INVALID));
 }
 
 static void disconnect_peer(unsigned handle) {
@@ -467,6 +469,7 @@ static void provisional_and_duplicates(void) {
     links[1].key_size = 0;
     tick();
     assert(!hub_output_ready(0) && !physical->identity_authenticated);
+    assert(!hub_output_is_ready_connection(1));
     links[1].key_size = 16;
     tick();
     assert(!hub_output_ready(0)); /* Encryption alone isn't SM completion. */
@@ -780,6 +783,7 @@ static void readiness_and_release_errors(void) {
     assert(write_attribute(1, ATT_CHARACTERISTIC_2A4C_01_VALUE_HANDLE, 0, 0, &suspend, 1) == 0);
     pump();
     assert(!hub_output_ready(0) && hub_output_ready(1));
+    assert(!hub_output_is_ready_connection(1) && hub_output_is_ready_connection(2));
     assert(!hub_output_keyboard(key_down));
     suspend = 1;
     assert(write_attribute(1, ATT_CHARACTERISTIC_2A4C_01_VALUE_HANDLE, 0, 0, &suspend, 1) == 0);

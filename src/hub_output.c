@@ -175,6 +175,11 @@ bool hub_output_ready(unsigned slot) {
     return transport_ready(computer) && computer->release_pending == 0;
 }
 
+bool hub_output_is_ready_connection(uint16_t handle) {
+    computer_t *computer = computer_for_handle(handle);
+    return transport_ready(computer) && computer->release_pending == 0;
+}
+
 unsigned hub_output_active_slot(void) {
     return active_slot;
 }

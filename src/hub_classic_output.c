@@ -188,6 +188,10 @@ uint16_t hub_output_active_handle(void) {
     return hub_output_ready(0) ? handle : HCI_CON_HANDLE_INVALID;
 }
 
+bool hub_output_is_ready_connection(uint16_t connection_handle) {
+    return connection_handle == handle && hub_output_ready(0);
+}
+
 bool hub_output_select(unsigned slot) {
     if (slot == 0) return true;
     printf("[classic-output] PC%u unavailable; singleton experiment supports PC1 only\n", slot + 1);

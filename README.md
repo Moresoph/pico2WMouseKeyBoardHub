@@ -426,7 +426,7 @@ latency; their requested maximum is capped at the current interval when it is
 already below 15 ms, so a 7.5 ms input link is not asked to slow down.
 The host/device can reject or choose different
 parameters; the printed negotiated values, not the request, determine whether
-radio timing changed. Inactive computers stay connected and are not accelerated;
+radio timing changed. By default, inactive computers stay connected and are not accelerated;
 a previously accelerated computer is requested back to its baseline when it is
 no longer selected. Controller requests are bounded rather than retried in a loop.
 Firmware 0.4.3 also waits for input connection/authentication/HID discovery,
@@ -441,8 +441,206 @@ supervision timeout. These guards reduce avoidable negotiation traffic; they
 do not prove the cause of earlier `0x28` disconnections or prevent all
 controller/host-initiated procedures.
 Peers can later renegotiate their power-saving parameters; fast mode does not
-continually override them. Peripheral latency permits skipping idle connection
+continually override them unless the activity experiment below is enabled.
+Peripheral latency permits skipping idle connection
 events, not a fixed delay added to every moving-mouse report.
+
+#### Activity-triggered mouse latency recovery (0.4.5; boot default updated in 0.4.9)
+
+```text
+latency mouse-active status
+latency mouse-active on
+latency mouse-active off
+```
+
+Since 0.4.9, this BLE-output-only feature is **automatically ON at boot when
+the saved latency mode is fast**. Normal-mode boots (including no saved or
+invalid settings) and Classic-output builds keep it OFF. The runtime override
+remains RAM-only: `off` lasts until reboot, then the saved fast mode enables
+it again. No new setting or Flash record is added. Switching from normal to
+fast without reboot retains the existing manual `mouse-active on` behavior.
+Let initial negotiation settle; enabling the feature does not itself request
+a parameter update. A new valid report from a ready
+BLE mouse marks that specific connection for a latency-0 request if its actual
+peripheral latency is nonzero. Keyboard reports, Classic mouse reports, unknown
+handles and PC links cannot trigger it. No input payloads are logged.
+
+The existing 250 ms service timer submits the request, not the HID callback.
+It retains the mouse's **current connection interval and supervision timeout**,
+changing only peripheral latency. Existing fast-mode initialization is unchanged.
+All connection/security/busy guards, the two-second radio quiet window and
+global update serialization still apply. Attempts on that link are spaced at
+least 10 seconds apart, including failed attempts. A queued activity trigger
+expires after one second without another mouse report, so a delayed/retried
+request requires recent activity instead of waking an idle connection indefinitely.
+Continuous reports coalesce into one trigger; an update that actually reaches
+latency 0 clears it. A successful local API return alone does not mean the
+parameters took effect: inspect `latency` and `latency trace`.
+
+Peer power-saving requests remain allowed. The firmware neither forces an
+idle value of 44 nor repeatedly requests 0 in the absence of reports. `off`
+clears unsubmitted activity triggers; it does **not** undo an in-flight update
+or force previously negotiated values back onto the mouse. The mouse may
+renegotiate its own idle parameters. `latency normal` also disables this
+feature before following the existing baseline-restoration policy. `latency reset` clears its
+request counters but retains enabled state, activity triggers and pending
+updates. `status` and `latency` expose enabled state and per-mouse request counts.
+
+This cannot remove the wait preceding the first received report, and parameter
+updates themselves take time. It is an experiment for subsequent continuous
+stutter, not a guarantee of zero latency. Compare OFF and ON on the same image,
+with the same links and actual interval/timeout, after reproducing the idle
+condition; do not equate a request with a successful improvement.
+
+Versions 0.4.5--0.4.8 defaulted this feature OFF at every boot. On 2026-09-26,
+a fresh 0.4.8 boot retained fast mode but lost the previously enabled runtime
+mouse-active setting. The mouse subsequently requested peripheral latency 44
+after its initial latency-0 update, and no activity-triggered recovery was
+enabled. Version 0.4.9 changes only the boot default; the busy/quiet guards,
+activity expiry, retry spacing and accepted peer power-saving updates remain
+unchanged. The PC standby experiment still defaults OFF.
+
+On 2026-09-25, 0.4.5 was flashed with bonds retained and the experiment was
+subsequently enabled from the console. The first 40-second observation received
+no mouse reports, so it triggered no update and was not a motion comparison.
+After the operator later resumed movement and reported normal operation, the
+same mouse connection (`0041`, generation 9) showed one activity request at
+uptime 790861 ms and an actual update at 794548 ms: peripheral latency changed
+from 44 to 0, with 7.5 ms interval and 2160 ms supervision timeout unchanged.
+The request-to-application time was 3687 ms, not physical wake latency.
+All four links remained connected across this recovery observation.
+
+This supports further activity-triggered trials, not a proven root cause or
+complete fix. Earlier input-connection timeouts and two PC2 `0x28` disconnects
+remain separate open issues; the latter also occurred without new mouse
+parameter requests. Two mouse output-software waits over 20 ms (maximum
+46.413 ms) appeared between the pre-movement and recovery snapshots, which
+include idle time and are not a controlled continuous-motion latency sample.
+
+#### Classic input Central preference (0.4.6)
+
+Classic HID inputs now prefer Pico as the Central, with the keyboard/mouse as
+the Peripheral. This follows the HID Host role recommendation, rather than
+assuming that every keyboard must always be a Peripheral: the profile permits
+both roles. A Windows direct-connect capture on 2026-09-25 confirmed the FILCO
+link with the PC as Central using successful Role Change and Role Discovery
+events; earlier Pico captures showed the opposite arrangement. This is a real
+role difference, not proof that it caused the observed typing latency.
+
+In the normal BLE-output build, incoming Classic ACLs request the Central role
+during acceptance, like the observed Windows host. If a selected Classic input
+still connects with Pico as Peripheral, it gets at most one additional
+`gap_request_role(..., HCI_ROLE_MASTER)` request per ACL connection. In the
+experimental Classic-output build, the global incoming policy stays unchanged
+for PCs; only selected Classic input links receive that targeted request.
+BLE input/output roles, connection intervals, mouse buffering, HID routing,
+security and stored bonds/forwarding consent are unchanged.
+
+This is a preference, not a guarantee: role negotiation may fail. A refused
+request is logged without disconnecting an otherwise usable input, and later
+role changes do not trigger a retry loop. `status` reports the actual
+`Pico-role` (`0=central`, `1=peripheral`, `255=unknown`) and the preference.
+Connection and Role Change logs distinguish a queued request from a confirmed
+role; `latency trace` retains the existing live-role history. Check the actual
+role after reconnecting before comparing latency. A forgotten input remains
+forgotten; this feature does not reauthorize or pair it automatically.
+
+The preference defaults ON via `HUB_CLASSIC_INPUT_CENTRAL`. For a same-version
+legacy-role comparison, add `-ClassicInputPeerRole` to the existing
+`tools\build.ps1` command (prefer a separate `-BuildDirectory`), or configure
+CMake with `-DHUB_CLASSIC_INPUT_CENTRAL=OFF`. Keep the other build options and
+link topology identical. `latency normal` does not change this build-time role
+preference. Building does not flash the board.
+
+#### Passive Classic mode diagnostics (0.4.7)
+
+`latency classic` prints a compact, read-only snapshot for each Classic ACL:
+Pico's role, the last successfully observed mode (`active`, `hold`, `sniff`,
+`park`), mode interval in 0.625 ms units and microseconds, event age and last
+status. It reports `unknown` until a successful HCI Mode Change is observed;
+neither an input gap nor being Central establishes a Sniff mode/interval.
+It sends no HCI query or tuning command and does not exit Sniff, change link
+policy, disable power saving, or request role changes.
+
+The last successful Sniff Subrating event is recorded separately, including
+maximum TX/RX latency and minimum remote/local timeout in 0.625 ms units.
+These are last-observed parameters, not proof that Sniff is currently active
+or a fixed HID report period. Failed events retain the preceding successful
+state and are explicitly reported. Both event types also appear in the bounded
+`latency trace` control history, tagged with handle and connection generation.
+The link snapshot, statuses and event counts are since connection and survive
+`latency reset`; disconnect/reuse starts a new unknown snapshot. No input
+contents are retained. Even compact printing can perturb timing, so capture
+snapshots before/after typing rather than continuously.
+
+On 2026-09-25, a different same-model FILCO was confirmed HID-ready with Pico
+Central on 0.4.6, but the operator reported very laggy typing without perceived
+lost keys. Repeated input-report gaps near 67.5/135/202.5 ms warrant checking
+the actual link mode; they are not measurements of physical key latency.
+During that observation, 38 new PC1 keyboard notifications each had less than
+1 ms of measured MCU enqueue-to-ATT-submission wait (mean about 518 us).
+This rules out a large software queue in that window, not radio/host latency.
+Version 0.4.7 adds observations only; it does not claim to fix this symptom.
+
+#### Standby PC interval experiment (0.4.8; 15 ms since 0.4.10)
+
+```text
+latency pc-standby status
+latency pc-standby on
+latency pc-standby off
+```
+
+This BLE-output-only experiment is **default OFF and RAM-only** and requires
+`latency fast`. It requests an exact **15 ms** interval (12 units of 1.25 ms)
+and peripheral latency 0 for ready, authenticated, subscribed **unselected PC
+connections**. It leaves input-device policy unchanged. The selected PC still
+requests 7.5 ms / latency 0. This is a request to the PC's Central, not direct
+control of radio time slots, and not proof that airtime contention caused lag.
+The idle PC's current supervision timeout is retained if valid at 15 ms;
+otherwise a 2-second timeout is requested. Links stay connected.
+
+On selection changes, the newly selected PC's fast request takes priority over
+slowing the former PC. Reports are not held waiting for parameter negotiation,
+so initial input can still use the previous slower interval. The existing
+two-second quiet window, global local/peer-update serialization, encryption and
+input-radio-busy guards apply. A release barrier or unavailable selected PC
+defers the experiment's PC requests. Switching is therefore **not guaranteed
+to restore 7.5 ms immediately**. Each policy transition gets one attempt;
+rejection, timeout or a different applied interval does not trigger a retry
+loop, forced disconnection, or repeated overriding of peer changes.
+
+`status`, `latency`, and `latency pc-standby status` distinguish requested
+standby state from the **actual negotiated** interval, peripheral latency and
+pending state. Successful submission/acceptance alone is not application:
+look for `actual-interval=15.000ms`, `latency=0`, and no pending update.
+`latency trace` retains the usual parameter request/application metadata.
+
+`off` requests previously tuned standby PCs back to their original baseline,
+not necessarily 7.5 ms; the selected PC remains fast. In-flight requests finish
+before restoration is attempted. Baselines remain protected until restoration
+actually succeeds. `latency normal` disables this experiment before restoring
+the normal policy, reboot disables it, and `latency reset` preserves its state.
+Pairing, bonds, input authorization and selection persistence are unchanged.
+Use this switch for a same-firmware A/B comparison; do not simultaneously
+change mouse settings or assume the 15 ms request cured intermittent lag.
+
+On 2026-09-25, 0.4.8 was flashed and this experiment enabled. Both PCs
+accepted 100 ms when unselected and returned to 7.5 ms when selected, with
+all four links restored. Observed fast requests took approximately 1.2--1.3
+seconds from submission to application, in addition to the policy's quiet
+window before submission. The operator reported noticeable mouse delay just
+after switching, improving later. This is a demonstrated transition cost,
+not evidence that receive buffers are full. The mouse also independently
+renegotiated its own power parameters; its contribution remains unisolated.
+
+Version 0.4.10 replaces that 100 ms standby target with 15 ms to reduce the
+slow-interval penalty immediately after selection, before 7.5 ms takes effect.
+It does not shorten the quiet window or guarantee faster negotiation, and
+it offers less reduction in connection-event frequency than the 100 ms trial.
+The same runtime switch is reused; mouse-active's fast-boot ON default,
+input policies and saved device records are unchanged.
+
+#### Returning to baseline
 
 `latency normal` restores the baseline send scheduling and requests each tuned
 link's earlier connection parameters. Neither mode changes encryption, bond
@@ -462,6 +660,18 @@ processing/USB time, so collect them after a movement sample, not continuously.
 `latency reset` clears measurement history/counters without disconnecting
 devices, discarding queued input, changing pairing, or cancelling pending
 parameter procedures. Long-term stability must still be observed on hardware.
+
+Version 0.4.4 adds a separate 96-entry protocol history: input reconnect backoff
+and attempt boundaries, encrypted/discovery/ready/first-HID/first-router
+milestones, each HID input subscription's local API result and raw ATT completion,
+and RX/TX ATT Error Response request opcode, attribute handle and error code.
+It is independent of the limited opcode-summary table; saturation there cannot
+hide these details. Link generations distinguish reused connection handles.
+Evictions are counted, and `latency reset` also clears this history.
+An ATT `Attribute Not Found` response (`0x0a`) often terminates discovery normally;
+it is not automatically a connection failure. "First router submission" can
+still be held by the existing neutral-input safety gate, and no milestone
+measures physical mouse motion onset or Windows display latency.
 
 For comparison, reset the counters, move the mouse continuously for the same
 duration on the same selected computer, read `latency`, and repeat in the other
@@ -879,6 +1089,80 @@ anchors. Updating SDK/BTstack requires reviewing this overlay; it fails the buil
 rather than silently applying to a different source revision. Its tests exercise
 the generated production handler and original GAP connection APIs, with
 controller transport/allocation/event delivery mocked.
+
+### Input HOGP completeness and idle recovery (0.4.4)
+
+The companion GATT flow starts **after HID input is ready**, so device metadata
+does not become an extra forwarding prerequisite. It discovers Device
+Information/PnP ID, reads HID Information flags, and discovers the optional
+Scan Parameters Service. If present, it writes Scan Interval Window using
+Write Without Response, enables an available Scan Refresh notification, and
+resends the parameters on a valid refresh. Commands are retried on temporary
+GATT/controller backpressure with a bounded deadline, not a busy loop.
+Each input owns its state and listener; disconnect cancels its application
+flow without affecting other inputs or PC links.
+
+`status` reports `[hogp N]` state, validated PnP identifiers, RemoteWake and
+NormallyConnectable flags, service presence, subscription result, errors and
+the number of scan-parameter **submissions** (not peer acknowledgements).
+Missing Scan Parameters on a device is normal. Failed or missing mandatory
+metadata is explicitly reported as degraded rather than silently called
+complete; it does not disconnect an otherwise usable HID input. This does not
+claim full HOGP qualification, and does not add Suspend/Exit Suspend commands.
+
+The scan hint uses the existing initiating-scan settings: 60 ms interval and
+30 ms window, now explicitly shared with the connection setup. It describes
+the active connection attempt, **not continuous scanning during retry backoff**.
+The 1/2/4/5-second retry backoff, 5-second LE attempt deadline, BLE connection
+parameter policy, security requirements and mouse-buffer policy are unchanged.
+Do not interpret idle-to-first-report gaps as measured wake latency; compare
+the protocol milestones before changing any of these policies.
+
+`cmake\HubBtstackHids.cmake` generates a pinned copy of `hids_host.c`, leaving
+the SDK untouched. Failed local submissions, asynchronous discovery/CCCD
+errors, or missing/malformed Report References cannot silently become a
+successful HID connection. Partial notification listeners are cleaned up on
+failure. The native tests compile the actual generated SDK file, exercise
+every nonzero ATT completion status at each subscription position, and cover
+cleanup, immediate/scheduling failures and successful multi-report setup.
+Repeated requests for the same already-queued GATT callback are coalesced,
+not treated as connection failures. A fatal discovery/subscription error also
+removes that callback before freeing the client, avoiding stale queued work.
+
+The corrected 0.4.4 hardware run on 2026-09-25 identified the M720 as PnP
+`046d:b015`, version `0013`, HID Information flags `03`. It **does not expose
+Scan Parameters Service** on this connection; the companion flow completed
+without errors. All three input report subscriptions (`002c`, `0030`, `0034`)
+returned ATT success. From LE connection at uptime 207238 ms, encryption/
+discovery began at 207465 ms, HID became ready at 209426 ms, and the first
+router submission occurred at 209430 ms. Thus this connection spent 227 ms
+before encrypted discovery and 1961 ms in HID setup; this is **not measured
+physical wake latency**. The companion flow finished 498 ms after HID readiness.
+Observed ATT errors were `Attribute Not Found` discovery termination responses.
+With both PCs and the keyboard subsequently online, the mouse remained on the
+same connection generation after at least 61 seconds without input reports.
+These observations do not establish the cause of intermittent idle lag or
+prove that a future subscription/reconnection cannot fail.
+
+Later in the same run, the operator reported persistent stutter even during
+continuous movement after idle. The 18:09 controlled-motion capture retained
+the same mouse handle `0041` / generation 3, all four links, and parameters
+7.5 ms / peripheral latency 44 / supervision timeout 2160 ms. Connection,
+parameter-update and protocol histories did not change. Across the latency
+snapshots bracketing the 20-second movement prompt (21.744 seconds between
+snapshots), 166 mouse reports arrived, including 88 inter-report gaps over
+100 ms; retained slow samples repeatedly measured about 232.5--240 ms.
+The 166 corresponding output timing samples all stayed below 1 ms, averaging
+546 us from MCU enqueue to successful ATT submission, with no new merges or
+notification errors. Across the separate trace snapshots, the raw input
+notification count and parsed mouse report count both increased by 199.
+This localizes a visible stall to input arrival at the host, not a long output
+software queue or repeated HID initialization. It does **not** distinguish
+mouse power behavior, controller/radio scheduling, or radio interference,
+nor measure PC delivery time. Peripheral latency 44 is legal and is not
+proven causal; a mouse-only parameter comparison remains necessary. Slow
+history is throttled to one sample per source per 250 ms, so spacing between
+printed records is not the actual report period.
 
 ## Replacing a mouse or keyboard
 

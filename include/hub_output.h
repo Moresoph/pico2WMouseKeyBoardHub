@@ -18,6 +18,7 @@ void hub_output_set_low_latency(bool enabled);
 bool hub_output_set_mouse_buffering(bool enabled);
 void hub_output_mouse_buffer_status(void);
 uint16_t hub_output_active_handle(void);
+bool hub_output_is_ready_connection(uint16_t handle);
 /* MCU enqueue -> successful ATT notify, not radio delivery. Metrics belong to
    logical PCs across reconnects. Reset keeps queues/state; pre-reset queued
    events (including later merges into them) are excluded from timing samples. */

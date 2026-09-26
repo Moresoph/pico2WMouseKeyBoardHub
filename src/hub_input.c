@@ -4,6 +4,8 @@
 #include "hub_router.h"
 #include "hub_security.h"
 #include "hub_latency.h"
+#include "hub_hogp.h"
+#include "hub_perf.h"
 
 #include <inttypes.h>
 #include <limits.h>
@@ -74,6 +76,7 @@ typedef struct {
     bool auth_failed;
     bool ever_ready;
     bool disconnect_sent;
+    bool classic_central_requested;
     bool warned_report;
     bool retry_allowed;
     bool protocol_pending;
@@ -466,6 +469,7 @@ static void load_targets(void) {
 }
 
 static void close_input(input_slot_t *slot, uint8_t error, bool retry) {
+    if (!slot->classic) hub_hogp_stop(slot_index(slot));
     slot->last_error = error;
     slot->pairing_authorized = false;
     slot->retry_allowed = retry && (slot->ever_ready || slot->stored) &&
@@ -718,6 +722,10 @@ static void input_ready(input_slot_t *slot) {
     slot->last_error = 0;
     if (establishing == (int)slot_index(slot)) establishing = -1;
     if (input_forwarding_allowed(slot)) hub_router_input_connected(slot_index(slot));
+    if (!slot->classic) {
+        hub_perf_input_phase(slot_index(slot), slot->handle, HUB_PERF_INPUT_READY, 0);
+        hub_hogp_start(slot_index(slot), slot->handle);
+    }
     printf("[input %u] HID ready: %s handle=0x%04x cid=0x%04x descriptors=%u bytes\n",
            slot_index(slot) + 1, slot->classic ? "Classic" : "BLE",
            slot->handle, slot->cid, slot->descriptor_used);
@@ -810,6 +818,10 @@ static void handle_report(input_slot_t *slot, uint8_t service,
             }
         }
     }
+    bool usable = (keyboard_present && (slot->roles & HUB_INPUT_ROLE_KEYBOARD))
+        || (mouse_present && (slot->roles & HUB_INPUT_ROLE_MOUSE));
+    if (!slot->classic && usable && !slot->flow.keyboard && !slot->flow.mouse)
+        hub_perf_input_phase(slot_index(slot), slot->handle, HUB_PERF_INPUT_FIRST_ROUTED, 0);
     if (keyboard_present && (slot->roles & HUB_INPUT_ROLE_KEYBOARD)) {
         ++slot->flow.keyboard;
         hub_latency_input_report(slot_index(slot), false);
@@ -819,6 +831,7 @@ static void handle_report(input_slot_t *slot, uint8_t service,
     if (mouse_present && (slot->roles & HUB_INPUT_ROLE_MOUSE)) {
         ++slot->flow.mouse;
         hub_latency_input_report(slot_index(slot), true);
+        if (!slot->classic) hub_latency_mouse_activity(slot->handle);
         report->buttons = buttons;
         buttons = 0;
         for (unsigned i = 0; i < slot->report_count; ++i) buttons |= slot->reports[i].buttons;
@@ -851,6 +864,8 @@ static void discover_le(input_slot_t *slot) {
     if (slot->classic || slot->state != INPUT_SECURITY || slot->remove ||
         !gap_encryption_key_size(slot->handle)) return;
     slot->state = INPUT_DISCOVERING;
+    hub_perf_input_phase(slot_index(slot), slot->handle, HUB_PERF_INPUT_SECURED, 0);
+    hub_perf_input_phase(slot_index(slot), slot->handle, HUB_PERF_INPUT_DISCOVERY, 0);
     memset(&slot->flow, 0, sizeof(slot->flow));
     slot->deadline = btstack_run_loop_get_time_ms() + INPUT_DISCOVERY_MS;
     uint8_t status = hids_host_connect(slot->handle, input_hids_event,
@@ -917,11 +932,15 @@ static bool start_connection(input_slot_t *slot) {
         ? INPUT_RECONNECT_ATTEMPT_MS : INPUT_CONNECT_MS;
     if (slot->classic && slot->pairing_authorized) attempt_ms = HUB_PAIRING_WINDOW_MS;
     slot->deadline = btstack_run_loop_get_time_ms() + attempt_ms;
+    if (!slot->classic)
+        hub_perf_input_phase(slot_index(slot), HCI_CON_HANDLE_INVALID, HUB_PERF_INPUT_CONNECT_START, 0);
     uint8_t status = slot->classic ?
         hid_host_connect(slot->address, HID_PROTOCOL_MODE_REPORT, &slot->cid) :
         gap_connect(slot->address, (bd_addr_type_t)slot->address_type);
     if (status) {
         slot->cid = 0;
+        if (!slot->classic)
+            hub_perf_input_phase(slot_index(slot), HCI_CON_HANDLE_INVALID, HUB_PERF_INPUT_CONNECT_FAILED, status);
         printf("[input %u] %s connect rejected: status=0x%02x\n",
                slot_index(slot) + 1, slot->classic ? "Classic" : "BLE", status);
         close_input(slot, status, slot->retry_allowed);
@@ -996,6 +1015,8 @@ static void finish_close(input_slot_t *slot, uint32_t now) {
     } else if (slot->retry_allowed && !slot->auth_failed) {
         slot->state = INPUT_RETRY;
         slot->deadline = now + retry_delay(slot->retries);
+        if (!slot->classic)
+            hub_perf_input_phase(slot_index(slot), HCI_CON_HANDLE_INVALID, HUB_PERF_INPUT_RETRY_WAIT, slot->last_error);
         printf("[input %u] %s reconnect in %" PRIu32 " ms (backoff cap=%u ms)\n",
                slot_index(slot) + 1, slot->open_test ? "authorized Level 0" : "bond-only",
                slot->deadline - now, INPUT_RETRY_MAX_MS);
@@ -1062,6 +1083,7 @@ static void input_tick(btstack_timer_source_t *timer) {
         }
     }
     enrollment_tick(now);
+    hub_hogp_tick();
     btstack_run_loop_set_timer(timer, 100);
     btstack_run_loop_add_timer(timer);
 }
@@ -1229,6 +1251,8 @@ static void input_hids_event(uint8_t packet_type, uint16_t channel,
             break;
         }
         case GATTSERVICE_SUBEVENT_HID_REPORT: {
+            if (!slot->flow.hids)
+                hub_perf_input_phase(slot_index(slot), slot->handle, HUB_PERF_INPUT_FIRST_HID, 0);
             ++slot->flow.hids;
             slot->flow.hids_at = btstack_run_loop_get_time_ms();
             if (size < 9 || slot->state != INPUT_READY) {
@@ -1363,6 +1387,11 @@ static void input_hci_event(uint8_t packet_type, uint16_t channel,
             if (size < 6) break;
             uint16_t opcode = hci_event_command_status_get_command_opcode(packet);
             status = hci_event_command_status_get_status(packet);
+            if (opcode == HCI_OPCODE_HCI_SWITCH_ROLE_COMMAND && status) {
+                printf("[input] Classic role-switch command rejected status=0x%02x; "
+                       "use status/latency trace for actual roles\n", status);
+                break;
+            }
             if ((opcode == HCI_OPCODE_HCI_LE_CREATE_CONNECTION ||
                  opcode == HCI_OPCODE_HCI_LE_EXTENDED_CREATE_CONNECTION) && status &&
                 establishing >= 0 && !inputs[establishing].classic &&
@@ -1447,20 +1476,49 @@ static void input_hci_event(uint8_t packet_type, uint16_t channel,
             break;
         }
         case HCI_EVENT_CONNECTION_COMPLETE:
-            if (size < 13) break;
+            if (size < 13 || hci_event_connection_complete_get_link_type(packet) != 1) break;
             hci_event_connection_complete_get_bd_addr(packet, address);
             slot = slot_for_classic_address(address);
             if (!slot) break;
             status = hci_event_connection_complete_get_status(packet);
             printf("[input %u] Classic ACL status=0x%02x\n", slot_index(slot) + 1, status);
             if (!status) {
-                slot->handle = hci_event_connection_complete_get_connection_handle(packet);
+                uint16_t handle = hci_event_connection_complete_get_connection_handle(packet);
+                if (slot->handle != handle) slot->classic_central_requested = false;
+                slot->handle = handle;
                 slot->disconnect_sent = false;
                 if (slot->remove || slot->paused || slot->auth_failed || slot->state == INPUT_CLOSING) {
                     close_input(slot, 0, false);
+                } else {
+                    hci_role_t role = gap_get_role(handle);
+                    printf("[input %u] Classic Pico-role=%u (0=central,1=peripheral,255=unknown)\n",
+                           slot_index(slot) + 1, (unsigned)role);
+#if HUB_CLASSIC_INPUT_CENTRAL
+                    if (role == HCI_ROLE_SLAVE && !slot->classic_central_requested) {
+                        slot->classic_central_requested = true;
+                        uint8_t result = gap_request_role(slot->address, HCI_ROLE_MASTER);
+                        printf("[input %u] Classic request Pico Central status=0x%02x (%s)\n",
+                               slot_index(slot) + 1, result,
+                               result ? "not queued" : "queued, not confirmed");
+                    }
+#endif
                 }
             } else {
                 slot->last_error = status;
+            }
+            break;
+        case HCI_EVENT_ROLE_CHANGE:
+            if (size < 10) break;
+            hci_event_role_change_get_bd_addr(packet, address);
+            slot = slot_for_classic_address(address);
+            if (!slot) break;
+            status = hci_event_role_change_get_status(packet);
+            if (status) {
+                printf("[input %u] Classic role-change failed status=0x%02x; role not confirmed\n",
+                       slot_index(slot) + 1, status);
+            } else {
+                printf("[input %u] Classic role-change success Pico-role=%u (0=central,1=peripheral)\n",
+                       slot_index(slot) + 1, (unsigned)hci_event_role_change_get_role(packet));
             }
             break;
         case HCI_EVENT_META_GAP: {
@@ -1492,6 +1550,7 @@ static void input_hci_event(uint8_t packet_type, uint16_t channel,
             if (status) {
                 establishing = -1;
                 slot->disconnect_sent = false;
+                hub_perf_input_phase(slot_index(slot), HCI_CON_HANDLE_INVALID, HUB_PERF_INPUT_CONNECT_FAILED, status);
                 close_input(slot, status, slot->retry_allowed);
                 break;
             }
@@ -1559,6 +1618,7 @@ static void input_hci_event(uint8_t packet_type, uint16_t channel,
             slot->last_disconnect_reason = hci_event_disconnection_complete_get_reason(packet);
             slot->handle = HCI_CON_HANDLE_INVALID;
             slot->disconnect_sent = false;
+            slot->classic_central_requested = false;
             if (!slot->classic && establishing == (int)slot_index(slot)) establishing = -1;
             if (slot->state != INPUT_CLOSING) {
                 close_input(slot, hci_event_disconnection_complete_get_reason(packet), true);
@@ -1639,6 +1699,12 @@ void hub_input_init(void) {
     open_bridge_enabled = false;
     next_retry_slot = 0;
     for (unsigned i = 0; i < HUB_INPUT_COUNT; ++i) reset_slot(&inputs[i]);
+    hub_hogp_init();
+    /* Classic-output PCs share the accept policy; only input links may be
+       switched explicitly after connecting in that backend. */
+    hci_set_master_slave_policy(HUB_CLASSIC_INPUT_CENTRAL && !HUB_CLASSIC_OUTPUT_TEST ? 0 : 1);
+    gap_set_connection_parameters(HUB_INPUT_SCAN_INTERVAL, HUB_INPUT_SCAN_WINDOW,
+                                  0x0008, 0x0018, 4, 0x0048, 0, 0);
     hid_host_init(classic_descriptors, sizeof(classic_descriptors));
     hid_host_register_packet_handler(input_hid_event);
     hids_host_init(le_descriptors, sizeof(le_descriptors));
@@ -2135,6 +2201,10 @@ void hub_input_status(void) {
            enrollment_active ? "active" : enrollment_pending ? "deferred" : "closed", forgetting);
     printf("[input] reconnect-backoff-max=%u ms BLE-reconnect-attempt=%u ms\n",
            INPUT_RETRY_MAX_MS, INPUT_RECONNECT_ATTEMPT_MS);
+    printf("[input] Classic input role preference=%s; incoming-ACL-policy=%s\n",
+           HUB_CLASSIC_INPUT_CENTRAL ? "Pico Central" : "legacy/peer",
+           HUB_CLASSIC_INPUT_CENTRAL && !HUB_CLASSIC_OUTPUT_TEST
+               ? "prefer Pico Central" : "let connecting peer decide");
     printf("[input-flow] unmatched-HIDS-reports=%" PRIu32 " since boot; no payload logging\n",
            unmatched_hids_reports);
     for (unsigned i = 0; i < HUB_INPUT_COUNT; ++i) {
@@ -2151,6 +2221,11 @@ void hub_input_status(void) {
                slot->open_test ? "not-required" : slot->pairing_authorized ? "authorized" : "bond-only",
                slot->retries, INPUT_RETRIES, slot->last_error, slot->stored, slot->roles,
                slot->remove ? " removing" : slot->paused ? " paused" : "");
+        if (slot->classic && slot->handle != HCI_CON_HANDLE_INVALID) {
+            printf("[input %u] Classic Pico-role=%u (0=central,1=peripheral,255=unknown) "
+                   "Central-requested=%u\n", i + 1, (unsigned)gap_get_role(slot->handle),
+                   slot->classic_central_requested);
+        }
         if (slot->identity_valid) {
             printf("[input %u] identity=%s type=%u\n", i + 1,
                    bd_addr_to_str(slot->identity), slot->identity_type);
@@ -2169,6 +2244,7 @@ void hub_input_status(void) {
             if (flow->hids) printf(" last-callback-age=%" PRIu32 "ms",
                                   btstack_run_loop_get_time_ms() - flow->hids_at);
             printf("\n");
+            hub_hogp_status(i);
         }
         if (slot->open_test) {
             printf("[open-test] input %u reports=%" PRIu32 " encryption-key=%u forwarding=%s saved-target=%u\n",

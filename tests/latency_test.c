@@ -4,6 +4,7 @@
 
 static uint32_t milliseconds, microseconds;
 static uint16_t active_handle, mouse_handle;
+static uint16_t not_ready_handle;
 static bool pairing_busy, input_busy, output_fast;
 static uint16_t unencrypted_handle;
 static unsigned resets, updates, requests;
@@ -63,6 +64,9 @@ bool hub_input_radio_busy(void) { return input_busy; }
 bool hub_input_is_connection(uint16_t handle) { return handle == 1; }
 bool hub_input_is_ble_mouse_ready(uint16_t handle) { return handle == mouse_handle; }
 uint16_t hub_output_active_handle(void) { return active_handle; }
+bool hub_output_is_ready_connection(uint16_t handle) {
+    return handle >= 2 && handle <= 5 && handle != not_ready_handle;
+}
 void hub_output_set_low_latency(bool enabled) { output_fast = enabled; }
 void hub_output_latency_reset(void) { ++resets; }
 void hub_output_latency_status(void) {}
@@ -93,6 +97,7 @@ static void reset(void) {
     milliseconds = microseconds = 0;
     active_handle = HCI_CON_HANDLE_INVALID;
     mouse_handle = HCI_CON_HANDLE_INVALID;
+    not_ready_handle = HCI_CON_HANDLE_INVALID;
     pairing_busy = input_busy = output_fast = false;
     unencrypted_handle = HCI_CON_HANDLE_INVALID;
     resets = updates = requests = 0;
@@ -117,14 +122,19 @@ static void connect_link(uint16_t handle, uint8_t role) {
     event_handler(HCI_EVENT_PACKET, 0, packet, sizeof(packet));
 }
 
-static void updated(uint16_t handle, uint8_t status, uint16_t interval) {
+static void updated_parameters(uint16_t handle, uint8_t status, uint16_t interval,
+                               uint16_t latency, uint16_t timeout) {
     uint8_t packet[12] = {HCI_EVENT_LE_META, 10, HCI_SUBEVENT_LE_CONNECTION_UPDATE_COMPLETE};
     packet[3] = status;
     little_endian_store_16(packet, 4, handle);
     little_endian_store_16(packet, 6, interval);
-    little_endian_store_16(packet, 8, 0);
-    little_endian_store_16(packet, 10, 200);
+    little_endian_store_16(packet, 8, latency);
+    little_endian_store_16(packet, 10, timeout);
     event_handler(HCI_EVENT_PACKET, 0, packet, sizeof(packet));
+}
+
+static void updated(uint16_t handle, uint8_t status, uint16_t interval) {
+    updated_parameters(handle, status, interval, 0, 200);
 }
 
 static void tick(void) { milliseconds += 250; service(&timer); }
@@ -219,16 +229,18 @@ static void test_persisted_mode(void) {
     assert(hub_latency_set_fast(true));
     hub_latency_init();
     assert(fast_mode && output_fast);
+    assert(mouse_active_mode == !HUB_CLASSIC_OUTPUT_TEST);
     assert(hub_latency_set_fast(false));
     hub_latency_init();
     assert(!fast_mode && !output_fast);
+    assert(!mouse_active_mode);
     fail_save = true;
     assert(!hub_latency_set_fast(true));
     assert(!fast_mode && !output_fast);
     fail_save = false;
     setting[5] ^= 1;
     hub_latency_init();
-    assert(!fast_mode);
+    assert(!fast_mode && !mouse_active_mode);
 }
 
 static void test_fast_skips_already_satisfied_parameters(void) {
@@ -557,7 +569,531 @@ static void test_mouse_interval_only(void) {
 }
 #endif
 
+static void test_mouse_active_default_and_support(void) {
+    reset();
+    assert(!mouse_active_mode);
+    assert(!hub_latency_set_mouse_active(true));
+    assert(hub_latency_set_fast(true));
+    pairing_busy = true;
+    assert(!hub_latency_set_mouse_active(true) && !mouse_active_mode);
+    pairing_busy = false;
+    assert(hub_latency_set_mouse_active(true) == !HUB_CLASSIC_OUTPUT_TEST);
+    assert(mouse_active_mode == !HUB_CLASSIC_OUTPUT_TEST);
+    uint8_t saved[sizeof(setting)];
+    memcpy(saved, setting, sizeof(saved));
+    hub_latency_mouse_active_status();
+    assert(!memcmp(saved, setting, sizeof(saved)) && !updates && !requests);
+    hub_latency_init();
+    assert(fast_mode && mouse_active_mode == !HUB_CLASSIC_OUTPUT_TEST && !updates && !requests);
+    assert(!pc_standby_mode && !memcmp(saved, setting, sizeof(saved)));
+}
+
+#if !HUB_CLASSIC_OUTPUT_TEST
+static void test_mouse_active_fast_boot_default_and_runtime_off(void) {
+    reset();
+    assert(hub_latency_set_fast(true));
+    assert(hub_latency_set_mouse_active(false));
+    uint8_t saved[sizeof(setting)];
+    memcpy(saved, setting, sizeof(saved));
+    hub_latency_init();
+    assert(mouse_active_mode && fast_mode && !pc_standby_mode && !updates && !requests);
+    assert(!memcmp(saved, setting, sizeof(saved)));
+    working = true;
+    mouse_handle = 1;
+    connect_link(1, HCI_ROLE_MASTER);
+    updated(1, 0, 6);
+    settle();
+    assert(!updates && !requests); /* Boot opt-in does not force an already-fast link. */
+    updated_parameters(1, 0, 6, 44, 216);
+    settle();
+    assert(!updates && !find_link(1)->mouse_activity_pending);
+    hub_latency_input_report(0, false);
+    settle();
+    assert(!updates); /* Keyboard traffic is not mouse activity. */
+    hub_latency_mouse_activity(1);
+    tick();
+    assert(updates == 1 && changed_handle == 1 && find_link(1)->mouse_active_requests == 1);
+    assert(minimum_requested == 6 && maximum_requested == 6);
+    assert(latency_requested == 0 && timeout_requested == 216);
+    updated_parameters(1, 0, 6, 0, 216);
+    assert(hub_latency_set_mouse_active(false));
+    milliseconds += 30000;
+    updated_parameters(1, 0, 6, 44, 216);
+    for (unsigned i = 0; i < 80; ++i) {
+        hub_latency_mouse_activity(1);
+        tick();
+    }
+    assert(updates == 1 && !mouse_active_mode);
+    hub_latency_reset();
+    assert(!mouse_active_mode); /* Measurement reset does not re-enable the feature. */
+    hub_latency_init();
+    assert(mouse_active_mode && fast_mode && !pc_standby_mode);
+    assert(!memcmp(saved, setting, sizeof(saved)));
+    assert(hub_latency_set_fast(false) && !mouse_active_mode);
+    hub_latency_init();
+    assert(!fast_mode && !mouse_active_mode);
+}
+
+static void setup_active_mouse(uint16_t interval) {
+    reset();
+    mouse_handle = 1;
+    connect_link(1, HCI_ROLE_MASTER);
+    assert(hub_latency_set_fast(true));
+    settle();
+    assert(updates == 1);
+    updated(1, 0, 6);
+    milliseconds += 30000;
+    updated_parameters(1, 0, interval, 44, 216);
+    settle();
+    assert(updates == 1 && !find_link(1)->pending);
+}
+
+static void mouse_tick(void) {
+    hub_latency_mouse_activity(1);
+    tick();
+}
+
+static void test_mouse_active_targeting_and_exact_parameters(void) {
+    const uint16_t intervals[] = {6, 9, 12, 24};
+    for (unsigned n = 0; n < sizeof(intervals) / sizeof(intervals[0]); ++n) {
+        setup_active_mouse(intervals[n]);
+        hub_latency_mouse_activity(1);
+        settle();
+        assert(updates == 1 && !find_link(1)->mouse_activity_pending);
+        assert(hub_latency_set_mouse_active(true));
+        settle();
+        assert(updates == 1); /* Opt-in alone is not activity. */
+        connect_link(2, HCI_ROLE_SLAVE);
+        updated(2, 0, 6);
+        active_handle = 2;
+        connect_link(3, HCI_ROLE_MASTER);
+        settle();
+        hub_latency_mouse_activity(HCI_CON_HANDLE_INVALID);
+        hub_latency_mouse_activity(3);
+        mouse_handle = 2; /* Even a misidentified PC cannot be targeted. */
+        hub_latency_mouse_activity(2);
+        mouse_handle = HCI_CON_HANDLE_INVALID;
+        hub_latency_mouse_activity(1);
+        mouse_handle = 1;
+        hub_latency_input_report(0, false);
+        settle();
+        assert(updates == 1 && !requests);
+        for (unsigned i = 0; i < 1000; ++i) hub_latency_mouse_activity(1);
+        assert(updates == 1 && find_link(1)->mouse_activity_pending);
+        tick();
+        assert(updates == 2 && !requests && changed_handle == 1);
+        assert(minimum_requested == intervals[n] && maximum_requested == intervals[n]);
+        assert(latency_requested == 0 && timeout_requested == 216 && !range_writes);
+        assert(find_link(1)->pending && find_link(1)->mouse_active_requests == 1);
+        for (unsigned i = 0; i < 8; ++i) mouse_tick();
+        assert(updates == 2);
+        updated_parameters(1, 0, intervals[n], 0, 216);
+        assert(!find_link(1)->mouse_activity_pending);
+        for (unsigned i = 0; i < 80; ++i) mouse_tick();
+        assert(updates == 2 && !requests && !range_writes);
+    }
+}
+
+static void test_mouse_active_idle_expiry_and_peer_power_saving(void) {
+    setup_active_mouse(6);
+    assert(hub_latency_set_mouse_active(true));
+    hub_latency_mouse_activity(1);
+    milliseconds += LATENCY_MOUSE_ACTIVITY_MS + 1;
+    tick();
+    assert(updates == 1 && !find_link(1)->mouse_activity_pending);
+    hub_latency_mouse_activity(1);
+    input_busy = true;
+    settle();
+    input_busy = false;
+    settle();
+    assert(updates == 1); /* Stale activity does not survive a busy period. */
+    mouse_tick();
+    assert(updates == 2);
+    updated_parameters(1, 0, 6, 0, 216);
+    milliseconds += 30000;
+    uint8_t remote[] = {L2CAP_EVENT_CONNECTION_PARAMETER_UPDATE_REQUEST, 10,
+                        1, 0, 6, 0, 9, 0, 44, 0, 216, 0};
+    event_handler(HCI_EVENT_PACKET, 0, remote, sizeof(remote));
+    assert(find_link(1)->remote_pending && !range_writes);
+    updated_parameters(1, 0, 6, 44, 216);
+    for (unsigned i = 0; i < 240; ++i) tick();
+    assert(updates == 2 && find_link(1)->latency == 44);
+    mouse_tick();
+    assert(updates == 3 && latency_requested == 0 && timeout_requested == 216);
+}
+
+static void test_mouse_active_serialization_and_security(void) {
+    setup_active_mouse(6);
+    assert(hub_latency_set_mouse_active(true));
+    connect_link(2, HCI_ROLE_SLAVE);
+    uint8_t remote[] = {L2CAP_EVENT_CONNECTION_PARAMETER_UPDATE_REQUEST, 10,
+                        2, 0, 6, 0, 6, 0, 0, 0, 200, 0};
+    event_handler(HCI_EVENT_PACKET, 0, remote, sizeof(remote));
+    for (unsigned i = 0; i < 12; ++i) mouse_tick();
+    assert(updates == 1 && find_link(2)->remote_pending);
+    updated(2, 0, 6);
+    for (unsigned i = 0; i < 7; ++i) mouse_tick();
+    assert(updates == 1);
+    pairing_busy = true;
+    for (unsigned i = 0; i < 12; ++i) mouse_tick();
+    assert(updates == 1);
+    pairing_busy = false;
+    unencrypted_handle = 1;
+    for (unsigned i = 0; i < 12; ++i) mouse_tick();
+    assert(updates == 1);
+    unencrypted_handle = HCI_CON_HANDLE_INVALID;
+    for (unsigned i = 0; i < 7; ++i) mouse_tick();
+    assert(updates == 1);
+    mouse_tick();
+    assert(updates == 2 && !requests && changed_handle == 1);
+}
+
+static void test_mouse_active_failures_and_cooldown(void) {
+    setup_active_mouse(9);
+    assert(hub_latency_set_mouse_active(true));
+    request_error = ERROR_CODE_COMMAND_DISALLOWED;
+    mouse_tick();
+    assert(updates == 2 && !find_link(1)->pending);
+    uint32_t first = find_link(1)->request_at;
+    request_error = 0;
+    while ((uint32_t)(milliseconds - first) < LATENCY_INPUT_REASSERT_MS - 250u) mouse_tick();
+    assert(updates == 2);
+    mouse_tick();
+    assert(updates == 3 && find_link(1)->pending);
+    assert((uint32_t)(milliseconds - first) == LATENCY_INPUT_REASSERT_MS);
+    updated_parameters(1, ERROR_CODE_UNSUPPORTED_FEATURE_OR_PARAMETER_VALUE, 9, 0, 216);
+    assert(!find_link(1)->pending && find_link(1)->latency == 44);
+    for (unsigned i = 0; i < 80; ++i) tick();
+    assert(updates == 3); /* A failure alone never retries. */
+    mouse_tick();
+    assert(updates == 4 && find_link(1)->pending);
+    first = find_link(1)->request_at;
+    while ((uint32_t)(milliseconds - first) < LATENCY_INPUT_REASSERT_MS - 250u) mouse_tick();
+    assert(updates == 4 && !find_link(1)->pending && perf_timeouts == 1);
+    mouse_tick();
+    assert(updates == 5 && find_link(1)->pending);
+    assert(perf_requests == updates);
+}
+
+static void test_mouse_active_switches_and_measurement_reset(void) {
+    setup_active_mouse(6);
+    assert(hub_latency_set_mouse_active(true));
+    hub_latency_mouse_activity(1);
+    assert(hub_latency_set_mouse_active(false));
+    tick();
+    assert(updates == 1 && !find_link(1)->mouse_activity_pending);
+    assert(hub_latency_set_mouse_active(true));
+    tick();
+    assert(updates == 1);
+    mouse_tick();
+    assert(updates == 2 && find_link(1)->pending);
+    hub_latency_mouse_activity(1);
+    uint32_t requested = find_link(1)->request_at;
+    uint32_t activity = find_link(1)->mouse_activity_at;
+    hub_latency_reset();
+    assert(mouse_active_mode && find_link(1)->pending && find_link(1)->mouse_activity_pending);
+    assert(find_link(1)->request_at == requested && find_link(1)->mouse_activity_at == activity);
+    assert(find_link(1)->requests == 2 && !find_link(1)->mouse_active_requests);
+    assert(hub_latency_set_mouse_active(false) && find_link(1)->pending);
+    updated_parameters(1, 0, 6, 0, 216);
+    assert(find_link(1)->latency == 0); /* OFF does not undo an in-flight update. */
+    milliseconds += 30000;
+    updated_parameters(1, 0, 6, 44, 216);
+    for (unsigned i = 0; i < 80; ++i) mouse_tick();
+    assert(updates == 2);
+    assert(hub_latency_set_mouse_active(true));
+    hub_latency_mouse_activity(1);
+    fail_save = true;
+    assert(!hub_latency_set_fast(false) && mouse_active_mode);
+    fail_save = false;
+    assert(hub_latency_set_fast(false) && !mouse_active_mode);
+    assert(!find_link(1)->mouse_activity_pending);
+    settle();
+    assert(updates == 3 && minimum_requested == 24 && maximum_requested == 24);
+    assert(latency_requested == 4 && timeout_requested == 200);
+    assert(hub_latency_set_fast(true) && !mouse_active_mode);
+}
+
+static void test_mouse_active_wrap_and_handle_reuse(void) {
+    setup_active_mouse(6);
+    assert(hub_latency_set_mouse_active(true));
+    milliseconds = UINT32_MAX - 100u;
+    radio_activity_at = milliseconds - LATENCY_SETTLE_MS;
+    find_link(1)->request_at = milliseconds - LATENCY_INPUT_REASSERT_MS;
+    mouse_tick();
+    assert(updates == 2 && find_link(1)->pending);
+    updated_parameters(1, 0, 6, 0, 216);
+    milliseconds += 30000;
+    updated_parameters(1, 0, 6, 44, 216);
+    hub_latency_mouse_activity(1);
+    uint8_t gone[] = {HCI_EVENT_DISCONNECTION_COMPLETE, 4, 0, 1, 0, 0x13};
+    event_handler(HCI_EVENT_PACKET, 0, gone, sizeof(gone));
+    connect_link(1, HCI_ROLE_MASTER);
+    updated(1, 0, 6);
+    settle();
+    assert(updates == 2 && !find_link(1)->mouse_activity_pending);
+    assert(!find_link(1)->mouse_active_requests);
+    updated_parameters(1, 0, 6, 44, 216);
+    settle();
+    assert(updates == 2);
+    mouse_tick();
+    assert(updates == 3 && find_link(1)->mouse_active_requests == 1);
+}
+#endif
+
+static void test_pc_standby_default_and_support(void) {
+    reset();
+    assert(!pc_standby_mode && !hub_latency_set_pc_standby(true));
+    assert(hub_latency_set_fast(true));
+    pairing_busy = true;
+    assert(!hub_latency_set_pc_standby(true) && !pc_standby_mode);
+    pairing_busy = false;
+    uint8_t saved[sizeof(setting)];
+    memcpy(saved, setting, sizeof(saved));
+    assert(hub_latency_set_pc_standby(true) == !HUB_CLASSIC_OUTPUT_TEST);
+    hub_latency_pc_standby_status();
+    assert(!updates && !requests && !memcmp(saved, setting, sizeof(saved)));
+    hub_latency_reset();
+    assert(pc_standby_mode == !HUB_CLASSIC_OUTPUT_TEST);
+    hub_latency_init();
+    assert(fast_mode && !pc_standby_mode);
+}
+
+#if !HUB_CLASSIC_OUTPUT_TEST
+static void setup_standby_pcs(void) {
+    reset();
+    connect_link(1, HCI_ROLE_MASTER);
+    updated(1, 0, 6);
+    connect_link(2, HCI_ROLE_SLAVE);
+    updated(2, 0, 6);
+    connect_link(3, HCI_ROLE_SLAVE);
+    updated(3, 0, 6);
+    active_handle = 2;
+    assert(hub_latency_set_fast(true));
+    settle();
+    assert(!updates && !requests);
+    assert(hub_latency_set_pc_standby(true));
+}
+
+static void test_pc_standby_four_pcs_and_promotion_priority(void) {
+    setup_standby_pcs();
+    for (unsigned handle = 4; handle <= 5; ++handle) {
+        connect_link(handle, HCI_ROLE_SLAVE);
+        updated(handle, 0, 6);
+    }
+    connect_link(6, HCI_ROLE_SLAVE); /* Not a registered ready output. */
+    connect_link(7, HCI_ROLE_MASTER); /* Not an input or a PC. */
+    for (unsigned handle = 3; handle <= 5; ++handle) {
+        settle();
+        assert(requests == handle - 2 && changed_handle == handle && !updates);
+        assert(minimum_requested == 12 && maximum_requested == 12);
+        assert(latency_requested == 0 && timeout_requested == 200);
+        assert(find_link(handle)->pending && find_link(handle)->tuned);
+        for (unsigned i = 0; i < 8; ++i) tick();
+        assert(requests == handle - 2); /* Globally serialized. */
+        updated(handle, 0, 12);
+        assert(find_link(handle)->baseline_interval == 6);
+    }
+    settle();
+    assert(requests == 3 && !find_link(2)->tuned && !find_link(6)->tuned);
+    assert(find_link(1)->interval == 6 && !range_writes);
+    active_handle = 3;
+    settle();
+    assert(requests == 4 && changed_handle == 3 && minimum_requested == 6);
+    assert(!find_link(2)->pending && !find_link(3)->requested_standby);
+    updated(3, 0, 6);
+    settle();
+    assert(requests == 5 && changed_handle == 2 && minimum_requested == 12);
+    updated(2, 0, 12);
+    assert(hub_latency_set_pc_standby(false));
+    const uint16_t restoring[] = {2, 4, 5};
+    for (unsigned i = 0; i < 3; ++i) {
+        settle();
+        assert(requests == i + 6 && changed_handle == restoring[i] && minimum_requested == 6);
+        assert(find_link(restoring[i])->tuned); /* Still protected while restoration is pending. */
+        updated(restoring[i], 0, 6);
+        assert(!find_link(restoring[i])->tuned);
+    }
+    settle();
+    assert(requests == 8 && !updates && fast_mode && find_link(3)->interval == 6);
+}
+
+static void test_pc_standby_busy_readiness_and_no_active_target(void) {
+    setup_standby_pcs();
+    not_ready_handle = 3;
+    settle();
+    assert(!requests);
+    not_ready_handle = HCI_CON_HANDLE_INVALID;
+    active_handle = HCI_CON_HANDLE_INVALID; /* Release barrier or selected PC offline. */
+    settle();
+    assert(!requests);
+    active_handle = 2;
+    input_busy = true;
+    settle();
+    input_busy = false;
+    pairing_busy = true;
+    settle();
+    pairing_busy = false;
+    unencrypted_handle = 3;
+    settle();
+    assert(!requests);
+    unencrypted_handle = HCI_CON_HANDLE_INVALID;
+    for (unsigned i = 0; i < 7; ++i) tick();
+    assert(!requests);
+    tick();
+    assert(requests == 1 && changed_handle == 3);
+    updated(3, 0, 12);
+    active_handle = HCI_CON_HANDLE_INVALID;
+    settle();
+    assert(requests == 1); /* No transient restore while switching. */
+    assert(hub_latency_set_pc_standby(false));
+    settle();
+    assert(requests == 2 && changed_handle == 3 && minimum_requested == 6);
+}
+
+static void test_pc_standby_refusal_timeout_and_peer_override(void) {
+    for (unsigned failure = 0; failure < 5; ++failure) {
+        setup_standby_pcs();
+        if (failure == 0) request_error = ERROR_CODE_COMMAND_DISALLOWED;
+        settle();
+        assert(requests == 1 && changed_handle == 3);
+        request_error = 0;
+        if (failure == 1) {
+            uint8_t refused[] = {L2CAP_EVENT_CONNECTION_PARAMETER_UPDATE_RESPONSE, 4, 3, 0, 1, 0};
+            event_handler(HCI_EVENT_PACKET, 0, refused, sizeof(refused));
+        } else if (failure == 2) {
+            updated(3, ERROR_CODE_UNSUPPORTED_FEATURE_OR_PARAMETER_VALUE, 12);
+        } else if (failure == 3) {
+            updated(3, 0, 24); /* An applied update is not necessarily the requested value. */
+        }
+        for (unsigned i = 0; i < 80; ++i) tick();
+        assert(requests == 1 && !find_link(3)->pending && !updates);
+        assert(find_link(3)->baseline_interval == 6);
+        assert(find_link(3)->interval == (failure == 3 ? 24 : 6));
+        assert(perf_timeouts == (failure == 4 ? 1u : 0u));
+        assert(hub_latency_set_pc_standby(false));
+        settle();
+        if (failure == 3) {
+            assert(requests == 2 && minimum_requested == 6);
+            updated(3, 0, 24); /* Refused/clamped restoration must not poison the baseline. */
+            settle();
+            assert(requests == 2 && find_link(3)->baseline_interval == 6 && find_link(3)->tuned);
+        } else assert(requests == 1);
+    }
+}
+
+static void test_pc_standby_pending_switch_and_disable(void) {
+    setup_standby_pcs();
+    settle();
+    active_handle = 3;
+    settle();
+    assert(requests == 1 && find_link(3)->pending);
+    updated(3, 0, 12);
+    settle();
+    assert(requests == 2 && changed_handle == 3 && minimum_requested == 6);
+    active_handle = 2; /* Latest selection wins after the outstanding update. */
+    updated(3, 0, 6);
+    settle();
+    assert(requests == 3 && changed_handle == 3 && minimum_requested == 12);
+    assert(hub_latency_set_pc_standby(false));
+    hub_latency_reset();
+    assert(find_link(3)->pending && !pc_standby_mode && find_link(3)->tuned);
+    settle();
+    assert(requests == 3);
+    updated(3, 0, 12);
+    assert(find_link(3)->baseline_interval == 6);
+    settle();
+    assert(requests == 4 && changed_handle == 3 && minimum_requested == 6);
+    updated(3, 0, 6);
+    assert(!find_link(3)->tuned && find_link(3)->baseline_interval == 6);
+}
+
+static void test_pc_standby_timeout_bounds_normal_and_reuse(void) {
+    setup_standby_pcs();
+    updated_parameters(3, 0, 6, 0, 10);
+    settle();
+    assert(requests == 1 && minimum_requested == 12 && maximum_requested == 12);
+    assert(timeout_requested == 10); /* The minimum legal 100ms timeout is valid at 15ms. */
+    updated_parameters(3, 0, 12, 0, 10);
+    assert(find_link(3)->baseline_timeout == 10);
+    fail_save = true;
+    assert(!hub_latency_set_fast(false) && pc_standby_mode);
+    fail_save = false;
+    assert(hub_latency_set_fast(false) && !pc_standby_mode);
+    settle();
+    assert(requests == 2 && minimum_requested == 6 && timeout_requested == 10);
+    updated_parameters(3, 0, 6, 0, 10);
+    assert(!find_link(3)->tuned);
+    assert(hub_latency_set_fast(true));
+    assert(hub_latency_set_pc_standby(true));
+    milliseconds = UINT32_MAX - 1000u;
+    radio_activity_at = milliseconds;
+    for (unsigned i = 0; i < 7; ++i) tick();
+    assert(requests == 2);
+    tick();
+    assert(requests == 3 && find_link(3)->pending);
+    uint8_t gone[] = {HCI_EVENT_DISCONNECTION_COMPLETE, 4, 0, 3, 0, 0x13};
+    event_handler(HCI_EVENT_PACKET, 0, gone, sizeof(gone));
+    connect_link(3, HCI_ROLE_SLAVE);
+    assert(!find_link(3)->requested_standby && !find_link(3)->tuned);
+    settle();
+    assert(requests == 4 && minimum_requested == 12);
+    updated(3, 0, 12);
+    assert(find_link(3)->baseline_interval == 24);
+    assert(hub_latency_set_pc_standby(false));
+    settle();
+    assert(requests == 5 && minimum_requested == 24 && latency_requested == 4);
+}
+
+static void test_pc_standby_already_15ms_and_selected_7p5ms(void) {
+    setup_standby_pcs();
+    updated_parameters(3, 0, 12, 0, 216);
+    settle();
+    assert(!requests && find_link(3)->requested_standby && !find_link(3)->tuned);
+    assert(find_link(3)->interval == 12 && find_link(3)->baseline_interval == 12);
+    active_handle = 3;
+    settle();
+    assert(requests == 1 && changed_handle == 3);
+    assert(minimum_requested == 6 && maximum_requested == 6 && latency_requested == 0);
+    updated(3, 0, 6);
+    settle();
+    assert(requests == 2 && changed_handle == 2);
+    assert(minimum_requested == 12 && maximum_requested == 12 && latency_requested == 0);
+    updated(2, 0, 12);
+    assert(find_link(3)->interval == 6 && find_link(2)->interval == 12);
+    assert(hub_latency_set_pc_standby(false));
+    settle();
+    assert(requests == 3 && changed_handle == 2 && minimum_requested == 6);
+    updated(2, 0, 6);
+    assert(hub_latency_set_fast(false));
+    settle();
+    assert(requests == 4 && changed_handle == 3);
+    assert(minimum_requested == 12 && maximum_requested == 12 && timeout_requested == 216);
+    updated_parameters(3, 0, 12, 0, 216);
+    assert(!find_link(3)->tuned && !updates && !range_writes);
+}
+#endif
+
 int main(void) {
+    test_pc_standby_default_and_support();
+#if !HUB_CLASSIC_OUTPUT_TEST
+    test_pc_standby_four_pcs_and_promotion_priority();
+    test_pc_standby_busy_readiness_and_no_active_target();
+    test_pc_standby_refusal_timeout_and_peer_override();
+    test_pc_standby_pending_switch_and_disable();
+    test_pc_standby_timeout_bounds_normal_and_reuse();
+    test_pc_standby_already_15ms_and_selected_7p5ms();
+#endif
+    test_mouse_active_default_and_support();
+#if !HUB_CLASSIC_OUTPUT_TEST
+    test_mouse_active_fast_boot_default_and_runtime_off();
+    test_mouse_active_targeting_and_exact_parameters();
+    test_mouse_active_idle_expiry_and_peer_power_saving();
+    test_mouse_active_serialization_and_security();
+    test_mouse_active_failures_and_cooldown();
+    test_mouse_active_switches_and_measurement_reset();
+    test_mouse_active_wrap_and_handle_reuse();
+#endif
     test_targeted_fast_and_restore();
     test_refusal_timeout_and_pairing();
     test_input_metrics_and_reset();
