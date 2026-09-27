@@ -210,6 +210,13 @@ void hid_host_register_packet_handler(btstack_packet_handler_t handler) { (void)
 uint8_t hid_host_connect(bd_addr_t address, hid_protocol_mode_t mode, uint16_t *cid) {
     (void)mode; *cid = 1; return gap_connect(address, BD_ADDR_TYPE_ACL);
 }
+static unsigned classic_recoveries;
+static uint8_t classic_recovery_status;
+uint8_t hub_classic_hid_recover(uint16_t cid, const uint8_t address[6]) {
+    assert(cid && address);
+    ++classic_recoveries;
+    return classic_recovery_status;
+}
 uint8_t hid_host_accept_connection(uint16_t cid, hid_protocol_mode_t mode) {
     (void)cid; (void)mode; ++incoming_accepts; return 0;
 }
@@ -252,6 +259,7 @@ static void reset_fixture(void) {
     connects = disconnects = pairing_requests = scan_starts = inquiry_starts = 0;
     incoming_accepts = incoming_declines = 0;
     connect_cancels = 0;
+    classic_recoveries = classic_recovery_status = 0;
     classic_accept_policy = 0xff;
     role_request_status = 0;
     role_requests = role_queries = 0;
@@ -1050,7 +1058,65 @@ static void test_classic_central_preference(void) {
     assert(!other->forwarding_authorized && !flash_writes);
 }
 
+static void test_classic_orphan_cleanup(void) {
+    reset_fixture();
+    seed_target(0, false, 1, HUB_INPUT_ROLE_MOUSE, 1);
+    seed_target(1, true, 0, HUB_INPUT_ROLE_KEYBOARD, 2);
+    hub_input_init();
+    hub_input_start();
+    input_slot_t *mouse = &inputs[0], *keyboard = &inputs[1];
+    /* Start at the observed condition, without the helper that clears a HID CID. */
+    mouse->state = INPUT_RETRY;
+    mouse->handle = HCI_CON_HANDLE_INVALID;
+    mouse->cid = 0;
+    mouse->deadline = clock_ms;
+    keyboard->state = INPUT_CONNECTING;
+    keyboard->cid = 2;
+    keyboard->retry_allowed = true;
+    establishing = 1;
+    classic_acl_event(keyboard, 0x40, 0, 1);
+    uint8_t disconnected[6] = {HCI_EVENT_DISCONNECTION_COMPLETE, 4, 0, 0x40, 0, 0x13};
+    input_hci_event(HCI_EVENT_PACKET, 0, disconnected, sizeof(disconnected));
+    assert(keyboard->state == INPUT_CLOSING && keyboard->cid == 2);
+    unsigned attempts = connects, writes = flash_writes;
+    tick(INPUT_CLASSIC_CLEANUP_MS - 1);
+    assert(!classic_recoveries && establishing == 1 && connects == attempts);
+    classic_recovery_status = ERROR_CODE_COMMAND_DISALLOWED;
+    tick(1);
+    assert(classic_recoveries == 1 && keyboard->cid == 2 && establishing == 1);
+
+    /* A late ACL is disconnected without erasing the retry/error decision. */
+    classic_acl_event(keyboard, 0x41, 0, 1);
+    assert(keyboard->retry_allowed && keyboard->last_error == 0x13);
+    tick(100);
+    assert(disconnects && keyboard->disconnect_sent);
+    disconnected[3] = 0x41;
+    disconnected[5] = 0x16;
+    input_hci_event(HCI_EVENT_PACKET, 0, disconnected, sizeof(disconnected));
+    classic_recovery_status = 0;
+    tick(INPUT_CLASSIC_CLEANUP_MS);
+    assert(keyboard->state == INPUT_RETRY && !keyboard->cid);
+    assert(mouse->state == INPUT_CONNECTING && establishing == 0 && connects == attempts + 1);
+    assert(keyboard->retry_allowed && flash_writes == writes && classic_key_present[1] && le_db[0].key);
+
+    /* Old profile completion cannot close the next attempt with a different CID. */
+    keyboard->cid = 3;
+    keyboard->state = INPUT_CONNECTING;
+    uint8_t closed[5] = {HCI_EVENT_HID_META, 3, HID_SUBEVENT_CONNECTION_CLOSED, 2, 0};
+    input_hid_event(HCI_EVENT_PACKET, 2, closed, sizeof(closed));
+    assert(keyboard->cid == 3 && keyboard->state == INPUT_CONNECTING);
+    keyboard->paused = true;
+    close_input(keyboard, 0, false);
+    classic_acl_event(keyboard, 0x42, 0, 1);
+    assert(!keyboard->retry_allowed);
+    disconnected[3] = 0x42;
+    input_hci_event(HCI_EVENT_PACKET, 0, disconnected, sizeof(disconnected));
+    tick(INPUT_CLASSIC_CLEANUP_MS);
+    assert(keyboard->state == INPUT_FAILED && keyboard->paused && !keyboard->retry_allowed);
+}
+
 int main(void) {
+    test_classic_orphan_cleanup();
     test_classic_central_preference();
     test_hids_failure_never_starts_companion();
     test_ready_ble_mouse_identification();
@@ -1073,6 +1139,6 @@ int main(void) {
     test_secure_image_does_not_activate_saved_open_input();
     test_radio_busy_covers_establishment_and_scans();
     test_classic_target_isolation_survives_pause();
-    puts("input tests: 22 groups passed (production state machine and SDK HID parser)");
+    puts("input tests: 23 groups passed (production state machine and SDK HID parser)");
     return 0;
 }

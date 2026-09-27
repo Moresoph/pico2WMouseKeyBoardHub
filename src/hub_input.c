@@ -23,6 +23,7 @@
 #include "ble/sm.h"
 #include "ble/le_device_db.h"
 #include "classic/hid_host.h"
+#include "hub_classic_recovery.h"
 
 #define INPUT_DESCRIPTOR_BYTES 4096u
 #define INPUT_REPORTS 16u
@@ -33,6 +34,7 @@
 #define INPUT_SCAN_MS 15000u
 #define INPUT_RETRIES 3u
 #define INPUT_RETRY_MAX_MS 5000u
+#define INPUT_CLASSIC_CLEANUP_MS 3000u
 #define INPUT_ENROLL_SCAN_MS 4000u
 #define INPUT_CANDIDATES 12u
 #define INPUT_SCAN_PEERS 16u
@@ -109,6 +111,7 @@ typedef struct {
     uint8_t last_disconnect_reason;
     uint8_t retries;
     uint32_t deadline;
+    uint32_t cleanup_at;
     uint8_t service_count;
     uint8_t report_count;
     uint16_t descriptor_used;
@@ -475,6 +478,8 @@ static void close_input(input_slot_t *slot, uint8_t error, bool retry) {
     slot->retry_allowed = retry && (slot->ever_ready || slot->stored) &&
                           !slot->auth_failed && !slot->paused && !slot->remove;
     if (slot->candidate && !slot->stored && !slot->storage_error) slot->remove = true;
+    if (slot->state != INPUT_CLOSING)
+        slot->cleanup_at = btstack_run_loop_get_time_ms() + INPUT_CLASSIC_CLEANUP_MS;
     slot->state = INPUT_CLOSING;
     release_input(slot);
 }
@@ -1046,6 +1051,15 @@ static void input_tick(btstack_timer_source_t *timer) {
             close_input(slot, ERROR_CODE_CONNECTION_TIMEOUT, slot->retry_allowed);
         }
         if (slot->state == INPUT_CLOSING) {
+            if (slot->classic && slot->cid && slot->handle == HCI_CON_HANDLE_INVALID
+                && expired(now, slot->cleanup_at)) {
+                uint16_t cid = slot->cid;
+                uint8_t status = hub_classic_hid_recover(cid, slot->address);
+                printf("[input %u] Classic cleanup cid=0x%04x status=0x%02x%s\n",
+                       i + 1, cid, status, status ? "; waiting for transport ownership" : "; retired");
+                slot->cleanup_at = now + INPUT_CLASSIC_CLEANUP_MS;
+                if (!status && slot->cid == cid) slot->cid = 0;
+            }
             if (slot->handle != HCI_CON_HANDLE_INVALID) {
                 if (!slot->disconnect_sent) {
                     uint8_t status = gap_disconnect(slot->handle);
@@ -1062,10 +1076,6 @@ static void input_tick(btstack_timer_source_t *timer) {
             } else if (!slot->cid) {
                 finish_close(slot, now);
             }
-            /*
-             * Classic SDP has no cancel API. Retain its CID/target until its
-             * completion callback; disconnect an arriving ACL before use.
-             */
         }
     }
     if (establishing < 0 && scanning == SCAN_OFF && !hub_security_input_pairing_blocked()
@@ -1488,7 +1498,7 @@ static void input_hci_event(uint8_t packet_type, uint16_t channel,
                 slot->handle = handle;
                 slot->disconnect_sent = false;
                 if (slot->remove || slot->paused || slot->auth_failed || slot->state == INPUT_CLOSING) {
-                    close_input(slot, 0, false);
+                    close_input(slot, slot->last_error, slot->retry_allowed);
                 } else {
                     hci_role_t role = gap_get_role(handle);
                     printf("[input %u] Classic Pico-role=%u (0=central,1=peripheral,255=unknown)\n",

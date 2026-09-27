@@ -1,4 +1,5 @@
 include_guard(GLOBAL)
+include("${CMAKE_CURRENT_LIST_DIR}/HubBtstackClassicRecovery.cmake")
 
 # Source-local, experimental overlay for SDK 2.3.1 / BTstack eb0bb8b5.
 # Never wrap L2CAP globally: outgoing host channels must retain their handlers.
@@ -39,6 +40,9 @@ function(hub_generate_classic_mux_source original output role)
         message(FATAL_ERROR
             "BTstack hid_${role}.c differs from pinned eb0bb8b5ea6d234ccb940313b47f7a5c3b4e20ec; "
             "review the Classic mux overlay before updating SDK (SHA256 ${actual_hash})")
+    endif()
+    if(role STREQUAL "host")
+        hub_recover_classic_text("${source}" hid source)
     endif()
     hub_classic_replace("${source}" "#include \"l2cap.h\"\n"
         "#include \"l2cap.h\"\n#include \"hub_classic_mux.h\"\n" 1 source)

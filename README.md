@@ -19,9 +19,44 @@ all six links.** Controller connection failures and disconnect reasons are
 reported over USB serial. A successful build alone does not prove radio
 capacity, computer compatibility, or switching latency.
 
-## Working milestone: 0.4.0 (2026-09-20)
+## Current standard baseline: 0.4.11 (2026-09-27)
 
-The current hardware setup has demonstrated a Classic Level 0 keyboard and a
+Version **0.4.11** is the user-approved reference for further development and
+rollback, replacing 0.4.10 as the current standard baseline. It includes the
+Classic HID/SDP disconnect recovery described below. "Standard" means an
+accepted development baseline, not a production or security-hardened release.
+
+| Item | Recorded baseline |
+| --- | --- |
+| Firmware identity | `0.4.11-open-test-mouse-buffer` |
+| Output backend | BLE HOGP; Classic output remains an opt-in experiment |
+| Input links | Classic keyboard with explicit Level 0 forwarding consent; bonded BLE mouse |
+| Performance configuration | Saved fast mode; mouse-active ON; mouse-buffer ON; pc-standby OFF |
+| Selected computer | Saved PC1; PC2 remains enrolled but was offline |
+| Observed operation | After reboot and device wake-up, both inputs and PC1 were HID-ready; keyboard/mouse reports and PC1 output counters advanced |
+
+Build this source revision with:
+
+```powershell
+.\tools\build.ps1 -Jobs 8 -OpenClassicInputTest
+```
+
+The verified, deployed image is retained locally at
+`backups\pico_bt_hub-0.4.11-classic-recovery.uf2`, SHA256
+`E6D43C3E6CEF69C9E34A752D50E0664BC9DE97A02171D430ED15EB5C5A68CDAD`.
+Use that exact backup for binary-identical rollback; rebuild timestamps can
+change the hash. The previous 0.4.10 backup is also retained. Binary backups,
+device logs and pairing keys are not committed to Git.
+
+Existing identities, bonds, forwarding consent and latency policy were
+preserved. The Classic Level 0 keyboard link is still **unencrypted and
+unauthenticated**. Four-PC/six-link capacity, long-term freedom from intermittent
+lag, and the 15 ms standby-PC switching behavior are not established by this
+baseline's three-link recovery observation.
+
+## Historical working milestone: 0.4.0 (2026-09-20)
+
+That hardware milestone demonstrated a Classic Level 0 keyboard and a
 bonded BLE mouse controlling either of two encrypted BLE HID computer
 connections. Both computers stayed connected while the user switched keyboard
 and mouse input to computer 2 and back to computer 1 using the hotkeys.
@@ -35,7 +70,8 @@ and mouse input to computer 2 and back to computer 1 using the hotkeys.
 | Simultaneous hardware links | Four demonstrated: two inputs and two computers |
 | Four computers / six total links | Still pending hardware confirmation |
 
-To reproduce this **specific working configuration**, build with:
+To reproduce that **specific working configuration**, use the 0.4.0 source
+revision and build with:
 
 ```powershell
 .\tools\build.ps1 -OpenClassicInputTest
@@ -52,7 +88,8 @@ The working firmware artifact has SHA256
 `148CF9116134D96A900B1B10343C542DBA52BD6451A06C866743B2CB0D11A487`.
 Build timestamps/tool environment may change this hash on a later rebuild.
 Binary backups, pairing keys, captured device logs, and downloaded toolchains are
-kept out of Git. Further feature/performance work should build on this checkpoint.
+kept out of Git. This historical checkpoint is superseded by the current
+standard baseline above.
 
 ## Build on Windows
 
@@ -395,7 +432,7 @@ explicitly before proceeding.
 
 ### BLE baseline measurements
 
-The saved 0.4.0 checkpoint remains the functional baseline. Firmware 0.4.1 adds
+The saved 0.4.0 checkpoint was the initial functional baseline. Firmware 0.4.1 adds
 on-demand measurements and a reversible performance mode:
 
 ```text
@@ -516,6 +553,29 @@ remain separate open issues; the latter also occurred without new mouse
 parameter requests. Two mouse output-software waits over 20 ms (maximum
 46.413 ms) appeared between the pre-movement and recovery snapshots, which
 include idle time and are not a controlled continuous-motion latency sample.
+
+#### Classic input disconnect recovery (0.4.11)
+
+A Classic input that loses its ACL before HID setup finishes must not retain a
+stale HID CID forever and block the other input's reconnect queue. After three
+seconds in disconnect-pending, the input timer checks the actual BTstack ACL
+registry. Only when **no live or pending Classic ACL exists for that peer** does
+it retire that peer's orphaned HID/SDP channels, detach the old SDP callback,
+release descriptor/context storage and resume the existing serial retry queue.
+If the transport still owns the peer, cleanup is deferred and logged; this is
+not permission to run competing connection attempts or reset the controller.
+
+The SDK 2.3.1 / BTstack eb0bb8b5 overlays also propagate synchronous SDP/channel
+creation failures, track the SDP channel before it opens, and reject late
+events belonging to a previous channel. Recovery is scoped by peer and profile
+owner: other SDP requests and PC connections are not reset. Late ACL arrival
+during closing no longer erases the original retry decision. Manual pause,
+authentication failure and forget still prevent automatic reconnect.
+
+Existing bonds, saved input identities, explicit Level 0 forwarding consent,
+selected PC, latency policy and boot defaults are unchanged. Tests exercise
+the generated production HID/SDP code and L2CAP reaper as well as the input
+state machine; hardware is still required to verify a particular radio failure.
 
 #### Classic input Central preference (0.4.6)
 

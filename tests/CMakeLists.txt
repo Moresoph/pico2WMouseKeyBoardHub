@@ -123,6 +123,29 @@ else()
 endif()
 add_test(NAME hub_hci_reconnect_tests COMMAND hub_hci_reconnect_tests)
 
+set(HUB_CLASSIC_RECOVERY_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated/classic-recovery")
+execute_process(COMMAND "${CMAKE_COMMAND}"
+    "-DBTSTACK_PATH=${HUB_BTSTACK_PATH}" "-DOUTPUT_DIR=${HUB_CLASSIC_RECOVERY_GENERATED}"
+    -P "${CMAKE_CURRENT_LIST_DIR}/generate_classic_recovery_test.cmake"
+    RESULT_VARIABLE HUB_CLASSIC_RECOVERY_RESULT)
+if(NOT HUB_CLASSIC_RECOVERY_RESULT EQUAL 0)
+    message(FATAL_ERROR "Generating Classic recovery tests failed")
+endif()
+add_executable(hub_classic_recovery_tests classic_recovery_test.c
+    "${HUB_BTSTACK_PATH}/src/btstack_linked_list.c"
+    "${HUB_BTSTACK_PATH}/src/btstack_util.c"
+    "${HUB_BTSTACK_PATH}/src/classic/sdp_util.c")
+target_include_directories(hub_classic_recovery_tests PRIVATE ../include
+    "${HUB_BTSTACK_PATH}/src" "${HUB_CLASSIC_RECOVERY_GENERATED}")
+target_compile_definitions(hub_classic_recovery_tests PRIVATE
+    ENABLE_BLE=1 ENABLE_CLASSIC=1 ENABLE_SDP_EXTRA_QUERIES=1)
+if(MSVC)
+    target_compile_options(hub_classic_recovery_tests PRIVATE /W4 /UNDEBUG)
+else()
+    target_compile_options(hub_classic_recovery_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+endif()
+add_test(NAME hub_classic_recovery_tests COMMAND hub_classic_recovery_tests)
+
 add_executable(hub_output_tests output_test.c "${HUB_BTSTACK_PATH}/src/btstack_util.c")
 target_include_directories(hub_output_tests PRIVATE ../include
     "${HUB_BTSTACK_PATH}/src" "${CMAKE_CURRENT_LIST_DIR}/output_stubs")

@@ -83,6 +83,7 @@ if ($LASTEXITCODE -ne 0) { throw "Security profile compilation failed: $LASTEXIT
 if ($LASTEXITCODE -ne 0) { throw "Security profile tests failed: $LASTEXITCODE" }
 
 & (Join-Path $root 'tests\test-hci-reconnect.ps1') -SdkPath $SdkPath
+& (Join-Path $root 'tests\test-classic-recovery.ps1') -SdkPath $SdkPath
 & (Join-Path $root 'tests\test-hogp.ps1') -SdkPath $SdkPath
 & (Join-Path $root 'tests\test-output.ps1') -SdkPath $SdkPath
 $output = Join-Path $outputDirectory 'hub_latency_tests.exe'
