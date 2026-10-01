@@ -524,8 +524,9 @@ bool hub_output_set_mouse_buffering(bool enabled) {
 
 void hub_output_mouse_buffer_status(void) {
     printf("[mouse-buffer] enabled=%u reserve-free=%u hold-us=%u idle-ms=%u;"
-           " RAM-only, boot default ON; shared ACL credits, NOT mouse ACKs\n",
-           mouse_buffering, MOUSE_RESERVE_SLOTS, MOUSE_HOLD_US, MOUSE_IDLE_MS);
+           " RAM-only, boot default %s; shared ACL credits, NOT mouse ACKs\n",
+           mouse_buffering, MOUSE_RESERVE_SLOTS, MOUSE_HOLD_US, MOUSE_IDLE_MS,
+           HUB_DUAL_BLUETOOTH ? "OFF" : "ON");
     for (unsigned slot = 0; slot < HUB_COMPUTER_COUNT; ++slot) {
         computer_t *computer = computer_for_slot(slot);
         const output_metrics_t *metrics = &output_metrics[slot];
@@ -1072,7 +1073,7 @@ void hub_output_init(void) {
     _Static_assert(HUB_COMPUTER_COUNT == 4, "This feasibility firmware has four PC slots");
     _Static_assert(sizeof(HUB_DEVICE_NAME) - 1 <= 29, "BLE scan-response name too long");
     low_latency = continuation_registered = pump_timer_armed = false;
-    mouse_buffering = true;
+    mouse_buffering = !HUB_DUAL_BLUETOOTH;
     cancel_motion_timer();
     memset(output_metrics, 0, sizeof(output_metrics));
     pump_registration.callback = continue_pump;

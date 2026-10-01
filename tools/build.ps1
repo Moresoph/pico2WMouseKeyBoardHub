@@ -19,6 +19,8 @@ param(
     [switch]$ClassicInputPeerRole,
     [switch]$MouseInterval7p5,
     [switch]$ClassicOutput7p5,
+    [switch]$UsbHostProbe,
+    [switch]$DualBluetooth,
     [string]$SdkPath = $env:PICO_SDK_PATH,
     [string]$ToolchainPath = $env:PICO_TOOLCHAIN_PATH
 )
@@ -26,15 +28,27 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
+if ($DualBluetooth -and ($UsbHostProbe -or $ClassicOutputTest -or $OpenClassicInputTest)) {
+    throw '-DualBluetooth cannot be combined with USB Host, Classic output or open-input experiments.'
+}
 if ($MouseInterval7p5 -and -not $ClassicOutputTest) {
     throw '-MouseInterval7p5 requires -ClassicOutputTest.'
 }
 if ($ClassicOutput7p5 -and -not $ClassicOutputTest) {
     throw '-ClassicOutput7p5 requires -ClassicOutputTest.'
 }
+if ($UsbHostProbe -and $ClassicOutputTest) {
+    throw '-UsbHostProbe requires BLE output; do not combine it with -ClassicOutputTest.'
+}
 $tools = Join-Path $root '.tools'
+if ($DualBluetooth -and -not $PSBoundParameters.ContainsKey('BuildDirectory')) {
+    $BuildDirectory = 'build\dual-bluetooth'
+}
 if ($ClassicOutputTest -and -not $PSBoundParameters.ContainsKey('BuildDirectory')) {
     $BuildDirectory = 'build\classic-output'
+}
+if ($UsbHostProbe -and -not $PSBoundParameters.ContainsKey('BuildDirectory')) {
+    $BuildDirectory = 'build\usb-host-probe'
 }
 if ([string]::IsNullOrWhiteSpace($SdkPath)) {
     $SdkPath = Join-Path $root '.deps\pico-sdk'
@@ -83,6 +97,8 @@ $configureArguments = @(
     "-DHUB_CLASSIC_INPUT_CENTRAL=$([int](-not $ClassicInputPeerRole.IsPresent))",
     "-DHUB_CLASSIC_MOUSE_7P5_TEST=$([int]$MouseInterval7p5.IsPresent)",
     "-DHUB_CLASSIC_OUTPUT_7P5_TEST=$([int]$ClassicOutput7p5.IsPresent)",
+    "-DHUB_USB_HOST_PROBE=$([int]$UsbHostProbe.IsPresent)",
+    "-DHUB_DUAL_BLUETOOTH=$([int]$DualBluetooth.IsPresent)",
     "-DPICO_SDK_PATH=$SdkPath",
     "-DPICO_TOOLCHAIN_PATH=$ToolchainPath",
     "-DPython3_EXECUTABLE=$python",

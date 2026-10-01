@@ -54,6 +54,677 @@ unauthenticated**. Four-PC/six-link capacity, long-term freedom from intermitten
 lag, and the 15 ms standby-PC switching behavior are not established by this
 baseline's three-link recovery observation.
 
+## Dual Bluetooth: ESP32 input + Pico 2 W output (0.5.0 candidate)
+
+This is an opt-in, two-firmware alternative to the single-radio and USB Host
+experiments. It is not yet an end-to-end hardware-accepted replacement for 0.4.11.
+
+```text
+Bluetooth keyboard + mouse -> ESP32 (Classic HID / BLE HOGP host)
+                              -> wired UART -> Pico 2 W -> BLE HID computers 1..4
+```
+
+Use an **original dual-mode ESP32**, not an ESP32-S3/C3. The locally identified
+board is ESP32-D0WDQ6 revision 1.1, 40 MHz crystal, 4 MB flash. ESP32 Wi-Fi is not
+started. Pico no longer scans/connects Bluetooth inputs in this build; it keeps
+the existing BLE computer identities, bonds, routing, passkey capture and
+Ctrl+Alt+Right/Left behavior. Four simultaneous computer links and latency under
+two-radio load still require hardware observation. Two antennas need clearance;
+two radios do not eliminate 2.4 GHz interference.
+
+### Wiring and power
+
+| Pico 2 W | ESP32 | Purpose |
+| --- | --- | --- |
+| GP4, physical pin 6 (UART1 TX) | D14 / GPIO14 (UART1 RX) | Pico heartbeat/challenge |
+| GP5, physical pin 7 (UART1 RX) | D13 / GPIO13 (UART1 TX) | Keyboard/mouse states |
+| GND, e.g. physical pin 8 | GND | Common signal ground |
+
+The firmware uses the board's active-high blue LED on GPIO2 as its status LED.
+The red power LED remains a power indicator and cannot be controlled by the
+firmware. No external LED is required.
+
+UART is **460800 baud, 8N1, 3.3V logic, no flow control**. The current wiring uses
+the ESP32 board's D13/D14 labels as GPIO13/GPIO14, not physical pin numbers.
+UART1 is routed to these pins by firmware; the board's UART0 TX/RX labels
+remain for USB programming/console. Both boards may be powered by their own USB
+connections to the same computer; **do not join their 5V/3.3V supply pins** and
+do not power ESP32 from Pico's 3V3 output. Disconnect the old external VBUS feed
+and USB Host/Hub wiring before powering Pico from the PC.
+
+GPIO13 and GPIO14 are not ESP32 strapping pins, so the connected Pico UART no
+longer interferes with entering the ROM serial downloader. GPIO2 remains a
+strapping pin but is only connected to the board's built-in LED circuit; the
+firmware configures it as an output after boot.
+
+Pico's micro-USB becomes a USB **device/CDC console**, not USB Host. ESP32's
+onboard USB-to-UART remains its 115200-baud programming/console port. Merely
+plugging both boards into the PC does **not** connect their UARTs. The above
+three signal wires are still required. Old COM numbers are not reliable:
+COM12, previously a Pico adapter, was identified as the ESP32 in this setup.
+
+### Builds and rollback
+
+```powershell
+.\tools\build.ps1 -DualBluetooth -Jobs 4
+.\tools\build-esp32.ps1
+.\tests\test-dual-bt.ps1
+```
+
+Outputs are isolated under `build\dual-bluetooth` (Pico UF2) and
+`build\esp32-dual-bluetooth` (ESP32 bootloader, partition table and application).
+Neither build script flashes hardware. The ESP32 build expects ESP-IDF
+**v5.5.1 / fcae32885b0296b32044cb99ecbdc50d98dddb83** in `.deps\esp-idf` and tools
+in `.tools\esp-idf`. After cloning that tag and initializing its submodules:
+
+```powershell
+$env:IDF_TOOLS_PATH = "$PWD\.tools\esp-idf"
+python .\.deps\esp-idf\tools\idf_tools.py install --targets esp32
+python .\.deps\esp-idf\tools\idf_tools.py install-python-env
+```
+
+ESP32 uses the existing pinned SDK's BTstack **HID parser only**, not its radio
+stack; Bluedroid owns the ESP32 radio. The parser's BlueKitchen copyright,
+non-commercial license and redistribution conditions remain in
+`.deps\pico-sdk\lib\btstack\src\btstack_hid_parser.c` and `btstack_util.c`;
+commercial distribution needs the appropriate license. No vendor source is
+edited. A hash-checked generated IDF Classic-HID overlay requests encryption
+without requiring MITM protection for normal Classic input. In the pinned IDF
+security manager, requesting encryption also sets authentication, but specifying
+authentication at registration time would additionally require MITM under SSP.
+An explicitly authorized `open-connect` target alone uses unencrypted Level 0,
+preserving the earlier keyboard experiment. This Classic input policy does not
+change BLE inputs or Pico's encrypted BLE computer outputs.
+
+The original ESP32 flash was backed up before writing any firmware to
+`backups\esp32-10521c1d9234-before-dual-bt-20260929.bin` (4 MB), SHA256
+`CD3517473707D59C3D915B52A3E16213CADCE80D9FFB2B4371958FB7ACB51A08`.
+It previously reported ROM `flash read err, 1000`; that alone does not establish
+hardware damage. This backup may contain private data and stays ignored.
+The 0.4.11 and 0.4.21 Pico backups are retained. Enter Pico BOOTSEL physically
+with its old external 5V/Host wiring disconnected; identify the exact board
+before writing. Never load/execute old USB Host firmware while still connected
+to a PC USB data port.
+
+### Enrollment and use
+
+On the **ESP32** console, use `help`, `status`, and `scan classic` / `scan ble`.
+Scanning only lists candidates and never pairs automatically. Assign each
+physical input device to one of two slots:
+
+```text
+connect 1 classic AA:BB:CC:DD:EE:FF
+connect 2 ble public AA:BB:CC:DD:EE:FF
+```
+
+Use `random` instead of `public` when indicated by the BLE scan. Each explicit
+connect opens a 120-second pairing window for that target only. A compatible
+Classic legacy keyboard PIN request is answered automatically with the fixed
+PIN **`123456`**. While the LED is flashing rapidly, type `123456` on that
+Bluetooth keyboard and press Enter. The fixed PIN is never accepted outside the
+explicit window or for an unselected address. A device that requires a
+16-character legacy PIN is rejected rather than silently weakening or changing
+the policy. SSP/BLE confirmation and passkey requests remain explicit: use
+`confirm <slot> yes|no` or `passkey <slot> <six digits>` when requested. Normal
+forwarding requires encryption.
+
+Classic input is connectable but non-discoverable so an enrolled keyboard can
+initiate its own reconnection. Outside an explicit pairing window, a normal
+Classic HID open must match a selected, unpaused target with a saved bond;
+unselected/paused HID opens are closed and unknown PIN/SSP requests are rejected.
+An explicitly saved `open-connect` exception is unchanged and is not enabled
+by this reconnect policy. Incoming ACL/HID setup is tracked as a pending
+connection so background reconnect does not open the same target concurrently.
+`status` reports actual GAP connectability/discoverability, Classic bond
+presence, and incoming-connection counters without exposing link keys.
+If `bonded=0`, selecting an address alone is not proof of successful pairing;
+use an explicit pairing window rather than accepting a new PIN automatically
+during ordinary reconnection.
+
+The built-in blue GPIO2 status LED uses these patterns:
+
+| Pattern | Meaning |
+| --- | --- |
+| Off | No input target is configured |
+| One 0.1 s flash every 2 s | A saved input is reconnecting |
+| 0.5 s on / 0.5 s off | Explicit pairing window is active |
+| 0.1 s on / 0.1 s off | Type fixed PIN `123456` on the keyboard, then press Enter |
+| Steady on | Every configured input is connected and ready to forward |
+| Two short flashes every 2 s | At least one configured input is paused after a fault |
+
+Pairing and PIN-entry indications take priority over the fault/ready patterns
+when two input slots are in different states.
+
+For the previously used Classic keyboard that cannot negotiate an encrypted
+HID link, the explicit alternative is:
+
+```text
+open-connect 1 AA:BB:CC:DD:EE:FF
+```
+
+This **persists consent to unencrypted, unauthenticated Classic input** for that
+one address. The address can be spoofed; it is not a cryptographic identity.
+Consent is not imported from Pico and is never enabled for BLE or PC output.
+Use `disconnect 1`, wait for CLOSE, then normal `connect` to remove that
+exception, or `forget 1` to remove its target/bond. Targets reconnect after
+restart and ordinary disconnects; authentication failures/unsupported HID
+pause the affected slot until explicit action. Reconnection to BLE devices
+that rotate private addresses is not established; re-scan/reselect may be
+needed. Keyboard HID LED output (Caps Lock, Num Lock, and similar), media/vendor keys
+and arbitrary gamepads are not implemented.
+
+On the **Pico USB CDC** console, use the existing `status`, `pair keyboard`
+(once a keyboard is ready), `pair justworks` or `pair on`, `select 1..4`, and
+`release`. Existing Pico input enroll/reset/scan commands are disabled in this
+variant; manage input peers on ESP32 instead. Do not re-pair or erase existing
+computer bonds merely to change the input backend. The dual-Bluetooth build
+defaults the Pico mouse motion-credit buffer to OFF: moving input traffic to the
+ESP32 removes its original shared-controller motivation, and the buffer can add
+up to 7.5 ms of intentional motion delay. `mouse-buffer on` remains available
+for output-credit experiments. The single-radio baseline keeps its existing ON
+default.
+
+For encrypted, mapped BLE mice, ESP32 requests a 7.5 ms connection interval
+while preserving the currently negotiated peripheral latency and supervision
+timeout. If the peer subsequently changes the interval, the request may be
+repeated, bounded to three submissions per connection to avoid an update loop.
+Rejected updates and exhausted retries are logged; `status` shows the actual
+interval, not just the requested target. Classic inputs and BLE keyboards
+without mouse reports are unaffected. A 7.5 ms input interval and 7.5 ms PC
+output interval do not imply a fixed 15 ms end-to-end motion latency.
+
+Before this input-interval change, the M720's live parameters were 11.25 ms,
+peripheral latency 44, and supervision timeout 2160 ms. On 2026-10-01, the
+7.5 ms request firmware was flashed and verified on the identified ESP32,
+application SHA256
+`2AA9FC3BD754B99983A462B279BF1AA76AF49FB675219BCEFBB5F14167B66FD0`.
+The application-only update left the NVS partition untouched; a current NVS
+backup is retained locally. Runtime confirmed the new 7.5 ms target and the
+Pico's default-OFF buffer, but M720 reconnects timed out during the subsequent
+bounded observation. The actual post-update mouse interval and motion latency
+were not verified at that point. A subsequent live check confirmed encrypted
+HID mouse input with `interval=7.500ms latency=44 timeout=2160ms`,
+`update-pending=0 attempts=1`, and 2,066 real input reports. This confirms the
+negotiated interval, not absolute physical-motion-to-display latency.
+
+On 2026-10-01, ESP32 `0.5.1-bonded-reconnect` was deployed with application
+SHA256 `E1C0D6E5D0C4658B55FB10F499A7E21C4DC802B6267F49F64F898235C39B1B75`.
+The identified board received an application-only, verified update after a
+local NVS backup; input target addresses and the FILCO bond survived reboot.
+Live status confirmed `connectable=1 discoverable=0`, FILCO `bonded=1`,
+`allow-unencrypted=0`, an online UART link, and the unchanged Pico default-OFF
+mouse buffer and encrypted PC1 output at 7.5 ms. During the initial bounded observation,
+FILCO still failed paging (`0x04`) without reaching authentication or incoming
+HID, and M720 reconnect attempts timed out (`0x85`).
+
+At 09:14 the user confirmed that both inputs were connected and usable, with
+responsive typing and no keyboard or mouse stutter. A subsequent live check
+confirmed FILCO `HID=1 encrypted=1 bonded=1 incoming=1 incoming-connections=1`
+with 585 keyboard reports, and M720 `HID=1 encrypted=1` with 2,932 mouse reports
+and actual `interval=7.500ms latency=44 timeout=2160ms`. Both slots were unpaused,
+with no pending connection, no invalid reports, and no unencrypted exception.
+Pico confirmed keyboard/mouse routing, an online UART link without framing
+errors, mouse buffer OFF, and encrypted HID-ready PC1 at 7.5 ms.
+This is the usable ESP32 + Pico 2 W dual-Bluetooth checkpoint; it does not claim
+an absolute physical-motion latency measurement or completed four-PC switching
+acceptance. Normal bonded reconnect must not be replaced with automatic PIN
+acceptance or re-pairing.
+
+On 2026-10-01, this default-OFF Pico image was deployed to the identified board
+`F1812912A883CCE2`, UF2 SHA256
+`58F523A32916205B6911A17C82A15F33EE8C7EA5F2B689F2E27E05B1EBB11431`.
+Full-flash readback matched all 2,056 application payload blocks and confirmed
+all 895 non-program sectors, including computer pairing storage, were unchanged.
+After reboot, `status` reported `mouse-buffer enabled=0`, `boot default OFF`,
+zero motion holds/deadline sends, an online UART link, and an encrypted/HID-ready
+PC1 connection using its existing bond. Both ESP32 inputs were selected but
+offline/reconnecting at this check; this is not a new keyboard/mouse latency
+measurement. Disabling the buffer removes the deliberate credit-reservation
+hold, not normal BLE scheduling or coalescing of already queued motion reports.
+
+### UART failure behavior and acceptance
+
+Protocol v1 uses `0x7e` delimiters, `0x7d` escaping, CRC16-CCITT-FALSE, a fresh
+Pico challenge, ESP32 session ID, 16-bit sequence and full state of both input
+slots. Mouse deltas accompany individual reports and are **not** repeated by
+heartbeats. Corrupt frames, sequence gaps, UART overflow, changed ESP32 session
+or 500 ms without a fresh frame release inputs and require a new handshake.
+Duplicate frames cannot replay movement or keep a dead link alive. Reconnection
+requires neutral physical keys/buttons before forwarding. A bounded 64-event
+ESP32 queue preserves normal key/button order; overflow is an explicit fault
+with a new session, not silently overwritten key-up events. This is fail-safe
+recovery, **not a lossless retransmission protocol**.
+
+The descriptor parser supports standard keyboard arrays/bitmaps and signed
+relative mouse X/Y/wheel with report IDs, up to 3 maps / 16 reports per device.
+Unsupported/oversized/malformed layouts pause the device rather than guessing
+byte offsets. Slot state is not declared ready from a synthetic neutral report:
+real input must be observed, and reports are not printed as typed-key payloads.
+
+End-to-end acceptance still requires two actual input devices, nonzero mouse X/Y,
+real keyboard reports reaching the selected PC, Ctrl+Alt+Right switching, and
+release after pulling a UART wire or resetting ESP32. The deployment/heartbeat
+observations below do not establish those input/output behaviors.
+
+Bring-up observation before the D2/D15 remap: the identified ESP32 on COM12 was
+flashed with the 0.5.0 candidate using TX=25/RX=26, with all written regions
+verified and the original full-flash backup retained. Its `status`/`help`
+console responded and BLE scanning received
+advertisements. Classic inquiry was accepted but no discoverable Classic device
+was observed; this is not Classic keyboard compatibility evidence. At that time
+both input slots were unselected and `Pico-link=0 packets=0`: Pico deployment was
+still blocked on BOOTSEL access.
+The subsequent TX=15/RX=2 firmware was flashed on COM12 after rechecking the
+ESP32 MAC, with all three written regions verified and NVS left untouched.
+Application SHA256:
+`F988F176CB0D9E0ACA9281636474C067E3E6D534ABE4EA93164CBC7041D85B82`.
+After reset, two `status` requests confirmed `UART1 TX=15 RX=2 baud=460800`.
+Before Pico deployment, both input slots were unselected and `Pico-link=0 packets=0`.
+Local evidence:
+`build\dual-bt-esp32-d2-d15-flash.log` and
+`build\dual-bt-esp32-d2-d15-console.log`.
+
+The subsequent Pico deployment succeeded on 2026-09-29 after the known board
+`F1812912A883CCE2` reappeared in BOOTSEL. A fresh, verified 4 MB backup is retained
+at `backups\pico-f1812912a883cce2-before-dual-bt-20260929-2356.bin`, SHA256
+`74AD70C33CAD6EB9A89C2CFC296BB28DA833333CBCF765E2830C96D811E1CBFE`.
+The flashed `0.5.0-dual-bluetooth` UF2 has SHA256
+`33A7FBFB2DBDD75F8A531EAACE50CF4B94F55A992FF731BAFBABA6EE251B2F93`.
+Before execution, full-flash readback confirmed all 2,056 application payload
+blocks and that every sector outside the firmware, including Bluetooth TLV
+storage, was unchanged.
+
+After boot, Pico USB CDC appeared as COM5. Both ends reported the UART link
+online: Pico accepted packets increased from 181 to 232, while ESP32 sent packets
+increased from 181 to 231. Pico's reset count stayed at its startup value of 1,
+with zero framing errors; ESP32 reported zero queue overflows. PC1 reconnected
+using its stored bond and became encrypted/HID-ready with both notifications
+enabled; PC2 remained reserved but offline. No pairing records were cleared.
+At that point both ESP32 input slots were unselected, so real keyboard/mouse
+forwarding and switching were still unverified. Evidence stays ignored under `build`:
+`dual-bt-pico-flash-20260929-2356.json`,
+`dual-bt-pico-console-20260929-2356.log`, and
+`dual-bt-esp32-link-20260929-2356.log`.
+
+The first Classic keyboard enrollment on 2026-09-30 exposed a command-validation
+bug: `ESP_HID_TRANSPORT_BT` is zero, not an invalid transport. The parser now uses
+`ESP_HID_TRANSPORT_MAX` as its invalid sentinel. The corrected ESP32 application
+was built and flashed with verification, SHA256
+`9190CC773D8D6A15D7A5FF7B8E8428C395BAE2639EA67FD06DE72AC192B13BF3`.
+The known FILCO was discovered, normal encrypted `connect 1 classic` was accepted,
+and ACL/SDP progressed to a legacy PIN request. Pairing did not complete: the
+latest slot status was selected but paused, with no encryption, HID readiness or
+input reports. No unencrypted-input exception was enabled. UART communication
+recovered after the firmware update; mouse enrollment and input forwarding
+remain outstanding.
+The explicit 120-second pairing window now also bounds the connection timeout
+while pairing is still allowed; ordinary reconnects retain their 40-second
+timeout. This fix was built and flashed to the identified ESP32 with all three
+written regions verified (application SHA256
+`1F0E5B5D44FBAA0C1BDC522BCFDF839FC835BD73914597C42153FA0F57CA00AB`).
+Pico was temporarily put in BOOTSEL during the ESP32 reset to avoid driving its
+GPIO2 strap pin, then rebooted; both radios recovered and the UART link came
+back online. A secure retry reached the keyboard's PIN request, but no physical
+PIN entry was confirmed and the input slot later paused without encryption or
+HID reports. The FILCO remains discoverable. Its encrypted pairing and physical
+key delivery are still unverified; do not silently substitute `open-connect`.
+
+On 2026-09-30, the Classic input policy was narrowed to encryption without an
+explicit MITM requirement, matching BTstack's Level 2 intent. Pinned ESP-IDF
+5.5.1 otherwise promotes `BTA_SEC_AUTHENTICATE | BTA_SEC_ENCRYPT` to a MITM
+requirement during HID service registration. Both HID host registration and
+ordinary target opens now request only `BTA_SEC_ENCRYPT`; Bluedroid adds the
+authentication prerequisite for encryption *after* deciding whether MITM is
+required. The separately authorized `open-connect` exception remains
+`BTA_SEC_NONE`. Generated source and its compilation were checked before
+flashing application SHA256
+`B78460D1AE7C1BC84F2E89A350224DAD6A02E0C1AC2144E761F8E0F373BDD0A2`
+to the identified ESP32. After reboot, ESP32 reported the new policy and both
+boards showed UART online; PC1 reconnected to Pico using its saved encrypted
+bond. FILCO was not in pairing mode during automatic retries, so encryption
+and actual key delivery with this policy still require physical pairing.
+The saved FILCO target remains paused for a deliberate retry; no unencrypted
+consent was enabled. Legacy pairing may still ask for a PIN even though MITM
+is not required. After the successful flash and initial status checks, all
+local serial ports disappeared from the host, so no later live-device check
+was possible; the reason for the USB disappearance is unknown.
+
+## USB Host / 2.4 GHz mouse receiver experiment: 0.4.21
+
+This separate experiment's acceptance target is **real mouse movement received from a USB
+2.4 GHz receiver**, not storage access or external Bluetooth. USB HID interfaces
+with supported signed relative X/Y layouts are polled in report protocol;
+8-, packed 12-, 16- and up to 32-bit axes and report IDs are decoded from the
+descriptor, not guessed from byte positions. `usb mouse` shows report/movement
+counts, last deltas/buttons and accumulated movement. A first nonzero X/Y
+report prints `FIRST MOTION`; later progress is rate-limited. Data is captured
+only and **not forwarded to PCs**. Keyboard/vendor-only and unsupported layouts
+are explicitly ignored. MSC is disabled: no flash-drive files are read or written.
+
+This is also groundwork for a separate USB Bluetooth controller for Classic
+inputs. **It does not yet move the keyboard to a Bluetooth dongle.** The onboard
+Bluetooth stack, input retry/security policy, PC output and stored bonds remain
+unchanged. No second BTstack instance or external Bluetooth pairing is started.
+The current standard/rollback baseline remains **0.4.11**, not this experiment.
+
+```powershell
+.\tools\build.ps1 -Jobs 8 -OpenClassicInputTest -UsbHostProbe
+```
+
+The isolated output is `build\usb-host-probe\pico_bt_hub.uf2`, identifying as
+`0.4.21-open-test-usb-host-probe`. This option requires BLE output. Without
+`-UsbHostProbe`, USB CDC and the existing build configuration are retained.
+
+In this experiment the native USB controller is **Host only**, not a USB serial
+device. The console uses UART0 at **115200 baud, 8N1, no flow control**:
+Pico GP0 (physical pin 1, TX) to the adapter RXD; GP1 (pin 2, RX) to TXD; and a
+common GND. Use verified 3.3V TTL signals, not RS-232 or 5V TX signals. Leave the
+adapter's 5V/3.3V supply pins disconnected. Power the serial adapter from the PC.
+
+The Pico USB data port connects to the hub's upstream port; the mouse receiver
+goes in a downstream port. Supply Pico and USB Host VBUS correctly: supplying
+VSYS alone does not energize the USB connector's VBUS, and a powered hub must
+not be assumed to backfeed its upstream port. Do not join independent 5V
+supplies or connect the running Pico Host port to a PC USB host. Verify the
+actual hub/cable power arrangement before powering this setup.
+
+For the current fixed Host wiring, the same protected 5V source powers the hub
+and Pico VBUS (physical pin 40), with GND on pin 38. The former external VSYS
+(pin 39) connection is removed; do not bridge pins 39 and 40. This arrangement
+must be disconnected before attaching Pico USB to a PC.
+
+For flashing, disconnect the hub and external Pico supply, enter BOOTSEL and
+connect Pico directly to the PC. Load with verification **without automatic
+execution** (`picotool load -v`, not `-x`). Unplug from the PC before powering
+the Host wiring again. UART `bootsel` remains available once this image is
+running, but its BOOTSEL state does not survive loss of power: after removing
+external power, hold the physical BOOTSEL button while plugging into the PC.
+Firmware loading must not erase pairing/configuration storage.
+
+Version 0.4.12 introduced the probe. Version 0.4.13 adds read-only physical VBUS
+presence from CYW43 GPIO2, root-port data connection state, USB frame number,
+task-poll count and queued-event status. Physical VBUS presence is a digital
+threshold, not a voltmeter reading or proof of adequate supply under load.
+Read errors explicitly report unknown voltage. The USB controller's forced
+VBUS-detect override is not used as evidence of actual power.
+
+Version 0.4.14 adds `usb trace`: the last 8 KiB of TinyUSB enumeration/control
+transfer diagnostics are kept in RAM, including logs produced in USB interrupts.
+An independent snapshot replays at most 64 bytes per USB task poll while live
+capture continues. Overwritten bytes, truncated messages and formatting errors
+are reported explicitly; no trace is written to flash. Trace output may
+interleave with ordinary console messages. No external HCI transfers or Bluetooth key data are captured. USB HID payloads
+are not dumped by the level-2 TinyUSB trace; mouse counters are printed separately.
+`usb status` also shows a read-only EP0/register snapshot and a saturating receive
+timeout count. Timeout messages are rate-limited to powers of two.
+
+The 0.4.14 hardware trace identified repeated receive timeouts on the initial
+address-zero SETUP at Hub port 3, with no failure delivered to enumeration.
+Version 0.4.15 extends the hash-pinned HCD overlay to stop that retry loop and
+return a single failed transfer to TinyUSB's existing bounded enumeration retry
+logic. Late completion indications for the failed EP0 are discarded without
+discarding other endpoints' buffer completions. It also selects SOF for a
+full-speed root bus or keep-alive for low speed, never both; low-speed children
+behind a full-speed hub continue to use preambles. These changes follow the
+upstream native Host implementation's
+[bus timing](https://github.com/hathach/tinyusb/commit/084ef43be654) and
+[timeout handling](https://github.com/hathach/tinyusb/blob/530c6708dd6f/src/portable/raspberrypi/rp2040/hcd_rp2040.c)
+approach without importing its unrelated endpoint scheduler rewrite.
+The vendored SDK and normal USB CDC build are unchanged. Hardware enumeration
+success must be established separately; an error recovery patch is not proof
+that the attached peripheral responds.
+
+Version 0.4.16 fills the native driver's previously empty root-port reset hook:
+the controller emits the USB reset pulse before enumeration, with completion
+state recorded in the RAM trace. An active control transfer is not silently
+discarded to issue a reset. It also adds HID reception with failed transfers
+delivered as errors rather than interpreting partial/stale data as motion.
+These additions still require hardware confirmation of receiver enumeration
+and nonzero movement reports before the receiver task is considered complete.
+
+Hardware observation of 0.4.16 found a startup regression: with the Hub attached,
+root bus reset repeatedly produced remove/attach events and restarted enumeration,
+preventing the USB task from returning to the console/Bluetooth run loop.
+Removing only the Hub data cable restored the console and exposed the repeated
+reset/remove/attach sequence in the RAM trace. Version 0.4.17 masks only the
+connection-change interrupt during the reset pulse, acknowledges the reset's
+speed changes before restoring the previous interrupt mask, and leaves other
+interrupts enabled. A duplicate reset cannot replace the saved mask; a rejected
+reset cannot acknowledge unrelated events. The upper layer still checks physical
+connection after its reset/debounce delay. Hardware observation confirmed that
+0.4.17 boots normally with the Hub attached, restores the console and reconnects
+PC1. Downstream initial SETUP requests still timed out; no HID interface mounted
+and no real mouse movement was received.
+
+Version 0.4.18 enables RP2350 `LINESTATE_TUNING.MULTI_HUB_FIX` immediately after
+the USB controller reset, before enabling Host operation. The
+[SDK register definition](https://github.com/raspberrypi/pico-sdk/blob/2.3.1/src/rp2350/hardware_regs/include/hardware/regs/usb.h)
+documents this normally disabled bit as extending Host inter-packet/turnaround
+timeouts to accommodate Hub delays. An atomic SET changes only this bit, leaving
+the other line-state settings untouched. The overlay applies only to the native
+Host experiment on RP2350; RP2040 and ordinary USB CDC builds are unchanged.
+`usb status` reads the actual register and reports `Hub-turnaround-fix=1` when
+enabled (normally `linestate-tuning=000000fc`), not merely a build-time flag.
+Production-init tests check placement after reset, before Host enable, and
+preservation of the other bits; a separate RP2040 compilation checks the guard.
+This addresses a documented hardware timing option, but receiver enumeration
+and real movement still require hardware verification.
+Version 0.4.18 is preserved as
+`backups\pico_bt_hub-0.4.18-usb-hub-timing.uf2` and was loaded with Flash
+verification on 2026-09-27 to Pico serial `F1812912A883CCE2`. Post-flash metadata
+confirmed the version and that the board remained in BOOTSEL; no automatic
+execution was requested. After restoring Host wiring, 0.4.18 booted normally
+and PC1 reconnected. Hardware readback confirmed
+`linestate-tuning=000000fc Hub-turnaround-fix=1`, but the first address-zero
+SETUP still failed on ports 1 and 4, with the timeout count stable at 16.
+No HID interfaces mounted and no real mouse movement was received. Enabling
+the documented timing bit alone does **not** resolve the observed failure;
+reflashing this same image is not a further diagnostic step.
+
+Version 0.4.19 adds an experimental read-only digital wire diagnostic because no
+alternate Hub/direct-receiver adapter is available. A claimed DMA channel/timer
+samples `USBPHY_DIRECT` before the first root and first downstream address-zero
+8-byte device-descriptor SETUP. Each capture is limited to 2048 samples (8 KiB)
+at a nominal `clk_sys / 4` rate; retries do not overwrite it. This reads the
+upstream D+/D- pin states without setting PHY overrides, changing GPIO wiring,
+or capturing routine HID reports. DMA allocation, timeout and bus errors are
+reported explicitly, and only the claimed resources are cleaned up. The short
+DMA activity can affect bus arbitration, so this is a diagnostic, not a passive
+external analyzer or a claimed fix.
+
+`usb wire` replays the two snapshots in paced UART lines. Decode a complete log
+with Python 3 (standard library only):
+
+```powershell
+python -B .\tools\decode-usb-wire.py .\build\your-uart-capture.log
+```
+
+The decoder checks SYNC, NRZI/bit stuffing, EOP, PID, token CRC5 and data CRC16.
+It distinguishes a decoded SETUP/DATA0/ACK sequence from an incomplete sample.
+SOP detection also accepts one intermediate SE0/SE1 sample at a J-to-K edge,
+as observed in the real 0.4.20 root capture. This does not modify raw samples or
+relax SYNC, packet, EOP or CRC validation; affected packets are annotated.
+Sampling rate is nominal, not independently calibrated: the successful root
+transaction must decode correctly before the failed child window is interpreted.
+Missing/invalid decoding does not establish a malformed on-wire packet or an
+absent device response. This cannot measure analog signal quality, voltage, or
+the Hub's downstream pins. The receiver-movement acceptance target is unchanged.
+Version 0.4.19 was flashed and verified on the target Pico, then started after
+safe reconnection to the Host topology. Actual captures now contain a valid
+root address-zero SETUP (`2d 00 10`), DATA0 with the expected eight-byte request
+and valid CRC16, followed by ACK (`d2`). The first downstream port's window
+contains three complete identical SETUP/DATA0 pairs with valid CRCs but no
+decoded ACK; a fourth pair is cut short by the capture boundary, not evidence
+of a malformed transmitted packet. These are real digital samples, not the
+decoder's synthetic tests. This supports correctly formatted requests on the
+Pico side, but does not show the Hub's downstream signals or establish whether
+forwarding, port reset, clock compatibility or electrical conditions cause the
+missing response. Hardware status still reports 16 RX timeouts and no mounted
+HID interfaces; real receiver movement remains unverified.
+
+Version 0.4.20 addresses an observed recovery gap, not a proven cause of the
+first missing ACK. When downstream enumeration exhausts its retries, the
+Host clears that port's `PORT_ENABLE` and reads its status back before
+enumerating another device. It never requests `PORT_POWER` changes. Only after
+the port is verified disabled are reserved device resources released and Hub
+polling resumed. This prevents failed default-address devices from being left
+enabled while later devices enumerate. Successful enumeration and root-port
+reset behavior are retained; there is no special-case CH342 driver or UART
+command. `usb status` reports cleanup activity, verified-disable count and errors.
+
+If disable/readback fails, still reports enabled, or takes over two seconds,
+new enumeration is blocked and an explicit error is retained. The code does
+not reuse a possibly outstanding control buffer or claim a successful disable.
+Unplug/reconnect the Hub's **upstream data connection** to clear this blocked
+state while keeping the established safe Host power arrangement; do not connect
+the running Pico Host USB port to a PC. Late cleanup callbacks are ignored.
+
+For a fresh same-port receiver observation, wait for enumeration/cleanup to
+finish, save the existing `usb wire` dump, then issue `usb wire arm`. It retains
+the root reference and rearms only the previously captured downstream Hub/port.
+Keep Pico and Hub powered, unplug/replug the receiver at that same port, then
+read `usb status`, `usb mouse` and `usb wire`. Each new dump records its capture
+generation and start time; replaying an old dump does not increment generation.
+Rearming during capture, replay, enumeration or blocked cleanup is rejected.
+The decoder accepts both legacy 0.4.19 dumps and the new metadata.
+
+Version 0.4.20 was observed after verified flashing and safe Host reconnection.
+Its actual startup trace confirms both failed ports (1 and 4) are disabled and
+read back as `0101`, with `disabled=2`, `errors=0` and `blocked=0`. Port 1 cleanup
+completes before port 4 enumeration begins. Startup still has no HID mount;
+the new root sample decodes SETUP/DATA0/ACK and the child sample has three
+complete valid SETUP/DATA0 pairs without a decoded ACK, followed by a pair
+truncated by the capture boundary. This validates cleanup, not mouse recovery.
+The powered same-port receiver hotplug comparison has also completed.
+Generation 1 records a new request after the Hub reported receiver removal,
+reinsertion and port reset; the CH342 USB port had already been disabled.
+The root reference still decodes correctly, but the fresh child capture again
+has three complete valid request pairs without a decoded ACK. Cleanup then
+reports `disabled=3`, `errors=0`, `blocked=0`, with no HID mount or movement.
+Thus cleanup and powered hotplug alone did not resolve the missing response.
+This does not rule out shared-power effects, physical reset/forwarding or
+clock/signal compatibility; the UART VBUS presence flag is not a voltage
+measurement. Downstream electrical observations and real receiver movement
+remain outstanding.
+
+### 0.4.21: power-good and debounce before downstream reset
+
+This version corrects a software ordering gap. It was flashed and verified on
+2026-09-27, then started after safe Host reconnection. **The actual receiver
+enumeration still fails; no HID interface or real mouse movement was received.**
+The pinned Hub driver previously issued `PORT_RESET` before USBH's 450 ms
+connection delay. USB 2.0 section 9.1.2 and Figure 7-29 instead require at least
+100 ms of connection debounce **before** reset, followed by a separate reset
+recovery interval. The
+[upstream TinyUSB enumeration implementation](https://github.com/hathach/tinyusb/blob/29851564af08cb4909175315d20c71f5eca13040/src/host/usbh.c#L1681-L1865)
+also waits 150 ms before checking and resetting an external Hub port.
+
+The new hash-guarded overlays leave the vendored SDK unchanged:
+
+- After the last successful `PORT_POWER` request, the Hub waits
+  `bPwrOn2PwrGood * 2 ms` before polling connection notifications and finishing
+  configuration. The observed CH334 descriptor requests **96 ms**; zero and
+  the maximum 510 ms value are also supported.
+- A Hub connection notification no longer resets the port. USBH first owns
+  the enumeration, then polls port status at 10 ms intervals for **150 ms**
+  of stable connection. Latched connection changes restart that interval;
+  stale reset-change is cleared before a new reset. Duplicate notifications
+  do not interrupt preparation; other attaches remain queued.
+- Only then is `PORT_RESET` issued. The host waits 20 ms before checking,
+  polls for reset completion and port enable, clears reset-change, waits
+  **10 ms of recovery**, and rechecks readiness before the first address-zero
+  device-descriptor request. A still-incomplete reset times out at 200 ms;
+  preparation has a two-second overall limit.
+- New waits use the existing cooperative poll, not blocking sleeps. Physical
+  root-port reset timing is unchanged. Disconnects cancel pending preparation;
+  transfer/status failures use the existing disable/readback recovery. A lost
+  callback blocks further enumeration without reusing its buffer, and late
+  callbacks cannot advance another operation or a reused Hub address.
+
+`usb status` adds preparation activity, phase (0 debounce, 1 reset, 2 recovery),
+pending transfer, reset/ready/error counts and the last preparation error.
+Trace messages include requested/elapsed power-good time, measured stable time
+before reset, and recovery time before descriptor access. Reaching `ready`
+means only that port preparation completed, **not** that a HID device mounted
+or real movement was received.
+
+The prepared image is
+`backups\pico_bt_hub-0.4.21-usb-pre-reset-timing.uf2`; the 0.4.20 diagnostic and
+standard 0.4.11 recovery images are retained. Native tests execute the generated
+Hub callbacks and USBH preparation/first-descriptor path, including exact
+timing boundaries, clock wrap, reconnect debounce, reset polling, unplug,
+failure recovery, duplicate attaches and stale completions. Flashing used the
+established manual BOOTSEL procedure and did not automatically start USB Host.
+The user subsequently disconnected the Pico's PC USB cable and restored Host
+wiring. COM12 confirms `firmware=0.4.21-open-test-usb-host-probe`, PC1 BLE ready,
+preparation `resets=2 ready=2 errors=0`, and cleanup
+`disabled=2 errors=0 blocked=0`. The retained trace shows port 4 reset after
+163 ms of stable connection, with 18 ms recovery before descriptor access.
+The 8192-byte trace ring overwrote 10439 earlier bytes, so this capture does
+not retain the exact power-good or port 1 preparation timing messages.
+
+The new boot's digital capture has a valid root SETUP/DATA0/ACK reference.
+The receiver on port 1 still shows three complete, CRC-valid SETUP/DATA0
+request pairs without a decoded ACK, followed by a fourth truncated DATA0.
+Root/child `started_us` are 1378442/1886699, both generation 0 of the new boot;
+these are not replays of the earlier 0.4.20 powered-hotplug capture.
+Final `RX-timeouts=16`, no HID mount and no mouse movement confirm that the
+ordering correction alone did not resolve the fault. No additional rearm,
+reset or hotplug was performed during collection.
+
+Evidence: `build\usb-wire-0421-hardware-20260927-234512.log`,
+`build\usb-wire-0421-decoded-20260927-234512.json`, and
+`build\usb-wire-0421-status-20260927-2345.log`. Upstream-only digital sampling
+still cannot distinguish a request not reaching the receiver from a response
+not returning through the Hub. Actual downstream observations remain needed;
+port preparation, PC operation and synthetic tests are not mouse acceptance.
+
+A read-only Windows comparison on 2026-09-27 confirmed the same Hub `1A86:8091`
+working at USB 2.0 high speed, with UGREEN receiver `2B89:0043` at full speed on
+port 1. The receiver has EP0 size 8 and three HID interfaces; interface 1 is a
+boot mouse with interrupt-IN endpoint `0x82`, maximum packet 8 and interval
+2 ms. Port 4 currently holds a full-speed CH342 dual serial device `1A86:55D2`.
+This establishes working PC enumeration, not the Hub's full-speed upstream
+operation on Pico, and does not establish a faulty Hub. PC operation and
+synthetic decoder tests do not meet the Pico mouse-movement acceptance target.
+
+`usb status` also shows observed hubs/devices, VID:PID, configuration state and
+standard Bluetooth HCI interface/endpoint candidates. Identification checks
+class E0/01/01 plus interrupt-IN and bulk-IN/OUT endpoints; it does not establish
+Classic support, chipset firmware readiness or HID compatibility. Vendor-class
+adapters may require a separate driver. Unplugging clears the old address's
+metadata. The observer does not claim interfaces or submit HCI commands; the
+TinyUSB Hub and HID drivers handle their respective interfaces. Limits are
+two hubs, four non-hub devices and four HID interfaces.
+The configuration flag comes from `tuh_mounted()`, which is set before class
+driver configuration finishes; it is not proof that hub downstream ports work.
+
+Hardware observation on 2026-09-27: 0.4.13 was deployed with the existing bonds
+preserved and PC1 reconnected. Hub `1A86:8091` exposed a full-speed `09/00/00`
+interface; physical VBUS presence and root data connection both reported 1,
+and USB frame/task counters advanced. No downstream interfaces appeared with
+the attached peripherals. Earlier supposed flash-drive-only/empty-hub controls
+were inconclusive: the user later clarified that the dongle was still attached.
+
+With 0.4.15 deployed, failed enumeration now exits after the initial request
+and three retries per port: EP0 becomes inactive, the Hub processes subsequent
+port events, and the timeout count stopped at 16 in the two-device observation.
+PC1 and the saved pairing metadata were preserved. This verifies the timeout
+recovery, **not successful downstream device enumeration**. After the user
+explicitly removed the dongle and connected only the flash drive, a new port-1
+attach/reset was observed, but its first address-zero SETUP still failed.
+The current cable set cannot connect the drive directly to Pico without the
+Hub, so that isolation comparison has not been performed. Hub/full-speed
+compatibility, downstream electrical conditions and remaining Host defects
+are not yet distinguished; these results do not establish a faulty dongle or
+working external HCI.
+
+USB events are serviced from the BTstack run loop with a 1 ms timer and a
+non-waiting task call. Enumeration itself can contain SDK delays, and UART
+diagnostic printing is synchronous: this bring-up image is **not a latency
+benchmark**. TinyUSB enumeration failures are logged rather than interpreted as
+Bluetooth failures. `status` still reports the original input/output links.
+
 ## Historical working milestone: 0.4.0 (2026-09-20)
 
 That hardware milestone demonstrated a Classic Level 0 keyboard and a

@@ -1,0 +1,17 @@
+#ifndef HUB_TUSB_CONFIG_H
+#define HUB_TUSB_CONFIG_H
+
+#define CFG_TUD_ENABLED 0
+#define CFG_TUH_ENABLED 1
+#define CFG_TUH_MAX_SPEED OPT_MODE_FULL_SPEED
+#define CFG_TUH_ENUMERATION_BUFSIZE 1024
+#define CFG_TUH_HUB 2
+#define CFG_TUH_DEVICE_MAX 4
+#define CFG_TUH_INTERFACE_MAX 8
+#define CFG_TUH_CDC 0
+#define CFG_TUH_HID 4
+#define CFG_TUH_MSC 0
+#define CFG_TUH_VENDOR 0
+#define CFG_TUSB_DEBUG_PRINTF hub_usb_trace_printf
+
+#endif

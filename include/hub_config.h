@@ -3,6 +3,9 @@
 
 #define HUB_COMPUTER_COUNT 4
 #define HUB_INPUT_COUNT 2
+#ifndef HUB_DUAL_BLUETOOTH
+#define HUB_DUAL_BLUETOOTH 0
+#endif
 #define HUB_PAIRING_WINDOW_MS 120000u
 #define HUB_INPUT_ENROLLMENT_MS 60000u
 /* Existing SDK initiating-scan defaults, also advertised through Scan Parameters. */
@@ -13,6 +16,9 @@
 #endif
 #ifndef HUB_CLASSIC_OUTPUT_TEST
 #define HUB_CLASSIC_OUTPUT_TEST 0
+#endif
+#ifndef HUB_USB_HOST_PROBE
+#define HUB_USB_HOST_PROBE 0
 #endif
 #ifndef HUB_CLASSIC_INPUT_CENTRAL
 #define HUB_CLASSIC_INPUT_CENTRAL 1

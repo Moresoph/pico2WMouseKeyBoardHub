@@ -23,6 +23,12 @@
 #include "hub_latency.h"
 #include "hub_perf.h"
 #include "hub_output_probe.h"
+#if HUB_USB_HOST_PROBE
+#include "hub_usb_host.h"
+#include "hub_usb_trace.h"
+#include "hub_usb_mouse.h"
+#include "hub_usb_wire.h"
+#endif
 #if HUB_CLASSIC_OUTPUT_TEST
 #include "hub_classic_output.h"
 #include "hub_classic_mux.h"
@@ -219,7 +225,7 @@ static void print_link_counts(void) {
     }
     printf("[links] total=%u classic=%u le-central=%u le-peripheral=%u (goal: %u)\n",
            counts[0] + counts[1] + counts[2], counts[0], counts[1], counts[2],
-           HUB_CLASSIC_OUTPUT_TEST ? 3u : 6u);
+           HUB_CLASSIC_OUTPUT_TEST ? 3u : HUB_DUAL_BLUETOOTH ? 4u : 6u);
 }
 
 static void track_link(uint16_t handle, link_role_t role, const bd_addr_t address) {
@@ -670,7 +676,36 @@ static bool parse_signed(const char *text, long min, long max, long *value) {
     return true;
 }
 
+#if HUB_USB_HOST_PROBE
+static void print_usb_status(void) {
+    bool vbus_present;
+    int result = cyw43_gpio_get(&cyw43_state, CYW43_WL_GPIO_VBUS_PIN, &vbus_present);
+    if (result) {
+        printf("[usb] physical VBUS sense read FAILED: %d; voltage unknown\n", result);
+    } else {
+        printf("[usb] physical-VBUS-sense=%u (CYW43 GPIO%u; digital presence, NOT measured volts)\n",
+               vbus_present, CYW43_WL_GPIO_VBUS_PIN);
+    }
+    hub_usb_host_status();
+}
+#endif
+
 static void print_help(void) {
+#if HUB_DUAL_BLUETOOTH
+    printf("\n[dual-bt] ESP32 handles ALL Bluetooth inputs; manage them on its USB console.\n"
+           "  Pico UART1: GP4 TX -> ESP32 RX, GP5 RX <- ESP32 TX, 460800 8N1, common GND.\n"
+           "  Pico USB is CDC/device, NOT USB Host. PC pairing/select/release remain here.\n"
+           "  Input enroll/scan/connect/reset and the BOOTSEL enrollment shortcut are unavailable here.\n");
+#endif
+#if HUB_USB_HOST_PROBE
+    printf("\n[experiment] USB HID mouse capture only; Classic input still uses onboard Bluetooth.\n"
+           "  usb status                 Physical VBUS sense, USB root state and device candidates\n"
+           "  usb trace                  Replay recent USB enumeration/transfer diagnostics from RAM\n"
+           "  usb mouse                  USB receiver report/movement counters; no PC forwarding\n"
+           "  usb wire                   Replay first root/child SETUP digital pin-state captures\n"
+           "  usb wire arm               Rearm capture for the same downstream port before hotplug\n"
+           "  Console: UART0 GP0=TX GP1=RX, 115200 8N1; USB CDC is disabled.\n");
+#endif
 #if HUB_CLASSIC_OUTPUT_TEST
     printf("\n[experiment] SINGLE PC1 Classic HID output; BLE PC advertising and multi-PC switching disabled.\n"
            "  classic target <address>   Authorize this PC's Bluetooth adapter (not the keyboard)\n"
@@ -684,11 +719,13 @@ static void print_help(void) {
         "  latency classic            Passive Classic mode / Sniff Subrating snapshot\n"
         "  latency mouse-active on|off|status  BLE activity-triggered latency=0; boot ON with fast\n"
         "  latency pc-standby on|off|status  Inactive BLE PCs request 15ms; default off\n"
-        "  mouse-buffer on|off|status BLE motion-credit experiment; RAM-only, default on\n"
+        "  mouse-buffer on|off|status BLE motion-credit experiment; RAM-only, build-dependent default\n"
         "  diag                       Replay recent pairing metadata (no PIN/key values)\n"
+#if !HUB_DUAL_BLUETOOTH
         "  enroll | enroll stop       Timed automatic keyboard/mouse enrollment\n"
         "  inputs reset               Forget both inputs, then enroll replacements\n"
         "  input forget <1|2>         Forget only that input, preserve the other\n"
+#endif
 #if !HUB_CLASSIC_OUTPUT_TEST
         "  pair keyboard              Pair a PC using an already-connected keyboard\n"
 #endif
@@ -701,6 +738,7 @@ static void print_help(void) {
         "  confirm <ticket> yes|no     Verify numbers on both devices first\n"
         "  passkey <ticket> <123456>   Supply a six-digit remote passkey\n"
         "  pin <ticket> <PIN>          Legacy Classic PIN, 1..16 characters\n"
+#if !HUB_DUAL_BLUETOOTH
         "  scan ble | scan classic | scan stop\n"
         "  name <address>             Read a Classic device's Bluetooth name\n"
         "  open-test <1|2> <address>   Isolated Classic Level 0 test (test image only)\n"
@@ -708,6 +746,7 @@ static void print_help(void) {
         "  connect <1|2> classic <AA:BB:CC:DD:EE:FF>\n"
         "  connect <1|2> ble public|random <AA:BB:CC:DD:EE:FF>\n"
         "  disconnect <1|2>\n"
+#endif
 #if HUB_CLASSIC_OUTPUT_TEST
         "  select 1                   Only PC1 exists in this experiment\n"
 #else
@@ -725,7 +764,10 @@ static void print_help(void) {
 #else
         "Shortcut: Ctrl+Alt+Right/Left, then release all keys/buttons.\n"
 #endif
-        "BOOTSEL while running: short=enroll; hold 8 seconds=input-only reset.\n\n");
+#if !HUB_DUAL_BLUETOOTH
+        "BOOTSEL while running: short=enroll; hold 8 seconds=input-only reset.\n"
+#endif
+        "\n");
 }
 
 static void print_bonds(void) {
@@ -908,9 +950,36 @@ static void console_command(char *line) {
         close_pairing_window("reboot");
         boot_pending = true;
         boot_deadline = btstack_run_loop_get_time_ms() + 300u;
+#if HUB_USB_HOST_PROBE
+        printf("[console] entering BOOTSEL; disconnect Hub/external power before attaching USB to a PC\n");
+#else
         printf("[console] entering BOOTSEL; USB serial will disconnect\n");
+#endif
         return;
     }
+#if HUB_USB_HOST_PROBE
+    if (strcmp(args[0], "usb") == 0 && argc == 2 && strcmp(args[1], "status") == 0) {
+        print_usb_status();
+        return;
+    }
+    if (strcmp(args[0], "usb") == 0 && argc == 2 && strcmp(args[1], "trace") == 0) {
+        hub_usb_trace_dump();
+        return;
+    }
+    if (strcmp(args[0], "usb") == 0 && argc == 2 && strcmp(args[1], "mouse") == 0) {
+        hub_usb_mouse_status();
+        return;
+    }
+    if (strcmp(args[0], "usb") == 0 && argc == 2 && strcmp(args[1], "wire") == 0) {
+        hub_usb_wire_dump();
+        return;
+    }
+    if (strcmp(args[0], "usb") == 0 && argc == 3 &&
+        strcmp(args[1], "wire") == 0 && strcmp(args[2], "arm") == 0) {
+        hub_usb_wire_arm();
+        return;
+    }
+#endif
     if (!working) {
         printf("[console] Bluetooth is not ready\n");
         return;
@@ -955,6 +1024,9 @@ static void console_command(char *line) {
     }
     if (strcmp(args[0], "status") == 0 && argc == 1) {
         printf("[status] firmware=%s\n", PICO_PROGRAM_VERSION_STRING);
+#if HUB_USB_HOST_PROBE
+        print_usb_status();
+#endif
         printf("[status] output=%s\n", HUB_CLASSIC_OUTPUT_TEST ? "Classic HID (single-PC experiment)" : "BLE HOGP");
         printf("[status] uptime-ms=%" PRIu32 " pairing=%s mode=%s keyboard-ready=%u passkey-pending=%u\n",
                btstack_run_loop_get_time_ms(),
@@ -1094,6 +1166,10 @@ static void console_command(char *line) {
         }
     }
     if (strcmp(args[0], "name") == 0 && argc == 2) {
+#if HUB_DUAL_BLUETOOTH
+        printf("[dual-bt] input discovery belongs to ESP32; onboard radio is reserved for PCs\n");
+        return;
+#else
         bd_addr_t address;
         if (strlen(args[1]) != 17 || !sscanf_bd_addr(args[1], address)) {
             printf("[name] invalid Bluetooth address\n");
@@ -1106,6 +1182,7 @@ static void console_command(char *line) {
         int result = gap_remote_name_request(address, 2, 0);
         printf("[name] request peer=%s status=0x%02x\n", bd_addr_to_str(address), result);
         return;
+#endif
     }
     if (strcmp(args[0], "open-test") == 0 && argc == 3
         && parse_uint(args[1], HUB_INPUT_COUNT, 10, &number) && number > 0) {
@@ -1276,7 +1353,7 @@ int main(void) {
     gap_set_local_name(HUB_DEVICE_NAME);
     gap_set_class_of_device(HUB_CLASSIC_OUTPUT_TEST ? 0x0025c0 : 0x000100);
     gap_discoverable_control(0);
-    gap_connectable_control(1);
+    gap_connectable_control(HUB_DUAL_BLUETOOTH ? 0 : 1);
     gap_set_bondable_mode(1);
     gap_ssp_set_io_capability(SSP_IO_CAPABILITY_DISPLAY_YES_NO);
     gap_ssp_set_authentication_requirement(
@@ -1310,6 +1387,9 @@ int main(void) {
 #endif
     hub_latency_init();
     hub_perf_init();
+#if HUB_USB_HOST_PROBE
+    if (!hub_usb_host_init()) panic("USB Host probe initialization failed");
+#endif
     btstack_run_loop_set_timer_handler(&console_timer, console_poll);
     btstack_run_loop_set_timer(&console_timer, 10);
     btstack_run_loop_add_timer(&console_timer);
