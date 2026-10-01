@@ -1,5 +1,13 @@
 # Pico 2 W Bluetooth keyboard/mouse hub
 
+**Current usable setup:** ESP32 `0.5.1-bonded-reconnect` receives the FILCO
+Classic keyboard and M720 BLE mouse, then forwards input over UART to Pico 2 W
+`0.5.0-dual-bluetooth`, which provides BLE HID output to the computer. Keyboard
+and mouse forwarding to PC1 is hardware-confirmed; four-PC switching acceptance
+is still pending. See the **Dual Bluetooth** section for wiring and build commands.
+
+The single-radio prototype below remains available as a separate configuration.
+
 Experimental firmware for one Raspberry Pi Pico 2 W:
 
 ```text
@@ -19,10 +27,10 @@ all six links.** Controller connection failures and disconnect reasons are
 reported over USB serial. A successful build alone does not prove radio
 capacity, computer compatibility, or switching latency.
 
-## Current standard baseline: 0.4.11 (2026-09-27)
+## Single-radio reference baseline: 0.4.11 (2026-09-27)
 
 Version **0.4.11** is the user-approved reference for further development and
-rollback, replacing 0.4.10 as the current standard baseline. It includes the
+rollback of the single-radio variant, replacing its 0.4.10 baseline. It includes the
 Classic HID/SDP disconnect recovery described below. "Standard" means an
 accepted development baseline, not a production or security-hardened release.
 
@@ -54,10 +62,11 @@ unauthenticated**. Four-PC/six-link capacity, long-term freedom from intermitten
 lag, and the 15 ms standby-PC switching behavior are not established by this
 baseline's three-link recovery observation.
 
-## Dual Bluetooth: ESP32 input + Pico 2 W output (0.5.0 candidate)
+## Dual Bluetooth: ESP32 input + Pico 2 W output (usable checkpoint)
 
 This is an opt-in, two-firmware alternative to the single-radio and USB Host
-experiments. It is not yet an end-to-end hardware-accepted replacement for 0.4.11.
+experiments. Keyboard/mouse forwarding to PC1 is hardware-accepted; simultaneous
+four-PC connections and physical switching acceptance are not yet established.
 
 ```text
 Bluetooth keyboard + mouse -> ESP32 (Classic HID / BLE HOGP host)
