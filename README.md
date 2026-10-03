@@ -1,5 +1,24 @@
 # Pico 2 W Bluetooth keyboard/mouse hub
 
+**Post-release deletion fix (`0.6.4-delete-controls`):** physically authorized
+deletion is no longer disabled merely because automatic discovery is running.
+Confirming an input deletion stops discovery, waits up to six seconds for
+completion, rechecks the window token and exact saved identity, then runs the
+existing deletion path. A failed stop, expired authorization, cancellation or
+changed identity preserves the record and reports that deletion was not executed.
+An active pairing trial and storage/telemetry faults remain guarded.
+The fix was built, tested and deployed on 2026-10-03 after USB was moved to
+another port (COM16). Application SHA256
+`07EEB8104E9A0A50D95BF36EED9395770CF6C0775686B287D2A627CFAA908312`;
+flash verification and byte-identical NVS preservation before reboot passed.
+Runtime confirmed `0.6.4-delete-controls`, no storage fault, fresh UART/PC
+telemetry, encrypted FILCO input and the newly saved/active `M585/M590` at
+7.5 ms with real reports. M720 remains saved and inactive. The initial serial
+re-enumeration after flashing was transiently unavailable; a later COM16 status
+read succeeded. This fix is recorded as a separate commit after the unchanged
+v0.6.3 release tag.
+Existing user records were not destructively deleted as a validation step.
+
 **Release checkpoint: `v0.6.3` (2026-10-03).** See
 [RELEASE-NOTES.md](RELEASE-NOTES.md) for firmware identities, deployed image
 hashes and acceptance limits. ESP32 is deployed as `0.6.3-auto-input`; Pico
@@ -53,6 +72,11 @@ automatic BLE/Classic scan cycling, waiting for the old BLE worker, and exclusio
 of the Pico broadcast. M585/M590 was no longer advertising in that bounded run,
 so actual new physical-mouse pairing is not claimed; the test window was cancelled
 and both old input records retained. Pico firmware was not changed for this task.
+Subsequently, at 19:45, COM16 runtime confirmed M585/M590 saved as input record 3
+and active, encrypted/HID-ready with 441 real reports; M720 record 2 remained
+saved/inactive. After the 0.6.4 update it reconnected encrypted with 401 reports,
+confirming physical new-mouse admission and persistent identity/name.
+The exact button-versus-page trigger was not captured in that observation.
 The final ESP32 application was identity-checked, flash-verified and deployed,
 SHA256 `A275AE4557A7CC464A4BC548C7DF20F700F4F9251783A1ACD2D873D6A8BD371C`.
 NVS was byte-identical before/after flashing, before reboot; the previous scan

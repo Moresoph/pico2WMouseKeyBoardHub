@@ -31,7 +31,7 @@ typedef struct {
 } peer_t;
 static peer_t peers[2];
 static hub_input_records_t saved_inputs;
-static bool records_fault,scanning,scan_ble_pending,record_names_dirty;
+static bool records_fault,scanning,scan_ble_pending,scan_cancelled,record_names_dirty;
 static bool auto_enrollment,auto_scan_complete,auto_committed;
 static uint8_t auto_stage;
 static uint32_t auto_retry_at;
@@ -42,6 +42,9 @@ static char management_token[17],operation[192];
 static hub_web_candidate_t candidates[16];
 static hub_link_output_cache_t pico_output;
 static hub_link_frame_t pc_request;
+static hub_web_command_t deferred_delete;
+static bool deletion_pending,stop_scan_immediately=true;
+static uint32_t delete_requested_at;
 typedef struct {
     uint8_t phase,kind,role,record;
     bool abort,was_bonded;
@@ -83,8 +86,8 @@ static esp_err_t nvs_get_blob(int s,const char *key,void *data,size_t *length){
     if(!flash_valid)return ESP_ERR_NOT_FOUND;
     memcpy(data,flash,sizeof(flash));return ESP_OK;
 }
-static esp_err_t esp_bt_gap_cancel_discovery(void){scanning=false;return ESP_OK;}
-static esp_err_t esp_ble_gap_stop_scanning(void){scanning=false;return ESP_OK;}
+static esp_err_t esp_bt_gap_cancel_discovery(void){if(stop_scan_immediately)scanning=false;return ESP_OK;}
+static esp_err_t esp_ble_gap_stop_scanning(void){if(stop_scan_immediately)scanning=false;return ESP_OK;}
 static esp_err_t esp_bt_gap_start_discovery(int mode,int duration,int count){
     (void)mode;(void)duration;(void)count;++scans;return ESP_OK;
 }
@@ -117,7 +120,8 @@ static void reset(void){
     configure_peer(1,&keyboard,false);configure_peer(2,&old_mouse,false);
     peers[0].mapped=peers[0].secure=true;peers[0].dev=&peers[0];peers[0].hid.roles=1;
     clock_ms=1000;states=scans=removes=errors=0;flash_valid=fail_write=queued=false;
-    records_fault=scanning=scan_ble_pending=record_names_dirty=false;requested_scan=active_scan=SCAN_NONE;
+    records_fault=scanning=scan_ble_pending=scan_cancelled=record_names_dirty=deletion_pending=false;
+    stop_scan_immediately=true;requested_scan=active_scan=SCAN_NONE;pc_request.type=0;
     memset(&trial,0,sizeof(trial));memset(&pico_output,0,sizeof(pico_output));
     open_management();
     assert(management_open());
@@ -225,6 +229,34 @@ int main(void){
     manage_tick();assert(saved_inputs.active[1]==2 && saved_inputs.slots[1].used);
     assert(!strcmp(saved_inputs.slots[2].name,"New independent mouse"));
     manage_tick();assert(!management_open() && !auto_enrollment);
+    /* Deletion can be confirmed directly while automatic discovery is waiting/running. */
+    reset();open_management();
+    c=cmd("delete");c.slot=2;strcpy(c.address,"02:02:02:02:02:02");
+    assert(handle_management(&c)==ESP_OK && deletion_pending && !requested_scan && !auto_enrollment);
+    manage_tick();
+    assert(!deletion_pending && !trial.phase && !saved_inputs.slots[1].used && !peers[1].selected);
+    assert(saved_inputs.slots[0].used && peers[0].mapped && removes==1 && removed[0]==2);
+    reset();open_management();manage_tick();
+    assert(scanning && scan_ble_pending);
+    scan_ble_pending=false;stop_scan_immediately=false;
+    c=cmd("delete");c.slot=2;strcpy(c.address,"02:02:02:02:02:02");
+    assert(handle_management(&c)==ESP_OK && deletion_pending && scanning && scan_cancelled);
+    manage_tick();assert(deletion_pending && saved_inputs.slots[1].used && !removes);
+    clock_ms+=5999;manage_tick();assert(deletion_pending && saved_inputs.slots[1].used);
+    scanning=false;active_scan=SCAN_NONE;manage_tick();
+    assert(!deletion_pending && !saved_inputs.slots[1].used && saved_inputs.slots[0].used);
+    reset();open_management();manage_tick();scan_ble_pending=false;stop_scan_immediately=false;
+    c=cmd("delete");c.slot=2;strcpy(c.address,"02:02:02:02:02:02");assert(handle_management(&c)==ESP_OK);
+    clock_ms+=6000;manage_tick();
+    assert(!deletion_pending && saved_inputs.slots[1].used && !removes && !flash_valid);
+    reset();open_management();manage_tick();scan_ble_pending=false;stop_scan_immediately=false;
+    c=cmd("delete");c.slot=2;strcpy(c.address,"02:02:02:02:02:02");assert(handle_management(&c)==ESP_OK);
+    c=cmd("cancel");assert(handle_management(&c)==ESP_OK);scanning=false;manage_tick();
+    assert(!deletion_pending && saved_inputs.slots[1].used && !removes);
+    reset();open_management();manage_tick();scan_ble_pending=false;stop_scan_immediately=false;
+    c=cmd("delete");c.slot=2;strcpy(c.address,"02:02:02:02:02:02");assert(handle_management(&c)==ESP_OK);
+    saved_inputs.slots[1].address[0]=9;scanning=false;manage_tick();
+    assert(!deletion_pending && saved_inputs.slots[1].used && !removes);
     /* Multiple fresh mice never pick by order/RSSI; generic hubs/known peers are excluded. */
     reset();open_management();requested_scan=SCAN_NONE;auto_stage=3;new_mouse();
     uint8_t second_mouse[]={4,4,4,4,4,4};const uint8_t mouse_name[]="Second new mouse";

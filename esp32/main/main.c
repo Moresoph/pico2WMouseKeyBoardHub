@@ -79,7 +79,7 @@ static QueueHandle_t snapshots, uart_events, ble_opens;
 static nvs_handle_t store;
 static uint32_t nonce, session, request_at, sent_at, sent_count, overflow_count, encryption_token;
 static uint16_t sequence;
-static bool classic_ready, scanning, scan_ble_pending;
+static bool classic_ready, scanning, scan_ble_pending, scan_cancelled;
 enum { SCAN_NONE, SCAN_CLASSIC, SCAN_BLE };
 static uint8_t requested_scan, active_scan;
 static uint32_t scan_requested_at, scan_started_at;
@@ -105,6 +105,9 @@ static uint16_t pc_sequence;
 static char management_token[17], operation[192];
 static QueueHandle_t management_commands;
 static hub_link_frame_t pc_request;
+static hub_web_command_t deferred_delete;
+static bool deletion_pending;
+static uint32_t delete_requested_at;
 static uint8_t pc_attempts;
 typedef struct {
     uint8_t phase, kind, role, record;
@@ -721,6 +724,11 @@ static void ble_gap(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *e) {
         case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
             if (scan_ble_pending) {
                 scan_ble_pending = false;
+                if(scan_cancelled){
+                    scanning=false;active_scan=SCAN_NONE;
+                    ESP_LOGI(TAG,"queued BLE scan cancelled before start");
+                    break;
+                }
                 esp_err_t error = e->scan_param_cmpl.status == ESP_BT_STATUS_SUCCESS &&
                     (!active_scan || management_open())
                     ? esp_ble_gap_start_scanning(6) : ESP_FAIL;
@@ -1113,6 +1121,7 @@ static bool web_snapshot(hub_web_snapshot_t *out) {
     out->records=saved_inputs;
     out->auto_enrollment=auto_enrollment;
     out->records_fault=records_fault;
+    out->deletion_pending=deletion_pending || pc_request.type!=0;
     out->management_open=management_open();out->trial=trial.phase!=0;out->scanning=scanning||requested_scan;
     out->scan_waiting=requested_scan!=SCAN_NONE;
     out->trial_role=trial.role;
@@ -1192,6 +1201,7 @@ static bool peer_idle(const peer_t *p){return !p->dev && !p->open_running && !p-
 static void stop_scan(void) {
     requested_scan=SCAN_NONE;
     if(!scanning)return;
+    scan_cancelled=true;
     if(active_scan==SCAN_CLASSIC)check_result(esp_bt_gap_cancel_discovery(),"cancel Classic scan");
     else if(active_scan==SCAN_BLE && !scan_ble_pending)check_result(esp_ble_gap_stop_scanning(),"cancel BLE scan");
 }
@@ -1220,7 +1230,7 @@ static void start_queued_scan(void) {
     if(!auto_enrollment || auto_stage==1)candidate_count=0;
     auto_scan_complete=false;
     esp_err_t error;
-    scanning=true;scan_started_at=now_ms();
+    scanning=true;scan_cancelled=false;scan_started_at=now_ms();
     if(classic)error=esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY,4,0);
     else{
         esp_ble_scan_params_t params={.scan_type=BLE_SCAN_TYPE_ACTIVE,.own_addr_type=BLE_ADDR_TYPE_PUBLIC,
@@ -1238,6 +1248,7 @@ static void start_queued_scan(void) {
 }
 static void close_management(void) {
     auto_enrollment=false;auto_stage=0;
+    deletion_pending=false;
     management_until=0;management_token[0]=0;stop_scan();
     if(trial.phase)trial.abort=true;
     for(unsigned i=0;i<2;++i){peers[i].pair_until=0;if(peers[i].auth)reject_auth(&peers[i]);}
@@ -1275,6 +1286,7 @@ static void remove_input_bond(const hub_saved_input_t *s) {
 static esp_err_t handle_management(const hub_web_command_t *cmd) {
     if(!management_open() || strcmp(cmd->token,management_token) || records_fault)return ESP_ERR_INVALID_STATE;
     if(!strcmp(cmd->action,"cancel")){close_management();snprintf(operation,sizeof(operation),"已取消，旧设备记录保留");return ESP_OK;}
+    if(deletion_pending)return ESP_ERR_INVALID_STATE;
     if(!strcmp(cmd->action,"manual")){
         auto_enrollment=false;auto_stage=0;stop_scan();
         snprintf(operation,sizeof(operation),"手动管理已开启，扫描停止后可删除记录或选择设备");
@@ -1308,6 +1320,7 @@ static esp_err_t handle_management(const hub_web_command_t *cmd) {
         const hub_link_pc_t *pc=&pico_output.value.computers[cmd->slot-1];
         char address[18];snprintf(address,sizeof(address),ESP_BD_ADDR_STR,ESP_BD_ADDR_HEX(pc->address));
         if(!(pc->flags&HUB_LINK_PC_RESERVED) || strcasecmp(address,cmd->address))return ESP_ERR_INVALID_ARG;
+        auto_enrollment=false;auto_stage=0;stop_scan();
         pc_request=(hub_link_frame_t){.type=HUB_LINK_MANAGE,.length=12,.sequence=++pc_sequence};
         uint32_t id=random_nonzero();for(unsigned i=0;i<4;++i)pc_request.payload[i]=(uint8_t)(id>>(8*i));
         pc_request.payload[4]=cmd->slot;pc_request.payload[5]=pc->address_type;
@@ -1328,7 +1341,8 @@ static esp_err_t handle_management(const hub_web_command_t *cmd) {
         if(error==ESP_OK)p->auth=AUTH_NONE;
         return error;
     }
-    if(trial.phase || scanning || requested_scan)return ESP_ERR_INVALID_STATE;
+    if(trial.phase)return ESP_ERR_INVALID_STATE;
+    if((scanning || requested_scan) && strcmp(cmd->action,"delete"))return ESP_ERR_INVALID_STATE;
     hub_saved_input_t target={0};unsigned role=0,record=255;uint8_t kind=1;
     if(!strcmp(cmd->action,"delete") || !strcmp(cmd->action,"activate")){
         if(!cmd->slot || cmd->slot>5 || !saved_inputs.slots[cmd->slot-1].used)return ESP_ERR_INVALID_ARG;
@@ -1336,6 +1350,13 @@ static esp_err_t handle_management(const hub_web_command_t *cmd) {
         char address[18];snprintf(address,sizeof(address),ESP_BD_ADDR_STR,ESP_BD_ADDR_HEX(target.address));
         if(strcasecmp(address,cmd->address))return ESP_ERR_INVALID_ARG;
         if(!strcmp(cmd->action,"delete")) {
+            auto_enrollment=false;auto_stage=0;
+            if(scanning || requested_scan){
+                deferred_delete=*cmd;deletion_pending=true;delete_requested_at=now_ms();
+                stop_scan();
+                snprintf(operation,sizeof(operation),"删除已排队：正在停止扫描，完成后删除所确认的设备");
+                return ESP_OK;
+            }
             if(saved_inputs.active[role-1]!=record){
                 hub_input_records_t next=saved_inputs;hub_records_forget(&next,record);
                 esp_err_t error=persist_records(&next);
@@ -1425,6 +1446,20 @@ static void manage_tick(void) {
         }
         esp_err_t error=handle_management(&cmd);
         if(error!=ESP_OK){snprintf(operation,sizeof(operation),"操作未执行：%s；旧记录未删除",esp_err_to_name(error));check_result(error,"management action");}
+    }
+    if(deletion_pending){
+        if(now_ms()-delete_requested_at>=6000u){
+            deletion_pending=false;
+            snprintf(operation,sizeof(operation),"扫描未能停止，删除未执行；设备记录保留，请稍后重试");
+            ESP_LOGE(TAG,"delete cancelled: discovery stop timeout; no record removed");
+        }else if(!scanning && !requested_scan){
+            hub_web_command_t command=deferred_delete;deletion_pending=false;
+            esp_err_t error=handle_management(&command);
+            if(error!=ESP_OK){
+                snprintf(operation,sizeof(operation),"删除未执行：%s；授权或设备身份已变化",esp_err_to_name(error));
+                check_result(error,"deferred identity-checked delete");
+            }
+        }
     }
     auto_enrollment_tick();
     start_queued_scan();
@@ -1585,6 +1620,7 @@ static int console_command(int argc, char **argv) {
                management_open(),management_open()?management_until-now_ms():0,requested_scan,scanning,candidate_count,
                trial.phase,trial.role,records_fault);
         printf("Auto enrollment=%u stage=%u BOOT-pressed=%u\n",auto_enrollment,auto_stage,gpio_get_level(GPIO_NUM_0)==0);
+        printf("Delete pending=%u\n",deletion_pending);
         printf("Input operation: %s\n",operation);
         if(trial.phase)printf("Trial target: " ESP_BD_ADDR_STR " transport=%u; previous registry retained\n",
                               ESP_BD_ADDR_HEX(trial.target.address),trial.target.transport);

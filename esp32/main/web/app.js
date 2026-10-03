@@ -17,22 +17,25 @@ function actionButton(label, handler, enabled, reason = '') {
   if (!enabled && reason) { button.title = reason; button.setAttribute('aria-label', `${label}：${reason}`); }
   button.addEventListener('click', handler); return button;
 }
-function managementBlock(data, pc = false) {
+function managementBlock(data, pc = false, deleting = false) {
   if (!data.management_open) return '未授权：长按 ESP32 BOOT 3 秒后松开';
   if (data.trial) return '正在录入设备：先取消或等待完成';
   if (data.input_storage_fault) return '输入存储异常，管理已锁定';
+  if (data.deletion_pending) return '正在处理已确认的删除，请等待结果';
   if (pc && (!data.pico_fresh || data.storage_fault)) return '电脑状态未知，不能删除';
-  if (data.auto_enrollment) return '自动录入中：先点“停止自动录入／手动管理”';
-  if (!pc && data.scanning) return '扫描中：等待完成或停止扫描';
+  if (!deleting && data.auto_enrollment) return '自动录入中：先点“停止自动录入／手动管理”';
+  if (!deleting && !pc && data.scanning) return '扫描中：等待完成或停止扫描';
   return '';
 }
 function deleteButton(node, label, address, fields, data, pc = false, saved = true) {
-  const reason = saved ? managementBlock(data, pc) : '此槽尚未保存设备';
+  const reason = saved ? managementBlock(data, pc, true) : '此槽尚未保存设备';
   node.append(actionButton(pc ? '删除此电脑' : '删除此设备', () => {
     if (confirm(`删除 ${label}（${address}）及其配对记录？此操作不可撤销。`))
       command(pc ? 'pc-delete' : 'delete', {...fields, address});
   }, saved && !reason, reason));
   if (reason) node.append(text('p', reason, 'control-note'));
+  else if (data.auto_enrollment || data.scanning)
+    node.append(text('p', '确认删除后会先停止自动录入／扫描，再删除指定记录', 'control-note'));
 }
 function text(tag, value, className) {
   const node = document.createElement(tag);
@@ -108,9 +111,10 @@ function render(data) {
   byId('management').textContent = data.management_open ? `已实体授权，剩余 ${Math.ceil(data.remaining_ms / 1000)} 秒${data.auto_enrollment ? ' · 自动录入开启' : ' · 手动管理'}${data.scan_waiting ? ' · 扫描排队中，将自动开始' : data.scanning ? ' · 扫描中' : ''}${data.trial ? ` · ${trialPhase}（${data.trial_role === 2 ? '鼠标' : '键盘'} ${data.trial_address}）` : ''}` :
     '管理未授权：长按 ESP32 BOOT 3 秒后松开；双击可开关热点。';
   byId('operation').textContent = data.operation || '';
-  byId('scan-classic').disabled = byId('scan-ble').disabled = !data.management_open || data.trial || data.scanning || data.input_storage_fault;
+  byId('scan-classic').disabled = byId('scan-ble').disabled = !data.management_open || data.trial ||
+    data.scanning || data.input_storage_fault || data.deletion_pending;
   byId('cancel').disabled = !data.management_open;
-  byId('manual').disabled = !data.management_open || data.trial;
+  byId('manual').disabled = !data.management_open || data.trial || data.deletion_pending;
   byId('records').replaceChildren(...(data.records || []).map(record => {
     const node = text('article', '', 'record');
     node.append(text('strong', `输入槽 ${record.slot} · ${record.saved ? (record.name || `${record.role === 1 ? '键盘' : '鼠标'}（名称尚未获取）`) : '未保存设备'}${record.active ? ' · 当前使用' : ''}`));
@@ -134,7 +138,7 @@ function render(data) {
       const full = (data.records || []).filter(r => r.saved).length >= 5;
       if (confirm(`将 ${candidate.name || candidate.address} 作为${role}？${full ? '槽已满，验证成功后淘汰最老记录。' : '原设备记录保留，失败恢复原设备。'}`))
         command('connect', {slot, candidate: candidate.id, address: candidate.address, replace: full});
-    }, data.management_open && !data.scanning && !data.trial && !data.input_storage_fault));
+    }, data.management_open && !data.scanning && !data.trial && !data.input_storage_fault && !data.deletion_pending));
     return node;
   }));
   const authKey = data.management_open && data.auth ?

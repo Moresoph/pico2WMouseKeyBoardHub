@@ -96,6 +96,7 @@ static esp_err_t status_api(httpd_req_t *request) {
     JSON_ADD(cJSON_AddNumberToObject(root, "uart_overflows", snapshot.overflows));
     JSON_ADD(cJSON_AddBoolToObject(root, "management_open", snapshot.management_open));
     JSON_ADD(cJSON_AddBoolToObject(root, "auto_enrollment", snapshot.auto_enrollment));
+    JSON_ADD(cJSON_AddBoolToObject(root, "deletion_pending", snapshot.deletion_pending));
     JSON_ADD(cJSON_AddBoolToObject(root, "scanning", snapshot.scanning));
     JSON_ADD(cJSON_AddBoolToObject(root, "scan_waiting", snapshot.scan_waiting));
     JSON_ADD(cJSON_AddBoolToObject(root, "trial", snapshot.trial));

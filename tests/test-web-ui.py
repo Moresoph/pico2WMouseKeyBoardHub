@@ -72,6 +72,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif self.server.mode == "missing_names":
                 for entry in payload["records"]: entry["name"]=""
                 for entry in payload["inputs"]: entry["name"]=""
+            elif self.server.mode == "deletion_pending":
+                payload.update(management_open=True,remaining_ms=100000,token="TEST",deletion_pending=True,
+                               operation="删除已排队：正在停止扫描")
             body = json.dumps(payload, ensure_ascii=False).encode()
             content_type = "application/json"
         elif path == "/test.js":
@@ -119,7 +122,7 @@ def main():
     worker.start()
     try:
         for mode in ("ready", "stale", "http_error", "malformed", "storage_fault", "management",
-                     "scan_waiting", "trial", "passkey", "automatic", "missing_names"):
+                     "scan_waiting", "trial", "passkey", "automatic", "missing_names", "deletion_pending"):
             server.mode, server.reads = mode, 0
             with tempfile.TemporaryDirectory(prefix="pico-web-browser-") as profile:
                 result = subprocess.run([
@@ -134,7 +137,7 @@ def main():
             assert server.reads >= 1, mode + ": JavaScript did not fetch the status API"
             assert dom.count('class="card') == 9, mode + ": missing input/computer cards"
             pc_dom = dom.split('<section id="computers"', 1)[1].split("</section>", 1)[0]
-            if mode in ("ready","management","scan_waiting","trial","passkey","automatic","missing_names"):
+            if mode in ("ready","management","scan_waiting","trial","passkey","automatic","missing_names","deletion_pending"):
                 assert 'class="card selected"' in dom and "HID 就绪" in dom
                 if mode!="missing_names": assert "&lt;script&gt;alert(1)&lt;/script&gt;" in dom
                 assert "<script>alert(1)</script>" not in dom
@@ -150,7 +153,11 @@ def main():
                     assert 'data-passkey-preserved="yes"' in dom
                     assert server.reads >= 2
                 if mode=="automatic":
-                    assert "自动录入开启" in dom and "自动录入中：先点" in dom
+                    assert "自动录入开启" in dom and "确认删除后会先停止" in dom
+                    assert '>删除此设备</button>' in dom
+                    assert 'aria-label="删除此设备：自动录入中' not in dom
+                if mode=="deletion_pending":
+                    assert "正在处理已确认的删除" in dom
                 if mode=="missing_names": assert "鼠标 · 名称尚未获取" in dom
                 if mode=="ready":
                     assert "Saved M720" in dom and "未授权：长按" in dom

@@ -5,7 +5,7 @@
 #include "hub_link.h"
 #include "hub_input_records.h"
 
-#define HUB_WEB_FIRMWARE "0.6.3-auto-input"
+#define HUB_WEB_FIRMWARE "0.6.4-delete-controls"
 #define HUB_WEB_CANDIDATES 16u
 typedef struct {
     uint8_t address[6], transport, type, roles;
@@ -33,7 +33,7 @@ typedef struct {
     hub_web_input_t inputs[HUB_LINK_SLOTS];
     hub_link_output_t output;
     hub_input_records_t records;
-    bool management_open, scanning, scan_waiting, trial, records_fault, auto_enrollment;
+    bool management_open, scanning, scan_waiting, trial, records_fault, auto_enrollment, deletion_pending;
     uint32_t remaining_ms, auth_number;
     char token[17], operation[192];
     uint8_t trial_role, trial_phase, trial_address[6];
