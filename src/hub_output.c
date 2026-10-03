@@ -59,6 +59,7 @@ typedef struct {
     unsigned queue_highwater;
     uint32_t mouse_merges, releases, release_errors, registration_errors, budget_yields;
     uint32_t motion_holds, motion_deadline_sends;
+    uint32_t keyboard_unchanged, mouse_unchanged;
 } output_metrics_t;
 
 typedef struct {
@@ -197,7 +198,7 @@ bool hub_output_storage_healthy(void) { return output_store.loaded && !output_st
 void hub_output_snapshot(hub_link_output_t *out) {
     memset(out, 0, sizeof(*out));
     out->selected = (uint8_t)(active_slot + 1);
-    out->version[0] = 0; out->version[1] = 6; out->version[2] = 1;
+    out->version[0] = 0; out->version[1] = 6; out->version[2] = 2;
     out->flags = (switch_pending ? HUB_LINK_OUTPUT_SWITCHING : 0) |
         (mouse_buffering ? HUB_LINK_OUTPUT_MOUSE_BUFFER : 0) |
         ((!output_store.loaded || output_store.fault) ? HUB_LINK_OUTPUT_STORAGE_FAULT : 0);
@@ -587,6 +588,24 @@ static bool queue_overflow(computer_t *computer, const char *reason) {
 bool hub_output_keyboard(const uint8_t report[8]) {
     computer_t *computer = computer_for_slot(active_slot);
     if (report == NULL || switch_pending || !hub_output_ready(active_slot)) return false;
+#if HUB_DUAL_BLUETOOTH
+    uint8_t normalized[8];
+    memcpy(normalized, report, sizeof(normalized));
+    normalized[1] = 0;
+    const uint8_t *previous = computer->last_keyboard;
+    for (unsigned i = computer->count; i > 0; --i) {
+        const output_event_t *queued = &computer->queue[(computer->head + i - 1) % OUTPUT_QUEUE_LENGTH];
+        if (queued->kind == RELEASE_KEYBOARD) {
+            previous = queued->value.keyboard;
+            break;
+        }
+    }
+    if (!memcmp(previous, normalized, sizeof(normalized))) {
+        ++output_metrics[computer->slot].keyboard_unchanged;
+        request_send(computer);
+        return true;
+    }
+#endif
     if (computer->count == OUTPUT_QUEUE_LENGTH) return queue_overflow(computer, "keyboard");
     unsigned tail = (computer->head + computer->count) % OUTPUT_QUEUE_LENGTH;
     output_event_t *event = &computer->queue[tail];
@@ -613,6 +632,13 @@ bool hub_output_mouse(uint8_t buttons, int32_t dx, int32_t dy, int32_t wheel) {
             break;
         }
     }
+#if HUB_DUAL_BLUETOOTH
+    if (!dx && !dy && !wheel && buttons == previous_buttons) {
+        ++output_metrics[computer->slot].mouse_unchanged;
+        request_send(computer);
+        return true;
+    }
+#endif
     bool pure_motion = !wheel && (dx || dy) && buttons == previous_buttons;
     uint32_t now_ms = btstack_run_loop_get_time_ms();
     bool first_motion = pure_motion && !computer->count && (!computer->motion_seen
@@ -1245,7 +1271,7 @@ void hub_output_latency_status(void) {
            low_latency ? "fast" : "baseline", OUTPUT_SERVICE_INTERVAL_MS,
            OUTPUT_PUMP_BUDGET, OUTPUT_PUMP_YIELD_MS);
     printf("[latency output] MCU queue-to-successful-ATT-notify us, NOT radio/end-to-end; "
-           "per-logical-PC since boot/reset across reconnects; enqueue=accepted calls incl merges; "
+           "per-logical-PC since boot/reset across reconnects; enqueue=queued calls incl merges, excludes unchanged; "
            "notify=ordinary packets incl split motion; timing=one sample/notify, oldest enqueue "
            "retained for merges/splits, excludes pre-reset events and safety releases\n");
     printf("[latency output] wait-bins=<1ms/1..<5ms/5..<10ms/10..<20ms/>=20ms; "
@@ -1259,6 +1285,8 @@ void hub_output_latency_status(void) {
                slot + 1, computer ? computer->count : 0, metrics->queue_highwater,
                metrics->mouse_merges, metrics->releases, metrics->release_errors,
                metrics->registration_errors, metrics->budget_yields);
+        printf("[latency output] PC%u unchanged-skipped keyboard=%" PRIu32 " mouse=%" PRIu32 "\n",
+               slot + 1, metrics->keyboard_unchanged, metrics->mouse_unchanged);
         for (unsigned kind = 0; kind < 2; ++kind) {
             const output_report_metrics_t *report = &metrics->reports[kind];
             printf("[latency output] PC%u %s enqueue=%" PRIu32 " notify=%" PRIu32

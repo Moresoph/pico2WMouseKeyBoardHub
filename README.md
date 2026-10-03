@@ -1,5 +1,39 @@
 # Pico 2 W Bluetooth keyboard/mouse hub
 
+**Pico output-load correction (`0.6.2-hid-dedup`):** the dual-board output backend
+no longer queues an unchanged keyboard snapshot or a mouse report with unchanged
+buttons and zero movement/wheel. Comparison uses the latest pending report of
+that kind, otherwise the last successfully notified report; this preserves
+press/release ordering even when the link is congested. Identical nonzero mouse
+movements and repeated wheel steps are still forwarded or accumulated without
+losing total movement. Safety releases, security gates, switching and reconnect
+synchronization still bypass normal suppression, and UART heartbeats/freshness
+remain unchanged. The single-radio backend retains its previous report behavior.
+
+This removes redundant keyboard reports between mouse events and allows adjacent
+motion merging without intentional buffering. `latency` reports per-PC
+`unchanged-skipped keyboard=... mouse=...`; enqueue counts now exclude unchanged
+reports. Host-controlled BLE intervals (including Mac's 15 ms) are not forced.
+Native dual-board tests exercise 5,000 complete snapshots on a credit-limited
+output, conserving all movement with a one-event motion queue, plus transitions,
+full queues, notify failures, release, switch, reconnect and security behavior.
+This verifies the redundant-report fix, not all causes of Mac radio delay.
+The identified Pico was updated on 2026-10-03 with UF2 SHA256
+`2640C2197B08C6F8CEBA6F06A460000964C7F39D33E9F6E7134861D5A2D32F95`.
+Full-flash readback matched 2,090 program blocks and all 893 non-program
+sectors remained unchanged, including Windows/Mac identity and bond storage.
+After reboot, PC1 and the newly enrolled Mac/PC3 reconnected encrypted/HID-ready;
+ESP32 `0.6.4-delete-controls` and its input configuration were not changed.
+Live PC1 observation showed 884 unchanged keyboard and 294 unchanged mouse
+reports skipped, with only 6 real keyboard and 596 mouse reports notified,
+queue peak 1, no overflow and mean MCU mouse queue wait 451 us. These are
+sampled runtime counters, not physical end-to-end latency.
+Mac retained its host-selected 15 ms interval. It was not selected in the final
+observation, and the user was unavailable for the requested continuous-movement
+test; post-update sustained Mac overflow/delay acceptance remains pending.
+No synthetic pointer motion or forced PC selection was used for validation.
+This is a separate follow-up commit to the unchanged `v0.6.3` release tag.
+
 **Post-release deletion fix (`0.6.4-delete-controls`):** physically authorized
 deletion is no longer disabled merely because automatic discovery is running.
 Confirming an input deletion stops discovery, waits up to six seconds for

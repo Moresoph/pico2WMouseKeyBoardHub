@@ -2,6 +2,48 @@
 
 更新日期：2026-10-01。最后一次用户确认：11:42，键盘已经能连接。
 
+## 2026-10-03 20:43 Pico 冗余 HID 报告修复（最新）
+
+用户报告切到 Mac 后鼠标逐渐延迟。修复前 live Mac/PC3
+`A4:83:E7:80:A9:61` 间隔15ms、latency0，队列曾满64，overflow从43
+涨到72，最大通知提交前等待约985ms。源码确认每次UART完整快照都把
+未变化键盘/零动作鼠标再入队，键盘插在移动中间阻断合并；这是真实效率
+缺陷，但尚不能证明全部Mac卡顿只由它引起。
+
+仅双板输出增加queue-aware去重：键盘比较最新同类待发送报告，
+没有则比较最后notify成功状态；鼠标只有零位移/零滚轮/按钮未变才跳过。
+相同非零移动、滚轮和down/up都保留，强制安全释放/切换/重连不去重；
+错误notify仍保留待发transition，满队列重复状态不产生overflow。
+UART完整状态/心跳/freshness不变，single-radio行为不改。
+`latency` 增加 `unchanged-skipped keyboard=... mouse=...`。
+
+Pico已刷 `0.6.2-hid-dedup`，源码及UART版本一致；ESP32未动，仍0.6.4。
+
+```text
+build\dual-hid-dedup\pico_bt_hub.uf2
+SHA256 2640C2197B08C6F8CEBA6F06A460000964C7F39D33E9F6E7134861D5A2D32F95
+```
+
+核序列F1812912A883CCE2，完整flash备份/读回：
+2090payload块一致、893非程序扇区不变，Windows/Mac keys均保留。
+备份 `backups\pico-f1812912a883cce2-before-hid-dedup-20261003-204203.bin`、
+`backups\pico-f1812912a883cce2-after-hid-dedup-before-boot-20261003-204203.bin`。
+
+原输出33组和新增dual生产测试通过：
+5000完整snapshot、8次入队/1次发送模拟、one-event移动队列、总移动守恒、
+重复key/zero-motion、fullqueue、notifyerror retry、switch/release/reconnect/security。
+实际PC1采样：skip keyboard884/mouse294，真实key6/mouse596通知，
+peak1/overflow0，鼠标MCU队列avg451us；两台PC重连/HIDready，加密正常；
+ESP键盘鼠标正常，input7.5ms、UARTfresh/framing-errors0。
+
+**Mac连续移动验收未完成**：最终选中PC1，用户不可响应切Mac约20秒请求。
+没有强制改变用户选中电脑、没有生成模拟移动；不要把PC1数据说成Mac改善
+或把重启后清零overflow说成解决。下一步用户切PC3后读取两次队列/通知/
+overflow/skip增量并观察真实手感。Mac15ms不等于不可用，不要强制反复
+重请求interval、增大queue掩盖问题。
+用户在21:04要求提交，本次去重修复作为独立后续commit保存；
+未推送，原v0.6.3标签和8efa3c2远端不改。
+
 **Git 更新（2026-10-03）：** `v0.6.3` 对应 `bd112dc`；
 0.6.4 删除修复作为后续独立提交保存在 `classic-hid-output`。
 用户已要求提交并推送；继续工作请使用该分支的最新提交。

@@ -49,7 +49,7 @@ static struct {
     uint16_t attribute;
     uint8_t data[8];
     uint16_t length;
-} notifications[512];
+} notifications[1024];
 static unsigned notification_count;
 static const uint8_t key_down[8] = {0, 0, 4};
 static const bd_addr_t private_address = {0x4a, 1, 2, 3, 4, 5};
@@ -219,7 +219,7 @@ uint8_t att_server_notify(hci_con_handle_t handle, uint16_t attribute,
     if (notify_error) return notify_error;
     assert(free_acl_slots > 0);
     if (track_acl_slots) --free_acl_slots;
-    assert(notification_count < 512);
+    assert(notification_count < sizeof(notifications) / sizeof(notifications[0]));
     notifications[notification_count].handle = handle;
     notifications[notification_count].attribute = attribute;
     notifications[notification_count].length = length;
@@ -269,7 +269,7 @@ static void boot(void) {
     motion_timer_callback = NULL;
     yield_timer_delay = 0;
     hub_output_init();
-    assert(mouse_buffering);
+    assert(mouse_buffering == !HUB_DUAL_BLUETOOTH);
     hub_output_start();
 }
 
@@ -358,10 +358,17 @@ static void subscribe(unsigned handle) {
 }
 
 static void ready_peer(unsigned handle, int index, bool private_addr) {
+#if HUB_DUAL_BLUETOOTH
+    bool was_pairing = pairing_window;
+    pairing_window = true;
+#endif
     connect_peer(handle, HCI_ROLE_SLAVE, index, private_addr);
     links[handle].key_size = 16;
     subscribe(handle); /* ATT may restore both CCCDs before SM identity is ready. */
     security_complete(handle);
+#if HUB_DUAL_BLUETOOTH
+    pairing_window = was_pairing;
+#endif
     pump();
     computer_t *computer = computer_for_handle((hci_con_handle_t)handle);
     assert(computer && computer->slot < 4 && hub_output_ready(computer->slot));
@@ -1588,7 +1595,172 @@ static void management_identity_deletion(void) {
     assert(!hub_output_forget(0,first.type,first.address));
 }
 
+#if HUB_DUAL_BLUETOOTH
+static void unchanged_keyboard_queue(void) {
+    fresh();
+    ready_peer(1, 0, false);
+    assert(notification_count == 2);
+    const uint8_t neutral[8] = {0};
+    for (unsigned i = 0; i < 1000; ++i) assert(hub_output_keyboard(neutral));
+    assert(!computers[0].count && notification_count == 2);
+    assert(output_metrics[0].keyboard_unchanged == 1000 && !output_metrics[0].reports[0].enqueued);
+    assert(hub_output_keyboard(key_down));
+    assert(computers[0].count == 1);
+    uint8_t same[8]; memcpy(same, key_down, sizeof(same)); same[1] = 0xff;
+    assert(hub_output_keyboard(same) && computers[0].count == 1);
+    assert(hub_output_mouse(0, 4, 0, 0));
+    assert(hub_output_keyboard(key_down) && computers[0].count == 2);
+    assert(hub_output_mouse(0, 4, 0, 0));
+    assert(computers[0].count == 2 && output_metrics[0].mouse_merges == 1);
+    assert(hub_output_keyboard(neutral));
+    assert(computers[0].count == 3);
+    assert(hub_output_keyboard(key_down) && computers[0].count == 4);
+    assert(hub_output_keyboard(key_down) && computers[0].count == 4);
+    pump();
+    assert(!computers[0].count);
+    assert(notifications[2].attribute == KEYBOARD_HANDLE && notifications[2].data[2] == 4);
+    assert(notifications[3].attribute == MOUSE_HANDLE && little_endian_read_16(notifications[3].data, 1) == 8);
+    assert(notifications[4].attribute == KEYBOARD_HANDLE && notifications[4].data[2] == 0);
+    assert(notifications[5].attribute == KEYBOARD_HANDLE && notifications[5].data[2] == 4);
+    unsigned count = notification_count;
+    assert(hub_output_keyboard(key_down)); pump(); assert(notification_count == count);
+}
+
+static void unchanged_mouse_preserves_actions(void) {
+    fresh(); ready_peer(1, 0, false);
+    for (unsigned i = 0; i < 1000; ++i) assert(hub_output_mouse(0, 0, 0, 0));
+    assert(!computers[0].count && output_metrics[0].mouse_unchanged == 1000);
+    synchronous_send = true;
+    unsigned sent = notification_count;
+    assert(hub_output_mouse(0, 5, -3, 0));
+    assert(hub_output_mouse(0, 5, -3, 0));
+    assert(notification_count == sent + 2);
+    assert(little_endian_read_16(notifications[sent].data, 1) == 5);
+    assert(little_endian_read_16(notifications[sent + 1].data, 1) == 5);
+    assert(hub_output_mouse(0, 0, 0, 1));
+    assert(hub_output_mouse(0, 0, 0, 1));
+    assert(notification_count == sent + 4);
+    synchronous_send = false;
+    assert(hub_output_mouse(1, 0, 0, 0));
+    assert(hub_output_mouse(1, 0, 0, 0) && computers[0].count == 1);
+    assert(hub_output_mouse(0, 0, 0, 0) && computers[0].count == 2);
+    assert(hub_output_mouse(1, 0, 0, 0) && computers[0].count == 3);
+    assert(hub_output_mouse(1, 0, 0, 0) && computers[0].count == 3);
+    pump();
+    assert(notifications[sent + 4].data[0] == 1);
+    assert(notifications[sent + 5].data[0] == 0);
+    assert(notifications[sent + 6].data[0] == 1);
+}
+
+static void full_queue_dedup_and_real_overflow(void) {
+    fresh(); ready_peer(1, 0, false); free_acl_slots = 0;
+    uint8_t key[8] = {0};
+    for (unsigned i = 0; i < OUTPUT_QUEUE_LENGTH; ++i) {
+        key[2] = (uint8_t)(4 + i % 2);
+        assert(hub_output_keyboard(key));
+    }
+    assert(computers[0].count == OUTPUT_QUEUE_LENGTH);
+    assert(hub_output_keyboard(key) && !computers[0].overflows);
+    assert(hub_output_mouse(0, 0, 0, 0) && !computers[0].overflows);
+    key[2] = 4;
+    assert(!hub_output_keyboard(key) && computers[0].overflows == 1);
+    assert(!computers[0].count && computers[0].release_pending == RELEASE_BOTH);
+    free_acl_slots = 8; pump();
+    assert(hub_output_ready(0) && notification_count == 4);
+    assert(hub_output_keyboard(key_down)); pump();
+    assert(notifications[notification_count - 1].data[2] == 4);
+}
+
+static void snapshot_flood_on_slow_output(void) {
+    fresh(); ready_peer(1, 0, false); hub_output_set_low_latency(true); free_acl_slots = 0;
+    const uint8_t neutral[8] = {0};
+    for (unsigned i = 0; i < 5000; ++i) {
+        assert(hub_output_keyboard(neutral));
+        assert(hub_output_mouse(0, 1, -1, 0));
+        assert(hub_output_keyboard(neutral)); /* An input heartbeat is not a keyboard event. */
+        assert(hub_output_mouse(0, 0, 0, 0));
+        assert(computers[0].count == 1 && !computers[0].overflows);
+        if (i % 8 == 7) {
+            free_acl_slots = 1; deliver(1); free_acl_slots = 0;
+        }
+    }
+    free_acl_slots = 8; pump(); run_main_callbacks();
+    assert(!computers[0].count && !computers[0].overflows);
+    assert(output_metrics[0].reports[0].enqueued == 0);
+    assert(output_metrics[0].keyboard_unchanged == 10000 && output_metrics[0].mouse_unchanged == 5000);
+    int x = 0, y = 0;
+    for (unsigned i = 2; i < notification_count; ++i) {
+        assert(notifications[i].attribute == MOUSE_HANDLE);
+        x += (int16_t)little_endian_read_16(notifications[i].data, 1);
+        y += (int16_t)little_endian_read_16(notifications[i].data, 3);
+    }
+    assert(x == 5000 && y == -5000); /* Repeated identical movements must never be lost. */
+}
+
+static void unchanged_safety_switch_reconnect(void) {
+    fresh(); ready_peer(1, 0, false); ready_peer(2, 1, false);
+    assert(hub_output_keyboard(key_down)); assert(hub_output_mouse(1, 2, 0, 0)); pump();
+    unsigned before = notification_count;
+    assert(hub_output_select(1)); pump();
+    assert(active_slot == 1);
+    assert(notification_count >= before + 2);
+    assert(hub_output_keyboard(key_down)); pump();
+    assert(notifications[notification_count - 1].handle == 2 && notifications[notification_count - 1].data[2] == 4);
+    assert(hub_output_mouse(1, 0, 0, 0)); pump();
+    before = notification_count; hub_output_release_all(); pump();
+    assert(notification_count == before + 4);
+    assert(!memcmp(computers[1].last_keyboard, (uint8_t[8]){0}, 8));
+    assert(computers[1].last_mouse[0] == 0);
+    assert(hub_output_keyboard(key_down)); pump();
+    assert(notifications[notification_count - 1].data[2] == 4);
+    disconnect_peer(2); tick(); ready_peer(3, 1, false);
+    assert(hub_output_ready(1));
+    assert(!memcmp(computer_for_slot(1)->last_keyboard, (uint8_t[8]){0}, 8));
+    assert(hub_output_keyboard(key_down)); pump();
+    assert(notifications[notification_count - 1].handle == 3 && notifications[notification_count - 1].data[2] == 4);
+    links[3].key_size = 0;
+    assert(!hub_output_keyboard(key_down) && !hub_output_mouse(1, 0, 0, 0));
+}
+
+static void unchanged_error_retry_does_not_drop_transition(void) {
+    fresh(); ready_peer(1, 0, false);
+    hub_output_set_low_latency(true);
+    notify_error = ATT_ERROR_INSUFFICIENT_RESOURCES;
+    assert(hub_output_keyboard(key_down)); deliver(1);
+    assert(computers[0].count == 1 && computers[0].last_keyboard[2] == 0);
+    assert(hub_output_keyboard(key_down) && computers[0].count == 1);
+    notify_error = 0; tick(); deliver(1);
+    assert(computers[0].count == 0 && computers[0].last_keyboard[2] == 4);
+    assert(hub_output_keyboard((uint8_t[8]){0}));
+    assert(hub_output_keyboard((uint8_t[8]){0}) && computers[0].count == 1);
+    deliver(1);
+    assert(computers[0].last_keyboard[2] == 0);
+    assert(hub_output_mouse(1, 0, 0, 0)); deliver(1);
+    notify_error = ATT_ERROR_INSUFFICIENT_RESOURCES;
+    assert(hub_output_mouse(0, 0, 0, 0)); deliver(1);
+    assert(computers[0].last_mouse[0] == 1 && computers[0].count == 1);
+    assert(hub_output_mouse(0, 0, 0, 0) && computers[0].count == 1);
+    notify_error = 0; tick(); deliver(1);
+    assert(!computers[0].last_mouse[0] && !computers[0].count);
+    /* Explicit release bypasses dedup even when both last reports are neutral. */
+    unsigned sent = notification_count;
+    hub_output_release_all(); pump();
+    assert(notification_count == sent + 2);
+}
+#endif
+
 int main(void) {
+#if HUB_DUAL_BLUETOOTH
+    unchanged_keyboard_queue();
+    unchanged_mouse_preserves_actions();
+    full_queue_dedup_and_real_overflow();
+    snapshot_flood_on_slow_output();
+    unchanged_safety_switch_reconnect();
+    unchanged_error_retry_does_not_drop_transition();
+    computer_status_snapshot();
+    management_identity_deletion();
+    puts("Dual-board queue-aware HID dedup: transitions, repeat movement/wheel, 5000-frame slow-output conservation, full queues, releases/switch/reconnect/security passed");
+#else
     migration_and_restore();
     provisional_and_duplicates();
     authentication_guards();
@@ -1623,5 +1795,6 @@ int main(void) {
     computer_status_snapshot();
     management_identity_deletion();
     puts("Output persistence/state-machine/latency tests passed (33 scenario groups)");
+#endif
     return 0;
 }
