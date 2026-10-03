@@ -24,10 +24,19 @@ static uint16_t crc16(const uint8_t *data, size_t length) {
     return crc;
 }
 
+static bool frame_valid(const hub_link_frame_t *f) {
+    if (!f->nonce) return false;
+    if (f->type == HUB_LINK_REQUEST) return !f->length && !f->session;
+    if (!f->session) return false;
+    if (f->type == HUB_LINK_STATE) return f->length == HUB_LINK_PAYLOAD;
+    if (f->type == HUB_LINK_OUTPUT) return f->length == HUB_LINK_OUTPUT_PAYLOAD;
+    if (f->type == HUB_LINK_UI) return f->length == 1 && f->payload[0] <= 1;
+    if (f->type == HUB_LINK_MANAGE) return f->length == 12;
+    return f->type == HUB_LINK_MANAGE_REPLY && f->length == 5 && f->payload[4] <= 1;
+}
+
 size_t hub_link_encode(const hub_link_frame_t *f, uint8_t wire[HUB_LINK_WIRE_MAX]) {
-    if (!f || !wire || !f->nonce ||
-        !((f->type == HUB_LINK_REQUEST && f->length == 0 && f->session == 0) ||
-          (f->type == HUB_LINK_STATE && f->length == HUB_LINK_PAYLOAD && f->session))) return 0;
+    if (!f || !wire || !frame_valid(f)) return 0;
     uint8_t raw[HUB_LINK_RAW_MAX] = {1, f->type};
     put32(raw + 2, f->nonce);
     put32(raw + 6, f->session);
@@ -57,7 +66,7 @@ bool hub_link_feed(hub_link_parser_t *p, uint8_t byte, hub_link_frame_t *f) {
         if (p->started && (p->length || p->discard || p->escaped)) {
             unsigned n = p->length;
             if (!p->discard && !p->escaped && n >= 15 && p->bytes[0] == 1 &&
-                p->bytes[12] <= HUB_LINK_PAYLOAD && n == 15u + p->bytes[12] &&
+                p->bytes[12] <= HUB_LINK_FRAME_PAYLOAD && n == 15u + p->bytes[12] &&
                 crc16(p->bytes, n - 2) ==
                     (uint16_t)(p->bytes[n - 2] | (uint16_t)p->bytes[n - 1] << 8)) {
                 memset(f, 0, sizeof(*f));
@@ -67,9 +76,7 @@ bool hub_link_feed(hub_link_parser_t *p, uint8_t byte, hub_link_frame_t *f) {
                 f->sequence = (uint16_t)(p->bytes[10] | (uint16_t)p->bytes[11] << 8);
                 f->length = p->bytes[12];
                 memcpy(f->payload, p->bytes + 13, f->length);
-                valid = f->nonce &&
-                    ((f->type == HUB_LINK_REQUEST && !f->length && !f->session) ||
-                     (f->type == HUB_LINK_STATE && f->length == HUB_LINK_PAYLOAD && f->session));
+                valid = frame_valid(f);
             }
             if (!valid) ++p->errors;
         }
@@ -136,4 +143,67 @@ bool hub_link_unpack(const hub_link_frame_t *f, hub_link_input_t inputs[HUB_LINK
     }
     memcpy(inputs, decoded, sizeof(decoded));
     return true;
+}
+
+void hub_link_pack_output(hub_link_frame_t *f, const hub_link_output_t *s) {
+    f->type = HUB_LINK_OUTPUT;
+    f->length = HUB_LINK_OUTPUT_PAYLOAD;
+    f->payload[0] = 1;
+    f->payload[1] = s->selected;
+    f->payload[2] = s->flags;
+    memcpy(f->payload + 3, s->version, 3);
+    for (unsigned i = 0; i < HUB_LINK_PC_SLOTS; ++i) {
+        uint8_t *p = f->payload + 6 + i * 10;
+        const hub_link_pc_t *pc = &s->computers[i];
+        p[0] = pc->flags;
+        p[1] = pc->address_type;
+        memcpy(p + 2, pc->address, 6);
+        p[8] = (uint8_t)pc->interval;
+        p[9] = (uint8_t)(pc->interval >> 8);
+    }
+}
+
+bool hub_link_unpack_output(const hub_link_frame_t *f, hub_link_output_t *s) {
+    if (f->type != HUB_LINK_OUTPUT || f->length != HUB_LINK_OUTPUT_PAYLOAD ||
+        f->payload[0] != 1 || !f->payload[1] || f->payload[1] > HUB_LINK_PC_SLOTS ||
+        (f->payload[2] & ~31u)) return false;
+    hub_link_output_t value = {.selected = f->payload[1], .flags = f->payload[2]};
+    memcpy(value.version, f->payload + 3, 3);
+    for (unsigned i = 0; i < HUB_LINK_PC_SLOTS; ++i) {
+        const uint8_t *p = f->payload + 6 + i * 10;
+        hub_link_pc_t *pc = &value.computers[i];
+        pc->flags = p[0];
+        pc->address_type = p[1];
+        memcpy(pc->address, p + 2, 6);
+        pc->interval = (uint16_t)(p[8] | (uint16_t)p[9] << 8);
+        if ((pc->flags & ~31u) || pc->address_type > 1 ||
+            (!(pc->flags & HUB_LINK_PC_RESERVED) && pc->flags) ||
+            (!(pc->flags & HUB_LINK_PC_CONNECTED) &&
+             ((pc->flags & (HUB_LINK_PC_ENCRYPTED | HUB_LINK_PC_READY | HUB_LINK_PC_SUSPENDED)) || pc->interval)) ||
+            ((pc->flags & HUB_LINK_PC_CONNECTED) && (pc->interval < 6 || pc->interval > 3200)) ||
+            ((pc->flags & HUB_LINK_PC_READY) &&
+             (!(pc->flags & HUB_LINK_PC_ENCRYPTED) || (pc->flags & HUB_LINK_PC_SUSPENDED)))) return false;
+    }
+    *s = value;
+    return true;
+}
+
+bool hub_link_receive_output(hub_link_output_cache_t *cache, const hub_link_frame_t *f,
+                             uint32_t nonce, uint32_t session, uint32_t now) {
+    if (!nonce || !session || f->nonce != nonce || f->session != session) return false;
+    if (cache->valid && cache->nonce == nonce && cache->session == session) {
+        uint16_t distance = (uint16_t)(f->sequence - cache->sequence);
+        if (!distance || distance >= 0x8000u) return false;
+    }
+    hub_link_output_t value;
+    if (!hub_link_unpack_output(f, &value)) return false;
+    *cache = (hub_link_output_cache_t){.valid = true, .nonce = nonce, .session = session,
+        .received_at = now, .sequence = f->sequence, .value = value};
+    return true;
+}
+
+bool hub_link_output_fresh(const hub_link_output_cache_t *cache,
+                           uint32_t nonce, uint32_t session, uint32_t now) {
+    return cache->valid && nonce && session && cache->nonce == nonce && cache->session == session &&
+        (uint32_t)(now - cache->received_at) < HUB_LINK_OUTPUT_TIMEOUT_MS;
 }

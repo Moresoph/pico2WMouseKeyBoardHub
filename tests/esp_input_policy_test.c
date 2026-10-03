@@ -17,6 +17,13 @@ int main(void) {
     assert(!input_classic_admitted(true, false, false, false, false));
     assert(!input_classic_admitted(false, false, true, true, true));
     assert(!input_classic_admitted(true, true, true, true, true));
+    for (unsigned bits = 0; bits < 64; ++bits) {
+        bool selected = (bits & 1) != 0, paused = (bits & 2) != 0;
+        bool pending = (bits & 4) != 0, incoming = (bits & 8) != 0;
+        bool device = (bits & 16) != 0, acl = (bits & 32) != 0;
+        assert(input_classic_acl_pending(selected, paused, pending, incoming, device, acl) ==
+               (selected && !paused && pending && incoming && !device && acl));
+    }
 
     assert(!input_pairing_window_open(true, false, 10, 0));
     assert(!input_pairing_window_open(false, false, 10, 20));

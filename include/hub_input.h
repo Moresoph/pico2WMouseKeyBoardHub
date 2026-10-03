@@ -27,6 +27,9 @@ bool hub_input_radio_busy(void);
 bool hub_input_enroll_start(void);
 void hub_input_enroll_stop(void);
 bool hub_input_enrolling(void);
+#if HUB_DUAL_BLUETOOTH
+bool hub_input_link_online(void);
+#endif
 
 /* Bit 0 = input 1, bit 1 = input 2. Forget only these inputs, then enroll replacements. */
 bool hub_input_forget(unsigned slot_mask);

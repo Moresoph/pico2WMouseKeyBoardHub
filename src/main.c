@@ -13,6 +13,7 @@
 
 #include "hub_config.h"
 #include "hub_button.h"
+#include "hub_ui.h"
 #include "hub_input.h"
 #include "hub_output.h"
 #include "hub_passkey.h"
@@ -86,8 +87,16 @@ static uint32_t keyboard_auth_ticket;
 static uint32_t keyboard_auth_deadline;
 static hub_button_t enrollment_button;
 static uint32_t next_button_sample;
+#if !HUB_DUAL_BLUETOOTH
 static bool button_reset_accepted;
+#endif
 static int last_status_led = -1;
+#if HUB_DUAL_BLUETOOTH
+static hub_ui_button_t runtime_button;
+static uint32_t ui_ack_until;
+static uint32_t ui_error_until;
+static hub_ui_fault_clock_t fault_clock;
+#endif
 
 static bool ble_pairing_active(void) {
     for (unsigned i = 0; i < MAX_NR_HCI_CONNECTIONS; ++i) {
@@ -327,6 +336,45 @@ static bool forget_inputs(unsigned mask) {
 static void poll_enrollment_button(uint32_t now) {
     if (!working || boot_pending || (int32_t)(now - next_button_sample) < 0) return;
     next_button_sample = now + 25u;
+#if HUB_DUAL_BLUETOOTH
+    hub_ui_action_t action = hub_ui_tick(&runtime_button, hub_bootsel_pressed(), now);
+    if (action == HUB_UI_SHORT || action == HUB_UI_DOUBLE) {
+        if (hub_security_pairing_open() || keyboard_passkey.active) close_pairing_window("physical button cancel");
+        else {
+            unsigned selected = hub_output_active_slot();
+            for (unsigned step = 1; step < HUB_COMPUTER_COUNT; ++step) {
+                unsigned next = (selected + step) % HUB_COMPUTER_COUNT;
+                if (hub_output_ready(next)) { hub_router_select(next); break; }
+            }
+        }
+    } else if (action == HUB_UI_LONG) {
+        if (hub_input_enrolling() || !hub_input_keyboard_ready() || ble_pairing_active()) {
+            printf("[button] PC pairing rejected: finish input enrollment/connect keyboard first\n");
+            ui_ack_until = 0;
+            ui_error_until = now+10000;
+        } else if (!hub_output_pairing_prepare()) {
+            printf("[button] PC pairing unavailable: storage/radio context busy\n");
+            ui_error_until=now+10000;
+        }
+        else {
+            keyboard_pairing_mode = computer_pairing_policy = pairing_enabled = true;
+            just_works_pairing_mode = false;
+            hub_security_configure(HUB_SECURITY_PC_KEYBOARD);
+            pairing_deadline = now + HUB_PAIRING_WINDOW_MS;
+            hub_router_release_all();
+            printf("[button] PC keyboard-code pairing open for 120 seconds; records full => oldest replaced after encrypted success\n");
+        }
+    }
+    hub_ui_led_t mode = keyboard_passkey.active ? HUB_LED_CODE :
+        hub_security_pairing_open() ? HUB_LED_PAIR :
+        (!hub_input_link_online() || !hub_output_storage_healthy() ||
+         (ui_error_until && (int32_t)(now-ui_error_until)<0)) ? HUB_LED_FAULT :
+        (hub_output_slot_saved(hub_output_active_slot()) && !hub_output_ready(hub_output_active_slot())) ? HUB_LED_RECONNECT :
+        ui_ack_until && (int32_t)(now - ui_ack_until) < 0 ? HUB_LED_ACK : HUB_LED_OFF;
+    if(runtime_button.long_press && runtime_button.stable)mode=HUB_LED_PAIR;
+    bool fault_led=hub_ui_fault_tick(&fault_clock,mode==HUB_LED_FAULT,now);
+    bool led = mode==HUB_LED_FAULT?fault_led:hub_ui_led(mode,now);
+#else
     hub_button_action_t action = hub_button_tick(&enrollment_button, hub_bootsel_pressed(), now);
     if (action == HUB_BUTTON_ENROLL) {
         printf("[button] short press: requesting input enrollment\n");
@@ -339,6 +387,7 @@ static void poll_enrollment_button(uint32_t now) {
         && enrollment_button.reset_sent && button_reset_accepted;
     bool led = reset_feedback ? (now / 75u) % 2u
                               : hub_input_enrolling() ? (now / 250u) % 2u : true;
+#endif
     if (last_status_led != (int)led) {
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led);
         last_status_led = led;
@@ -484,6 +533,10 @@ static void security_event(uint8_t packet_type, uint16_t channel,
             break;
         case SM_EVENT_PAIRING_COMPLETE:
             handle = sm_event_pairing_complete_get_handle(packet);
+#if HUB_DUAL_BLUETOOTH
+            if (hub_security_pairing_open() && sm_event_pairing_complete_get_status(packet) == ERROR_CODE_SUCCESS)
+                ui_ack_until = btstack_run_loop_get_time_ms() + 1000;
+#endif
             set_pairing_active(handle, false);
             if ((keyboard_pairing_mode || just_works_pairing_mode)
                 && !hub_input_is_connection(handle)) {
@@ -521,6 +574,9 @@ static void controller_event(uint8_t packet_type, uint16_t channel,
                 hub_output_start();
                 hub_input_start();
                 cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+#if HUB_DUAL_BLUETOOTH
+                ui_ack_until = btstack_run_loop_get_time_ms() + 500;
+#endif
                 printf("\nPico 2 W Bluetooth Hub %s ready. Enter help.\n", PICO_PROGRAM_VERSION_STRING);
 #if HUB_CLASSIC_OUTPUT_TEST
                 gap_local_bd_addr(address);
@@ -531,7 +587,8 @@ static void controller_event(uint8_t packet_type, uint16_t channel,
                     printf("[open-test] Classic Level 0, mode 2; only saved explicit bridge authorizations restore\n");
                 }
                 printf("Pairing is closed. No input is generated automatically.\n");
-                printf("BOOTSEL: short press enrolls inputs; eight-second hold forgets inputs only.\n");
+                printf(HUB_DUAL_BLUETOOTH ? "BOOTSEL: short switches ready PC; release after 3s opens PC pairing; no button clears bonds.\n" :
+                       "BOOTSEL: short press enrolls inputs; eight-second hold forgets inputs only.\n");
             }
             break;
         case HCI_EVENT_META_GAP:
@@ -749,6 +806,8 @@ static void print_help(void) {
 #endif
 #if HUB_CLASSIC_OUTPUT_TEST
         "  select 1                   Only PC1 exists in this experiment\n"
+#elif HUB_DUAL_BLUETOOTH
+        "  select <1..7>              Select a ready saved PC; four radio contexts\n"
 #else
         "  select <1..4>              Keep all PC connections established\n"
 #endif
@@ -766,6 +825,8 @@ static void print_help(void) {
 #endif
 #if !HUB_DUAL_BLUETOOTH
         "BOOTSEL while running: short=enroll; hold 8 seconds=input-only reset.\n"
+#else
+        "BOOTSEL: short=next ready PC/cancel pairing; hold 3 seconds then release=PC keyboard-code pairing.\n"
 #endif
         "\n");
 }

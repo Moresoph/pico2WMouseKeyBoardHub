@@ -145,6 +145,7 @@ int sm_le_device_index(hci_con_handle_t handle) {
     return links[handle].index;
 }
 int le_device_db_max_count(void) { return 8; }
+void le_device_db_remove(int i) { assert(i>=0 && i<8); bonds[i].type = -1; bonds[i].key_size = 0; }
 void le_device_db_info(int i, int *type, bd_addr_t address, sm_key_t irk) {
     assert(i >= 0 && i < 8 && irk == NULL);
     ++db_reads;
@@ -157,6 +158,10 @@ void le_device_db_encryption_get(int i, uint16_t *ediv, uint8_t rand[8], sm_key_
     assert(ediv == NULL && rand == NULL && key == NULL);
     assert(authenticated == NULL && authorized == NULL && sc == NULL);
     *size = bonds[i].key_size;
+}
+uint16_t gap_le_connection_interval(hci_con_handle_t handle) {
+    assert(handle < TEST_HANDLES && links[handle].connected);
+    return 6;
 }
 uint8_t gap_encryption_key_size(hci_con_handle_t handle) {
     assert(handle < TEST_HANDLES);
@@ -1539,6 +1544,50 @@ static void buffer_boundary_wake_and_overflow(void) {
     assert(nonneutral_notifications() == ordinary && !computers[0].release_pending);
 }
 
+static void computer_status_snapshot(void) {
+    fresh();
+    hub_link_output_t output;
+    hub_output_snapshot(&output);
+    assert(output.selected == 1 && !output.computers[0].flags);
+    ready_peer(1, 0, false);
+    hub_output_snapshot(&output);
+    assert(output.computers[0].flags == 15 && output.computers[0].interval == 6);
+    assert(!output.computers[1].flags);
+    computers[0].suspended = true;
+    hub_output_snapshot(&output);
+    assert((output.computers[0].flags & HUB_LINK_PC_SUSPENDED) &&
+           !(output.computers[0].flags & HUB_LINK_PC_READY));
+    computers[0].suspended = false;
+    links[1].key_size = 0;
+    hub_output_snapshot(&output);
+    assert(!(output.computers[0].flags & (HUB_LINK_PC_READY | HUB_LINK_PC_ENCRYPTED)));
+    computers[0].disconnecting = true;
+    hub_output_snapshot(&output);
+    assert(output.computers[0].flags == HUB_LINK_PC_RESERVED && !output.computers[0].interval);
+    output_store.fault = true;
+    hub_output_snapshot(&output);
+    assert(output.flags & HUB_LINK_OUTPUT_STORAGE_FAULT);
+}
+
+static void management_identity_deletion(void) {
+    fresh();
+    ready_peer(1, 0, false);
+    ready_peer(2, 1, false);
+    hub_output_identity_t first=output_store.identities[0], second=output_store.identities[1];
+    uint8_t wrong[6];memcpy(wrong,first.address,6);wrong[5]^=1;
+    unsigned writes=flash_writes;
+    assert(!hub_output_forget(0,first.type,wrong) && flash_writes==writes);
+    pairing_window=true;
+    assert(!hub_output_forget(0,first.type,first.address) && flash_writes==writes);
+    pairing_window=false;
+    assert(hub_output_forget(0,first.type,first.address));
+    assert(!output_store.identities[0].reserved && output_store.identities[1].reserved);
+    assert(output_store.selected==1 && hub_output_active_slot()==1);
+    assert(!hub_output_ready(0) && computer_for_slot(0)==NULL);
+    assert(!memcmp(output_store.identities[1].address,second.address,6));
+    assert(!hub_output_forget(0,first.type,first.address));
+}
+
 int main(void) {
     migration_and_restore();
     provisional_and_duplicates();
@@ -1571,6 +1620,8 @@ int main(void) {
     buffer_timer_and_notify_failures();
     buffer_pending_toggle_and_idle();
     buffer_boundary_wake_and_overflow();
-    puts("Output persistence/state-machine/latency tests passed (31 scenario groups)");
+    computer_status_snapshot();
+    management_identity_deletion();
+    puts("Output persistence/state-machine/latency tests passed (33 scenario groups)");
     return 0;
 }

@@ -30,3 +30,43 @@ $exe = Join-Path $out 'esp_input_policy_test.exe'
 if ($LASTEXITCODE) { throw 'ESP32 input policy compilation failed' }
 & $exe
 if ($LASTEXITCODE) { throw 'ESP32 input policy tests failed' }
+$exe = Join-Path $out 'link_output_test.exe'
+& $cc -Wall -Werror "-I$root\include" "$root\tests\link_output_test.c" "$root\src\hub_link.c" -o $exe
+if ($LASTEXITCODE) { throw 'Computer telemetry compilation failed' }
+& $exe
+if ($LASTEXITCODE) { throw 'Computer telemetry tests failed' }
+$exe = Join-Path $out 'classic_security_bridge_test.exe'
+& $cc -Wall -Werror "-I$root\include" "-I$root\esp32\main" `
+    "-I$root\tests\esp_stubs" `
+    "-I$root\.deps\esp-idf\components\esp_common\include" `
+    "$root\tests\classic_security_bridge_test.c" -o $exe
+if ($LASTEXITCODE) { throw 'Classic encryption bridge compilation failed' }
+& $exe
+if ($LASTEXITCODE) { throw 'Classic encryption bridge tests failed' }
+$exe = Join-Path $out 'esp_reconnect_test.exe'
+& $cc -Wall -Werror "-I$root\esp32\main" "$root\tests\esp_reconnect_test.c" -o $exe
+if ($LASTEXITCODE) { throw 'Reconnect policy compilation failed' }
+& $exe
+if ($LASTEXITCODE) { throw 'Reconnect policy tests failed' }
+foreach($suite in @('ui_records','pc_slots')){
+    $exe=Join-Path $out "$($suite)_test.exe"
+    & $cc -Wall -Werror -DHUB_DUAL_BLUETOOTH=1 "-I$root\include" "-I$btstack" "$root\tests\$($suite)_test.c" -o $exe
+    if($LASTEXITCODE){throw "$suite compilation failed"}
+    & $exe
+    if($LASTEXITCODE){throw "$suite tests failed"}
+}
+$cmake = Join-Path $root '.tools\python\cmake\data\bin\cmake.exe'
+& $cmake "-DROOT=$root" "-DOUTPUT=$out\input_management_generated.inc" -P "$root\tests\generate_enrollment_test.cmake"
+if($LASTEXITCODE){throw 'Production enrollment extraction failed'}
+$exe=Join-Path $out 'input_enrollment_test.exe'
+& $cc -Wall -Werror "-I$out" "-I$root\include" "-I$root\esp32\main" "-I$root\tests\esp_stubs" `
+    "-I$root\.deps\esp-idf\components\esp_common\include" "$root\tests\input_enrollment_test.c" `
+    "$root\src\hub_link.c" -o $exe
+if($LASTEXITCODE){throw 'Production enrollment compilation failed'}
+& $exe
+if($LASTEXITCODE){throw 'Production enrollment tests failed'}
+$exe=Join-Path $out 'ap_password_test.exe'
+& $cc -Wall -Werror "-I$root\esp32\main" "$root\tests\ap_password_test.c" -o $exe
+if($LASTEXITCODE){throw 'AP password policy compilation failed'}
+& $exe
+if($LASTEXITCODE){throw 'AP password policy tests failed'}

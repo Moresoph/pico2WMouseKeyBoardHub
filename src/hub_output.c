@@ -67,6 +67,7 @@ typedef struct {
     bool disconnecting;
     bool rejected;
     bool authentication_complete;
+    bool enrollment_authorized;
     bool identity_authenticated;
     bool suspended;
     bool send_registered;
@@ -186,6 +187,38 @@ unsigned hub_output_active_slot(void) {
 
 bool hub_output_switching(void) {
     return switch_pending;
+}
+bool hub_output_slot_saved(unsigned slot) {
+    return output_store.loaded && !output_store.fault && slot<HUB_COMPUTER_COUNT &&
+        output_store.identities[slot].reserved;
+}
+bool hub_output_storage_healthy(void) { return output_store.loaded && !output_store.fault; }
+
+void hub_output_snapshot(hub_link_output_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->selected = (uint8_t)(active_slot + 1);
+    out->version[0] = 0; out->version[1] = 6; out->version[2] = 1;
+    out->flags = (switch_pending ? HUB_LINK_OUTPUT_SWITCHING : 0) |
+        (mouse_buffering ? HUB_LINK_OUTPUT_MOUSE_BUFFER : 0) |
+        ((!output_store.loaded || output_store.fault) ? HUB_LINK_OUTPUT_STORAGE_FAULT : 0);
+    for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) {
+        hub_link_pc_t *pc = &out->computers[i];
+        const hub_output_identity_t *identity = &output_store.identities[i];
+        if (identity->reserved) {
+            pc->flags = HUB_LINK_PC_RESERVED;
+            pc->address_type = identity->type;
+            memcpy(pc->address, identity->address, 6);
+        }
+        if (hub_security_pairing_open()) out->flags |= HUB_LINK_OUTPUT_PAIRING;
+        computer_t *computer = computer_for_slot(i);
+        if (computer && computer->occupied && !computer->disconnecting) {
+            pc->flags |= HUB_LINK_PC_CONNECTED;
+            pc->interval = gap_le_connection_interval(computer->handle);
+            if (gap_encryption_key_size(computer->handle) >= 16) pc->flags |= HUB_LINK_PC_ENCRYPTED;
+            if (hub_output_ready(i)) pc->flags |= HUB_LINK_PC_READY;
+            if (computer->suspended) pc->flags |= HUB_LINK_PC_SUSPENDED;
+        }
+    }
 }
 
 uint16_t hub_output_active_handle(void) {
@@ -756,11 +789,67 @@ static void update_advertising(void) {
     if (!started) return;
     unsigned occupied = 0;
     for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) occupied += computers[i].occupied;
-    advertising_requested = occupied < HUB_COMPUTER_COUNT;
+    advertising_requested = occupied < HUB_PC_CONNECTION_LIMIT;
     gap_advertisements_enable(advertising_requested);
     printf("[output] legacy connectable advertising requested=%u occupied=%u/%u "
            "(controller capacity unproven)\n",
            advertising_requested, occupied, HUB_COMPUTER_COUNT);
+}
+
+static void remove_identity_bond(const hub_output_identity_t *identity) {
+    for (int i = 0; i < le_device_db_max_count(); ++i) {
+        int type = -1;
+        bd_addr_t address;
+        le_device_db_info(i, &type, address, NULL);
+        if (type == identity->type && !memcmp(address, identity->address, 6)) {
+            le_device_db_remove(i);
+            return;
+        }
+    }
+}
+
+bool hub_output_forget(unsigned slot, uint8_t type, const uint8_t address[6]) {
+    if (slot >= HUB_COMPUTER_COUNT || hub_security_pairing_open() || switch_pending ||
+        hub_output_store_find(&output_store, type, address) != (int)slot) return false;
+    hub_output_identity_t old = output_store.identities[slot];
+    if (!hub_output_store_forget(&output_store, slot)) return false;
+    computer_t *computer = computer_for_slot(slot);
+    if (computer) {
+        slot_connections[slot] = NULL;
+        computer->identity_authenticated = false;
+        computer->rejected = true;
+        require_release(computer);
+        uint8_t status = gap_disconnect(computer->handle);
+        computer->disconnecting = status == ERROR_CODE_SUCCESS;
+        if (status) printf("[output] forget disconnect failed=0x%02x; service will retry\n", status);
+        computer->auth_deadline = btstack_run_loop_get_time_ms();
+    }
+    active_slot = output_store.selected;
+    hub_router_release_all();
+    remove_identity_bond(&old);
+    memset(&output_metrics[slot], 0, sizeof(output_metrics[slot]));
+    printf("[output] PC%u forgotten by authorized management request\n", slot + 1);
+    return true;
+}
+
+bool hub_output_pairing_prepare(void) {
+    if (output_store.fault || !output_store.loaded || switch_pending) return false;
+    unsigned count = 0;
+    for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) count += computers[i].occupied;
+    if (count < HUB_PC_CONNECTION_LIMIT) return true;
+    computer_t *victim = NULL;
+    for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) {
+        computer_t *p = &computers[i];
+        if (!p->occupied || p->slot >= HUB_COMPUTER_COUNT || p->slot == active_slot || p->disconnecting) continue;
+        if (!victim || output_store.identities[p->slot].order < output_store.identities[victim->slot].order)
+            victim = p;
+    }
+    if (!victim) return false;
+    uint8_t status = gap_disconnect(victim->handle);
+    if (status) { printf("[output] free pairing radio context failed=0x%02x\n", status); return false; }
+    victim->disconnecting = true;
+    printf("[output] PC%u disconnected for pairing capacity; saved record retained\n", victim->slot + 1);
+    return true;
 }
 
 static void connected(uint8_t *packet) {
@@ -789,6 +878,7 @@ static void connected(uint8_t *packet) {
     }
     memset(computer, 0, sizeof(*computer));
     computer->occupied = true;
+    computer->enrollment_authorized = hub_security_pairing_open();
     computer->slot = HUB_COMPUTER_COUNT;
     computer->handle = handle;
     computer->release_pending = RELEASE_BOTH;
@@ -855,11 +945,29 @@ static void bind_identity(computer_t *computer) {
         return;
     }
     if (slot < 0) {
+        hub_output_identity_t removed = {0};
+#if HUB_DUAL_BLUETOOTH
+        if (!computer->enrollment_authorized) { reject_computer(computer, "new slot requires explicit pairing"); return; }
+        int oldest = hub_output_store_oldest(&output_store);
+        bool full = true;
+        for (unsigned i = 0; i < HUB_COMPUTER_COUNT; ++i) full &= output_store.identities[i].reserved;
+        if (full && oldest >= 0) removed = output_store.identities[oldest];
+#endif
         slot = hub_output_store_claim(&output_store, (uint8_t)type, identity);
+        if (slot >= 0 && removed.reserved) {
+            computer_t *old = slot_connections[slot];
+            if (old && old != computer) {
+                slot_connections[slot] = NULL;
+                reject_computer(old, "oldest saved PC replaced after new encrypted pairing");
+            }
+            remove_identity_bond(&removed);
+            memset(&output_metrics[slot], 0, sizeof(output_metrics[slot]));
+            hub_router_release_all();
+        }
         if (slot < 0) {
             if (output_store.fault) storage_fault();
             reject_computer(computer, output_store.fault ? "identity persistence failed"
-                                                        : "all four identities reserved");
+                                                        : "identity slot unavailable");
             return;
         }
     }
@@ -1070,7 +1178,7 @@ static void service(btstack_timer_source_t *timer) {
 }
 
 void hub_output_init(void) {
-    _Static_assert(HUB_COMPUTER_COUNT == 4, "This feasibility firmware has four PC slots");
+    _Static_assert(HUB_COMPUTER_COUNT == HUB_OUTPUT_STORE_SLOTS, "PC storage and routing slot count must match");
     _Static_assert(sizeof(HUB_DEVICE_NAME) - 1 <= 29, "BLE scan-response name too long");
     low_latency = continuation_registered = pump_timer_armed = false;
     mouse_buffering = !HUB_DUAL_BLUETOOTH;
@@ -1080,7 +1188,7 @@ void hub_output_init(void) {
     pump_registration.context = NULL;
     btstack_run_loop_set_timer_handler(&pump_timer, pump_after_yield);
     /* BTstack otherwise stops legacy connectable advertising after one link. */
-    gap_set_max_number_peripheral_connections(HUB_COMPUTER_COUNT);
+    gap_set_max_number_peripheral_connections(HUB_PC_CONNECTION_LIMIT);
     att_server_init(profile_data, read_attribute, write_attribute);
     hci_registration.callback = hci_event;
     hci_add_event_handler(&hci_registration);

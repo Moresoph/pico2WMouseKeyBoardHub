@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PicoHub · 键鼠中继</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header><div><p class="eyebrow">ESP32 + PICO 2 W</p><h1>键鼠中继状态</h1></div><span id="health" class="badge unknown">正在读取</span></header>
+    <p class="intro">每 2 秒更新 · 保存 5 个输入／7 台电脑 · 正常状态灯熄灭</p>
+    <section class="summary"><div><small>当前控制</small><strong id="selected">状态未知</strong></div><div><small>串口通信</small><strong id="uart">状态未知</strong></div><div><small>电脑状态</small><strong id="freshness">等待 Pico</strong></div></section>
+    <div id="error" role="alert" hidden></div>
+    <h2>输入设备 <small>连接到 ESP32</small></h2>
+    <section id="inputs" class="grid inputs" aria-live="polite"></section>
+    <h2>电脑 <small>连接到 Pico 2 W</small></h2>
+    <section id="computers" class="grid computers" aria-live="polite"></section>
+    <h2>设备管理 <small>ESP32 BOOT 长按 3 秒后松开：自动录入新键鼠</small></h2>
+    <p id="management">管理未授权；网页只能查看状态。</p>
+    <p id="operation"></p>
+    <div class="actions"><button id="manual" disabled>停止自动录入／手动管理</button><button id="scan-classic" disabled>扫描 Classic</button><button id="scan-ble" disabled>扫描 BLE</button><button id="cancel" disabled>取消管理</button></div>
+    <p>长按后自动扫描并连接唯一、明确的新键盘／鼠标；多个同类候选时请手动选择。删除或修改名称前先进入“手动管理”。未授权按钮显示原因，不代表记录丢失。</p>
+    <p>满槽按首次录入顺序淘汰最老记录（不是最近使用时间）；新设备加密与 HID 验证成功后才替换。输入一次只启用一把键盘和一只鼠标。</p>
+    <h3>已保存输入</h3><section id="records" class="grid"></section>
+    <h3>扫描候选</h3><section id="candidates" class="grid"></section>
+    <div id="auth"></div>
+    <p id="command-result" role="status"></p>
+    <footer><p id="network">正在读取热点信息…</p><p id="versions">固件信息等待更新</p><p id="updated">尚未收到有效状态</p><p>热点没有互联网；连接手机时请选择“保持连接”。电脑的蓝牙控制不要求连接这个热点。</p></footer>
+  </main>
+</body>
+</html>

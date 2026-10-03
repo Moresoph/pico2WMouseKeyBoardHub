@@ -65,6 +65,16 @@ int main(void) {
     assert(disconnected[0] == 1 && disconnected[1] == 1);
     assert(hub_external_receive(&state, &f, 0xfffffff0));
     assert(state.online && connected[0] == 1 && connected[1] == 1 && motion == 0);
+    hub_link_output_t output = {.selected = 1, .version = {0,5,2}};
+    hub_link_frame_t telemetry = {.nonce = f.nonce, .session = f.session};
+    hub_link_pack_output(&telemetry, &output);
+    assert(hub_external_receive(&state, &telemetry, 100));
+    assert(state.last_rx == 0xfffffff0 && state.accepted == 1 && motion == 0);
+    hub_link_frame_t control={.type=HUB_LINK_UI,.length=1,.nonce=f.nonce,.session=f.session};
+    assert(hub_external_receive(&state,&control,100));
+    control.type=HUB_LINK_MANAGE;control.length=12;
+    assert(hub_external_receive(&state,&control,101));
+    assert(state.last_rx==0xfffffff0 && state.accepted==1);
     assert(!hub_external_expired(&state, 0x10));
     assert(hub_external_expired(&state, 0x1e4));
     assert(hub_external_receive(&state, &f, 10)); /* Duplicate doesn't refresh the watchdog. */

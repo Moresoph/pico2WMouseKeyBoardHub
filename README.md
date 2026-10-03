@@ -1,6 +1,222 @@
 # Pico 2 W Bluetooth keyboard/mouse hub
 
-**Current usable setup:** ESP32 `0.5.1-bonded-reconnect` receives the FILCO
+**Release checkpoint: `v0.6.3` (2026-10-03).** See
+[RELEASE-NOTES.md](RELEASE-NOTES.md) for firmware identities, deployed image
+hashes and acceptance limits. ESP32 is deployed as `0.6.3-auto-input`; Pico
+source builds as `0.6.1-fault-lamp`, while the attached Pico remains on
+`0.6.0-slots-buttons`. Automatic new-mouse physical acceptance is still pending.
+
+## Button and saved-slot controls (0.6.0)
+
+### Automatic input enrollment and readable controls (ESP32 0.6.3)
+
+Long-press ESP32 BOOT for at least three seconds and release: the physically
+authorized window now automatically scans BLE followed by Classic. A single
+new HID mouse or keyboard with an unambiguous advertised role is automatically
+connected, encrypted, checked against its actual HID descriptor, saved and made
+active. Previously saved identities and hub names (including the Pico itself)
+are excluded. Multiple fresh candidates of the same role stop automatic selection
+and request an explicit page choice; generic HID with no keyboard/mouse role
+also requires manual choice. No RSSI/model-name guessing or automatic
+confirmation of a security code is used.
+
+The existing old-target cleanup, provisional pairing and failure rollback
+remain in force. A uniquely identified keyboard and mouse can be enrolled
+sequentially within the same authorization. A completed admission closes the
+window when no other new candidate remains. No discovered device is paired
+when the window is closed. The USB console's explicit `enroll [auto|manual|cancel]`
+uses the same paths for operator-driven diagnostics; HTTP cannot open its own
+authorization. To delete records without auto enrollment, long-press to authorize
+and then use **Stop automatic enrollment / Manual management** on the page.
+
+Device names are learned from advertisements or the connected HID device and
+persisted in a CRC-checked version-2 input registry, alongside the five identities,
+active roles and FIFO order. Version-1 (68-byte) records migrate without dropping
+addresses, age or keys. Names remain visible when the device is offline or after
+reboot. Devices that have not supplied a name are explicitly labeled
+“name not yet obtained”; operators can set a name in authorized manual management.
+Names are length-bounded, serialized/escaped as text and never interpreted as HTML.
+Older v1-only firmware cannot load the upgraded name-bearing registry; do not
+downgrade firmware alone after migration or erase bonds to bypass a schema error.
+
+The old grey disabled buttons could appear blank/unclear. Delete buttons now
+retain high-contrast text for current inputs, saved records and all PC cards.
+Unauthorized, busy, unconfigured and stale states show their reason alongside
+the disabled button. Deletion still requires explicit confirmation, physical
+authorization, matching identity and (for PCs) a Pico acknowledgement.
+Native checks execute the production management/candidate/trial functions,
+including both unique mouse/keyboard auto admission, ambiguity/known-hub guards,
+old-record retention and name persistence. Browser checks cover eleven states,
+including readable disabled deletion controls, saved/missing names and auto mode.
+Live operator `enroll auto` (the same admission path as a BOOT long press) confirmed
+automatic BLE/Classic scan cycling, waiting for the old BLE worker, and exclusion
+of the Pico broadcast. M585/M590 was no longer advertising in that bounded run,
+so actual new physical-mouse pairing is not claimed; the test window was cancelled
+and both old input records retained. Pico firmware was not changed for this task.
+The final ESP32 application was identity-checked, flash-verified and deployed,
+SHA256 `A275AE4557A7CC464A4BC548C7DF20F700F4F9251783A1ACD2D873D6A8BD371C`.
+NVS was byte-identical before/after flashing, before reboot; the previous scan
+run already migrated the input registry without losing active FILCO/M720 records.
+The final startup confirmed SoftAP/HTTP on `PicoHub-9235`; a subsequent console
+read again encountered a transient CH340 USB access error. The actual physical
+button/new-mouse admission and final phone-page appearance still need user
+acceptance. No saved input/PC was destructively deleted for validation.
+
+The dual-board variant saves **five input records** and **seven PC records**.
+These are storage limits, not a guarantee of 12 simultaneous radio links.
+ESP32 keeps one active keyboard and one active mouse chosen from its five
+records. Pico has seven logical PC identities and retains a four-peripheral
+connection limit; simultaneous four-PC capacity remains a hardware acceptance
+item. Selecting another ready PC works through BOOTSEL or Ctrl+Alt+Left/Right.
+
+| Runtime gesture | ESP32 BOOT (GPIO0) | Pico BOOTSEL |
+| --- | --- | --- |
+| Short press/release | Normal-status acknowledgement; during management, cancel | Next ready PC; during PC pairing, cancel |
+| Double click | Toggle Wi-Fi/HTTP | Same next-ready action, no destructive function |
+| Hold at least 3 s, then release | Open 120 s authorization and auto-scan/enroll unique new inputs; start hotspot if off | Open 120 s keyboard-code PC pairing |
+
+Long actions happen on release. Buttons held during startup must first be
+released and do not invoke runtime actions. EN/RESET still resets. Holding
+BOOT/BOOTSEL while powering up can enter the normal ROM download mode.
+No runtime button gesture clears all records.
+
+Normal status LEDs are OFF. Startup gives a short acknowledgement; reconnect
+is one 100 ms flash every 2 s; pairing/management is 500 ms on/off; code entry
+is 100 ms on/off; faults repeat 2 seconds steadily ON followed by 2 seconds of
+100 ms ON/OFF flashing (a 4-second cycle starting steadily ON when fault
+indication becomes active); successful pairing
+acknowledges briefly. ESP32 reports active inputs and UART, Pico reports UART
+and the currently selected PC. Unselected offline PCs are not faults.
+The ESP32 red power LED is not software-controlled.
+
+Connect to the existing protected hotspot and open `http://192.168.4.1/`.
+Long-press ESP32 BOOT to start automatic enrollment. For manual administration,
+choose **Stop automatic enrollment / Manual management**, then scan Classic
+or BLE candidates, choose a specific named/addressed device as keyboard or mouse,
+activate a stored input, or explicitly confirm deletion of an input/PC slot.
+Unknown advertisements are never auto-selected by RSSI or scan order; only a
+unique, new, explicitly classified keyboard/mouse is auto-admitted in the window.
+Legacy FILCO PIN remains `123456` + Enter on the new keyboard when prompted;
+SSP confirmation/passkeys have explicit page controls. PC pairing requires an
+already-connected keyboard for the computer's code and never silently falls
+back to Just Works. Incoming unknown pairings stay rejected outside explicit
+target authorization.
+
+When full, the oldest **first-admitted** record is evicted, not the
+least-recently-used device. Reconnection/activation does not change age.
+Input candidates are provisional until encrypted HID with the requested role
+is confirmed; cancel, timeout, wrong HID role or pairing failure restores the
+previous input record. Old records/bonds are not discarded before a successful
+replacement is persisted. PC replacement follows authenticated encrypted
+identity binding; a failed new pairing does not claim or evict a PC slot.
+If the oldest evicted input was the other currently active role, that role
+becomes unconfigured until another saved input is activated.
+
+Deletion requires physical ESP32 authorization, a window token, explicit
+address identity and same-origin JSON POST. PC deletion crosses a session/nonce
+checked UART request and is only reported complete after Pico acknowledgement;
+missing acknowledgement is reported as uncertain, never success.
+An explicitly deleted active device is released/disconnected and its own
+bond removed; no other device keys are erased.
+
+Existing two-input NVS records and four-PC PHO1 storage are loaded/migrated
+without losing identities, selection or bonds. Historical records did not
+store admission timestamps: their initial FIFO order is deterministically
+slot order. New admissions persist FIFO order. UART input payload stays 46 bytes;
+seven-PC output status becomes 76 bytes, with separate authorization and
+acknowledged management frames. Update both boards together.
+The old single-board configuration retains its four slots and old button
+behavior; the new gestures/capacity are dual-board-only.
+
+### New mouse enrollment correction (ESP32 0.6.2)
+
+An enrolled M720 is not a permanent or exclusive target. Any selected Classic
+or BLE HID mouse can occupy the active mouse role after encrypted HID validation,
+while up to five input records remain saved. ESP32 `0.6.2-input-enrollment`
+corrects discovery requests rejected solely because the old device was still
+in a reconnect/open call: the requested scan is queued, background offline
+reconnects are held while management is open, and discovery starts once the
+in-flight operation ends. The wait is bounded and explicitly reported; it does
+not cancel an SDK-owned BLE open unsafely or erase the old bond.
+
+Discovery retains named/HID candidates rather than filling the list with
+anonymous unrelated broadcasts, and prioritizes HID candidates at capacity.
+The page shows queued scanning, the exact new trial address, waiting/validation/
+rollback phase and Chinese operation results. Selecting a new device after
+waiting gets a fresh 120-second target-specific pairing budget. Passkey entry
+is kept intact across status refreshes. Pressing BOOT only authorizes management;
+it does not guess which nearby mouse to pair.
+
+Native regression coverage uses the actual production management/discovery/
+trial functions, with only SDK/NVS/queue boundaries mocked. It verifies adding
+an unfamiliar mouse despite an existing saved mouse, not saving before encryption,
+preserving keyboard/old mouse, switching back, failure/cancel/expiry/wrong-role/
+write-error rollback, queued scanning and stale candidate/token rejection.
+This is software-path validation, not a claim that every physical mouse works.
+Rollback closes the management window so the restored old target can reconnect
+immediately rather than staying held until authorization expires.
+
+On 2026-10-03 the identified ESP32 received the final `0.6.2-input-enrollment`
+application, SHA256
+`E9A7DBD37C3863A0B807147BCC0EA9DD627DCD54B3B113227D05F5B1C3596AF5`.
+Application verification passed and NVS was byte-identical before/after flashing,
+before reboot. Pico was not reflashed and remains `0.6.0-slots-buttons`.
+Live reads before and after the rollback correction confirmed both original
+input records/active selections, no storage fault, UART and PC telemetry.
+An intermediate console read encountered a CH340 access-denied error, but the
+last read succeeded on COM15 and confirmed the deployed 0.6.2 identity.
+A new physical mouse was not
+available for the actual pairing test; do not treat native trial tests as proof
+of that particular mouse's radio/HID compatibility. Reopen physical management
+and use the phone page to scan/select the new mouse without deleting M720 first.
+
+Fault-lamp revision `0.6.1-fault-lamp` implements the 2-second solid / 2-second
+fast-flash pattern on both boards, including fresh entry and timer wraparound.
+Both images build and the regression checks pass. The standalone 0.6.1 images
+were **not deployed**:
+only Pico COM5 was detected at that check. The later ESP32 0.6.2 enrollment
+deployment includes its new fault lamp; Pico still has its old 0.6.0 lamp.
+The ESP32 build path now contains 0.6.2 and the Pico build path contains pending
+0.6.1; do not confuse current build files with the original 0.6.0 deployments.
+The previously deployed 0.6.0 binaries are retained locally as
+`backups\esp32-0.6.0-slots-buttons-deployed-20261003.bin` and
+`backups\pico-0.6.0-slots-buttons-deployed-20261003.uf2`.
+
+```powershell
+.\tools\build-esp32.ps1 -BuildDirectory build\esp32-slots-buttons
+.\tools\build.ps1 -DualBluetooth -BuildDirectory build\dual-slots-buttons -Jobs 4
+.\tests\test-dual-bt.ps1
+.\tests\test-output.ps1
+python .\tests\test-web-ui.py
+```
+
+Deployment on 2026-10-03: both boards received `0.6.0-slots-buttons`.
+ESP32 application SHA256
+`6A4E4D8D64C1E20A1EF9AF1ECC2C9A480E3F68A6AE16C99D897268668201E7B9`;
+Pico UF2 SHA256
+`D0259472D9C19493E7ED9C59127166D13AC281DE0860A81F9BD55CB8DE0F100F`.
+ESP32 MAC was confirmed, the application was flash-verified and its 24,576-byte
+NVS partition was identical before/after writing, before boot. Pico readback
+matched 2,088 program blocks and all 893 non-program sectors were unchanged.
+Pico runtime confirmed seven slots, retained PC1/PC2 identities, encrypted
+HID-ready PC1 at 7.5 ms, mouse buffer OFF and fresh UART telemetry.
+
+Native tests cover actual IDF Classic=0/BLE=1 migration, FIFO admission,
+failed-trial copy preservation, CRC, active-input deletion, four-to-seven-PC
+storage migration, failed writes, exact identity deletion, release gestures,
+quiet LEDs and separate control frames. Browser tests cover seven-PC/five-input
+rendering, expired/error states and physical-authorization controls. A first
+deployment exposed an enum mismatch in input migration; it was corrected,
+regression-tested and reflashed without deleting any saved target/bond.
+The final ESP32 console read is blocked by recurring CH340 USB disappearance/
+access errors. The host has only its active Internet Wi-Fi connection and no
+permission to interrupt it, so final real-device web/button/new-pairing/deletion
+acceptance remains pending; destructive deletion of existing user records was
+not used as a test. Use a phone on the protected hotspot to finish acceptance.
+The following 0.5.x observations describe historical baselines, not this new
+revision's LED, slot-count or HTTP management behavior.
+
+**Historical accepted setup:** ESP32 `0.5.1-bonded-reconnect` receives the FILCO
 Classic keyboard and M720 BLE mouse, then forwards input over UART to Pico 2 W
 `0.5.0-dual-bluetooth`, which provides BLE HID output to the computer. Keyboard
 and mouse forwarding to PC1 is hardware-confirmed; four-PC switching acceptance
@@ -67,6 +283,162 @@ baseline's three-link recovery observation.
 This is an opt-in, two-firmware alternative to the single-radio and USB Host
 experiments. Keyboard/mouse forwarding to PC1 is hardware-accepted; simultaneous
 four-PC connections and physical switching acceptance are not yet established.
+
+### Reboot reconnection recovery (ESP32 0.5.3)
+
+The BLE HID open call can block for tens of seconds while a mouse is asleep.
+It now runs in a dedicated worker, separate from Classic HID submissions and
+the 100 ms connection/LED/deadline monitor. Setup is serialized within each
+transport, not across both radios' input protocols; a missing mouse cannot hold
+the saved Classic keyboard's reconnect scheduling or incoming HID completion.
+Successful OPEN callbacks alone own live HID pointers. The value returned by
+the SDK open call is never retained, because its callback may already have
+closed/freed the device before the call returns.
+
+Normal connection/HID/encryption deadlines now trigger release, link cleanup
+and automatic retry with capped 1/2/4/8/15-second backoff, rather than permanently
+pausing the input. A still-running BLE worker is never duplicated. Existing
+Classic ACLs without HID get a five-second profile grace; stalled ACL cleanup
+is posted to the Bluetooth thread, checks the exact live connection handle and
+does not remove bonds. Unknown targets, missing pairing consent, actual
+authentication/key failures, unsupported descriptors and malformed input retain
+their safety gates. No ordinary retry opens a pairing window or accepts a PIN.
+
+Encryption completions carry a unique request token, preventing a late result
+from an earlier attempt from authorizing a replacement attempt. An encryption
+OFF notification during initial setup does not destroy the HID descriptor;
+loss of established encryption still immediately releases input and cleans up.
+`status` reports `worker`, `recovering`, `profile-request`, retry count and delay
+in addition to actual ACL/HID/encryption status. Sleeping keyboards still need
+normal key wake-up on their original paired channel; this is not re-pairing.
+The ESP32 application component is size-optimized (`-Os`) to fit the unchanged
+partition layout. Pico firmware and mouse/output timing parameters are unchanged.
+
+The first live deployment observation confirmed that Classic retries continue
+during a blocked BLE open, retry delay caps at 15 seconds, saved FILCO bond is
+present and neither input is permanently paused. Both devices still timed out
+without responding in that bounded run, before keyboard authentication; this
+does not prove lost keys or successful physical reconnection. Physical wake-up
+on the original paired channels is required for repeated reboot acceptance.
+Final recovery image deployed on 2026-10-01: application SHA256
+`34D305F6C0909AE1E7CFECE2D162AFE20359A21BCA3131CCCA2B62CF12BDFA43`,
+size `0x175950` with 5,808 bytes remaining in the unchanged app partition.
+The identified ESP32 was application-flashed and verified after a current NVS
+backup; the Pico was not reflashed. The final bounded reboot observation again
+showed independent retries, `bonded=1`, no timeout pause and no PIN/new pairing
+window, but no response from either physical input. The user was unavailable
+for device wake-up, so repeated encrypted keyboard reconnection is not yet
+accepted. Pico PC1 remained encrypted/HID-ready at 7.5 ms, mouse buffer OFF,
+with an online UART link and zero framing errors.
+
+### Local SoftAP status website
+
+The optional-management firmware revision `0.5.2-softap-status` starts an
+ESP32-only Wi-Fi hotspot `PicoHub-XXXX` with a fixed management address
+`http://192.168.4.1`. It does not join a router, require the router's password,
+or provide Internet access/NAT. Connect the phone or management computer to
+this hotspot and explicitly keep the connection when the OS reports no Internet.
+The computers controlled over Pico Bluetooth do not need to join the hotspot.
+
+The WPA2 hotspot password is generated independently on first boot and saved
+in the ESP32 `hub_web` NVS namespace. It is not the keyboard pairing PIN, is
+not hard-coded in source, and is never returned by HTTP. Run `web` on the ESP32
+USB console to read the SSID/password. `web off` stops HTTP and the Wi-Fi radio
+without disabling Bluetooth; `web on` restores them. These switches are RAM-only;
+the hotspot starts on reboot. Maximum management clients: two.
+`web password <new-password>` on the USB console saves and verifies an
+8–63-character printable ASCII password in the local `hub_web` namespace,
+then reapplies the protected hotspot configuration. An active hotspot briefly
+disconnects clients and restarts; Bluetooth target/bond settings are not changed.
+The selected password is device-local, never embedded in public source or HTTP.
+Use a nontrivial password when nearby unauthorized access matters.
+The USB password-command image was application-flashed and verified on
+2026-10-03, SHA256
+`54735CFEBC3A1E23D0D7FE47E52A4E6F76B8E8674E75BD3612341A759EDC790D`.
+Existing NVS was byte-identical through that update. The first attempt to change
+the local password was blocked by COM15 disappearing. After the user replugged
+USB at 18:56, the password command and subsequent `web` status confirmed the
+requested local password and hotspot ON. The actual device password is not
+included in source or documentation.
+
+The phone-friendly page uses only embedded HTML/CSS/JavaScript, fetching
+read-only `/api/status` every two seconds without overlapping requests.
+It reports the two selected inputs, saved bonds, encrypted/HID readiness, and
+the Pico's four logical computer slots, active selection and mouse-buffer state.
+It never displays actual keystrokes, mouse movement, or pairing keys. Unknown
+input names fall back to the slot/address; stored PCs are labeled PC1 through PC4.
+No pairing, selection, forgetting, or other state-changing HTTP endpoint exists.
+
+Pico `0.5.2-dual-web-telemetry` sends a separate 46-byte output-status payload
+once per second over the existing 460800-baud UART. Input reports and their
+100 ms heartbeat/500 ms fail-safe are unchanged. Computer telemetry has separate
+sequence numbers and uses bounded, non-blocking UART TX, with heartbeats scheduled
+before new telemetry frames. Computer telemetry also has
+sequence/session checks; duplicates cannot refresh its three-second freshness
+deadline, and telemetry cannot keep the input watchdog alive. Missing/old Pico
+telemetry, UART loss, HTTP errors and pairing-storage faults are explicitly
+shown as unknown, never as cached online success. Update both boards: an older
+Pico can still forward input but cannot provide computer status.
+
+Wi-Fi/Classic/BLE share the ESP32 radio. Low-frequency status access, Wi-Fi/HTTP
+on core 1, bounded buffers and snapshot-only HTTP handlers reduce contention,
+but do not guarantee unchanged physical input latency. Use `web off` to compare
+against the working Bluetooth-only setup. No DNS/captive-portal auto-launch is
+implemented; type the fixed IP address into the browser.
+Wi-Fi IRAM/RX-IRAM throughput optimizations are disabled to fit Classic/BLE plus
+Wi-Fi into this original ESP32's IRAM; Bluetooth controller configuration is
+retained. This is a small status server, not a high-throughput network service.
+The hotspot uses 20 MHz channel width. ESP-IDF marks SoftAP-with-connected-clients
+plus Classic/BLE as supported but performance-unstable (C1), so actual coexistence
+and reconnection still need physical checks. After a five-second grace, a bonded
+incoming Classic ACL without HID is completed by host HID setup on the existing
+ACL when the serialized connection worker is available; waiting behind another input must not pause it as an
+authentication timeout. Encryption is taken from GAP events, never inferred
+from the existence of a saved bond.
+An incoming HID can open without producing the expected GAP encryption event.
+For a mapped Classic target without confirmed encryption, a version-locked
+IDF bridge requests BR/EDR encryption on the Bluetooth stack thread. Completion
+reads the live ACL and actual stack encryption flag; a success status or saved
+bond alone is insufficient. Results are queued without blocking the stack and
+matched to the ACL generation so a delayed callback cannot authorize a new
+connection. Missing keys still encounter the existing explicit pairing gate;
+this path never opens a pairing window or permits plaintext forwarding.
+
+Build and run the related checks without replacing the previously saved images:
+
+```powershell
+.\tools\build-esp32.ps1 -BuildDirectory build\esp32-dual-web
+.\tools\build.ps1 -DualBluetooth -BuildDirectory build\dual-web -Jobs 4
+.\tests\test-dual-bt.ps1
+.\tests\test-output.ps1
+python .\tests\test-web-ui.py
+```
+
+Deployment observation on 2026-10-01: the final ESP32 application SHA256 is
+`B43FB16E5B6F2A32E00EDADF5233852150E1DCA8A467363AF266919690662B3F`;
+Pico UF2 SHA256 is
+`5F75CEBD3477C41C11AE763673732661F6B8061468B08A5825F266F86FC7680D`.
+ESP32 updates were application-only after NVS backups. Pico full-flash readback
+matched all 2,060 program blocks and all 895 non-program sectors were unchanged,
+including computer pairing storage. Real HTTP/browser checks verified four
+computer slots: PC1 encrypted/HID-ready at 7.5 ms, PC2 saved/offline, PC3/4 empty,
+fresh UART telemetry and mouse buffer OFF. HTTP POST was rejected; the API did
+not contain hotspot passwords, link keys, or actual input data.
+
+The last live Bluetooth check after the encryption update confirmed FILCO
+`HID=1 encrypted=1 bonded=1` with 72 decoded reports, and M720
+`HID=1 encrypted=1` with 720 reports at actual
+`interval=7.500ms latency=44 timeout=2160ms`. Both slots were unpaused with no
+pending connection or plaintext exception. At 11:42 the user confirmed keyboard
+connection had recovered. The normal GAP encryption event was observed in this
+successful session; the extra encryption-request branch was covered by native
+tests, not independently forced in that session. Earlier hotspot/browser and
+off/on checks passed, but the management PC was disconnected from the hotspot at
+the final read-only check. Latest combined keyboard-plus-active-web-client
+smoothness and long-term C1 coexistence are not certified; no additional flashing
+or Bluetooth parameter changes were performed after this user confirmation.
+The current image fits the existing app partition with only 4,640 bytes spare;
+future additions must be size-checked rather than silently changing partitions.
 
 ```text
 Bluetooth keyboard + mouse -> ESP32 (Classic HID / BLE HOGP host)

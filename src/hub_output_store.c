@@ -34,17 +34,18 @@ static bool fail(hub_output_store_t *store, const char *reason) {
 
 static void encode(const hub_output_store_t *store, uint8_t record[HUB_OUTPUT_STORE_BYTES]) {
     memset(record, 0, HUB_OUTPUT_STORE_BYTES);
-    memcpy(record, "PHO1", 4);
-    record[4] = 1;
+    memcpy(record, HUB_DUAL_BLUETOOTH ? "PHO2" : "PHO1", 4);
+    record[4] = HUB_DUAL_BLUETOOTH ? 2 : 1;
     record[5] = (uint8_t)store->selected;
     record[6] = HUB_OUTPUT_STORE_SLOTS;
     for (unsigned i = 0; i < HUB_OUTPUT_STORE_SLOTS; ++i) {
         const hub_output_identity_t *identity = &store->identities[i];
         if (!identity->reserved) continue;
-        uint8_t *entry = &record[8 + 8 * i];
+        uint8_t *entry = &record[8 + (HUB_DUAL_BLUETOOTH ? 9 : 8) * i];
         entry[0] = 1;
         entry[1] = identity->type;
         memcpy(&entry[2], identity->address, 6);
+        if (HUB_DUAL_BLUETOOTH) entry[8] = identity->order;
     }
     uint32_t crc = record_crc(record, HUB_OUTPUT_STORE_BYTES - 4);
     for (unsigned i = 0; i < 4; ++i)
@@ -61,21 +62,23 @@ int hub_output_store_find(const hub_output_store_t *store, uint8_t type,
     return -1;
 }
 
-static bool decode(hub_output_store_t *store, const uint8_t record[HUB_OUTPUT_STORE_BYTES]) {
-    if (memcmp(record, "PHO1", 4) || record[4] != 1
-        || record[5] >= HUB_OUTPUT_STORE_SLOTS
-        || record[6] != HUB_OUTPUT_STORE_SLOTS || record[7]) return false;
+static bool decode(hub_output_store_t *store, const uint8_t *record, unsigned length) {
+    bool legacy = length == 44 && !memcmp(record, "PHO1", 4) && record[4] == 1 && record[6] == 4;
+    if ((!legacy && (length != HUB_OUTPUT_STORE_BYTES || memcmp(record, "PHO2", 4) ||
+                    record[4] != 2 || record[6] != HUB_OUTPUT_STORE_SLOTS || !HUB_DUAL_BLUETOOTH)) ||
+        record[5] >= record[6] || record[7]) return false;
     uint32_t crc = 0;
     for (unsigned i = 0; i < 4; ++i)
-        crc |= (uint32_t)record[HUB_OUTPUT_STORE_BYTES - 4 + i] << (8 * i);
-    if (crc != record_crc(record, HUB_OUTPUT_STORE_BYTES - 4)) return false;
+        crc |= (uint32_t)record[length - 4 + i] << (8 * i);
+    if (crc != record_crc(record, length - 4)) return false;
     hub_output_store_t decoded = {0};
     decoded.selected = record[5];
     bool any = false;
-    for (unsigned i = 0; i < HUB_OUTPUT_STORE_SLOTS; ++i) {
-        const uint8_t *entry = &record[8 + 8 * i];
+    unsigned orders = 0, next_order = 0;
+    for (unsigned i = 0; i < record[6]; ++i) {
+        const uint8_t *entry = &record[8 + (legacy ? 8 : 9) * i];
         if (entry[0] == 0) {
-            for (unsigned j = 1; j < 8; ++j)
+            for (unsigned j = 1; j < (legacy ? 8u : 9u); ++j)
                 if (entry[j]) return false;
             continue;
         }
@@ -84,6 +87,10 @@ static bool decode(hub_output_store_t *store, const uint8_t record[HUB_OUTPUT_ST
         decoded.identities[i].reserved = true;
         decoded.identities[i].type = entry[1];
         memcpy(decoded.identities[i].address, &entry[2], 6);
+        unsigned order = legacy ? ++next_order : entry[8];
+        if (!order || order > HUB_OUTPUT_STORE_SLOTS || (orders & (1u << order))) return false;
+        orders |= 1u << order;
+        decoded.identities[i].order = (uint8_t)order;
         any = true;
     }
     if ((any && !decoded.identities[decoded.selected].reserved)
@@ -108,9 +115,9 @@ bool hub_output_store_load(hub_output_store_t *store) {
                "by bonded, encrypted PC connections\n");
         return true;
     }
-    if (length != HUB_OUTPUT_STORE_BYTES
+    if ((length != HUB_OUTPUT_STORE_BYTES && !(HUB_DUAL_BLUETOOTH && length == 44))
         || tlv->get_tag(context, HUB_OUTPUT_STORE_TAG, record, sizeof(record)) != length
-        || !decode(store, record)) return fail(store, "Malformed/unsupported " HUB_OUTPUT_STORE_NAME " record");
+        || !decode(store, record, (unsigned)length)) return fail(store, "Malformed/unsupported " HUB_OUTPUT_STORE_NAME " record");
     printf("[output-store] restored identities and selected PC%u\n", store->selected + 1);
     return true;
 }
@@ -136,17 +143,52 @@ int hub_output_store_claim(hub_output_store_t *store, uint8_t type,
     if (!store->loaded || store->fault || !hub_output_identity_valid(type, address)) return -1;
     int existing = hub_output_store_find(store, type, address);
     if (existing >= 0) return existing;
-    for (unsigned i = 0; i < HUB_OUTPUT_STORE_SLOTS; ++i) {
-        if (store->identities[i].reserved) continue;
+    int target = -1;
+    for (unsigned i = 0; i < HUB_OUTPUT_STORE_SLOTS; ++i)
+        if (!store->identities[i].reserved) { target = (int)i; break; }
+    if (target < 0 && HUB_DUAL_BLUETOOTH) target = hub_output_store_oldest(store);
+    if (target >= 0) {
+        unsigned i = (unsigned)target;
         hub_output_store_t next = *store;
+        unsigned removed = next.identities[i].order, newest = 0;
+        for (unsigned j = 0; j < HUB_OUTPUT_STORE_SLOTS; ++j) {
+            if (j == i || !next.identities[j].reserved) continue;
+            if (removed && next.identities[j].order > removed) --next.identities[j].order;
+            if (next.identities[j].order > newest) newest = next.identities[j].order;
+        }
         next.identities[i].reserved = true;
+        next.identities[i].order = (uint8_t)(newest + 1);
         next.identities[i].type = type;
         memcpy(next.identities[i].address, address, 6);
         if (!commit(store, &next)) return -1;
         printf("[output-store] reserved PC%u identity (verified flash write)\n", i + 1);
         return (int)i;
     }
+
     return -1;
+}
+
+int hub_output_store_oldest(const hub_output_store_t *store) {
+    int oldest = -1;
+    for (unsigned i = 0; i < HUB_OUTPUT_STORE_SLOTS; ++i)
+        if (store->identities[i].reserved && (oldest < 0 ||
+            store->identities[i].order < store->identities[oldest].order)) oldest = (int)i;
+    return oldest;
+}
+
+bool hub_output_store_forget(hub_output_store_t *store, unsigned slot) {
+    if (!store->loaded || store->fault || slot >= HUB_OUTPUT_STORE_SLOTS || !store->identities[slot].reserved)
+        return false;
+    hub_output_store_t next = *store;
+    unsigned order = next.identities[slot].order;
+    memset(&next.identities[slot], 0, sizeof(next.identities[slot]));
+    for (unsigned i = 0; i < HUB_OUTPUT_STORE_SLOTS; ++i)
+        if (next.identities[i].order > order) --next.identities[i].order;
+    if (next.selected == slot) {
+        int oldest = hub_output_store_oldest(&next);
+        next.selected = oldest < 0 ? 0 : (unsigned)oldest;
+    }
+    return commit(store, &next);
 }
 
 bool hub_output_store_select(hub_output_store_t *store, unsigned slot) {

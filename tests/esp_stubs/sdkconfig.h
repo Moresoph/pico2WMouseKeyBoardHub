@@ -1,0 +1,3 @@
+#ifndef HUB_NATIVE_ESP_SDKCONFIG_H
+#define HUB_NATIVE_ESP_SDKCONFIG_H
+#endif

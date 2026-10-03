@@ -1,0 +1,20 @@
+:root{color-scheme:dark;--bg:#10151e;--card:#1a2230;--muted:#a4b1c5;--green:#7ee2b1;--amber:#ffc877;--border:#303d52}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#eef3fa;font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:960px;margin:auto;padding:32px 20px}header{display:flex;align-items:center;justify-content:space-between;gap:16px}
+h1{font-size:30px;margin:0}h2{font-size:20px;margin:30px 0 12px}h2 small{font-size:13px;font-weight:400;margin-left:8px;color:var(--muted)}
+.eyebrow{font-size:11px;letter-spacing:2px;color:var(--green);margin:0 0 5px}.intro,footer{color:var(--muted)}.intro{margin:16px 0 24px}
+.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.summary>div,.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px}
+.summary small{display:block;color:var(--muted)}.summary strong{display:block;font-size:19px;margin-top:5px}
+.grid{display:grid;gap:14px}.inputs{grid-template-columns:repeat(2,1fr)}.computers{grid-template-columns:repeat(2,1fr)}
+.card header{align-items:flex-start}.card h3{font-size:17px;margin:0;overflow-wrap:anywhere}.card.selected{border-color:var(--green)}
+.badge{display:inline-block;border-radius:20px;padding:3px 10px;font-size:12px;white-space:nowrap;background:#2d384a;color:var(--muted)}
+.badge.ready{background:#193f35;color:var(--green)}.badge.warning{background:#493920;color:var(--amber)}
+.card p{margin:12px 0 0;color:var(--muted);overflow-wrap:anywhere}.card .details{font-size:13px}.card code{font-family:ui-monospace,monospace;font-size:12px}
+#error{border:1px solid #6c4f29;background:#34291e;color:var(--amber);border-radius:12px;padding:12px 16px;margin-top:18px}
+footer{font-size:12px;margin-top:28px}footer p{margin:6px 0}small{font-size:12px}
+.record{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;overflow-wrap:anywhere}
+button{background:#24394d;color:#eef3fa;border:1px solid #42627e;border-radius:8px;padding:8px 12px;margin:6px 6px 0 0;cursor:pointer}
+button:disabled{opacity:1;background:#27303e;color:#c8d1df;border-color:#455064;cursor:not-allowed}
+.control-note{font-size:12px;color:var(--amber)!important;margin:6px 0}
+input{padding:8px;background:var(--bg);color:white;border:1px solid var(--border)}
+@media(max-width:560px){main{padding:24px 14px}h1{font-size:24px}.summary{grid-template-columns:1fr}.summary>div{padding:12px 16px}.summary strong{font-size:17px}.inputs,.computers{grid-template-columns:1fr}header{gap:8px}}

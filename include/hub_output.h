@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "hub_link.h"
 
 void hub_output_init(void);
 void hub_output_start(void);
@@ -10,6 +11,11 @@ void hub_output_status(void);
 bool hub_output_ready(unsigned slot);
 unsigned hub_output_active_slot(void);
 bool hub_output_switching(void);
+void hub_output_snapshot(hub_link_output_t *snapshot);
+bool hub_output_pairing_prepare(void);
+bool hub_output_forget(unsigned slot, uint8_t type, const uint8_t address[6]);
+bool hub_output_slot_saved(unsigned slot);
+bool hub_output_storage_healthy(void);
 
 /* Call from the BTstack/async-context lock, like the other output APIs.
    Baseline (default) sends once per trigger; fast mode drains a bounded burst. */

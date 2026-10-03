@@ -1,5 +1,7 @@
 #include "hub_input.h"
+#include "hub_config.h"
 #include "hub_external_input.h"
+#include "hub_output.h"
 #include "btstack_run_loop.h"
 #include "hardware/irq.h"
 #include "hardware/sync.h"
@@ -18,8 +20,17 @@ static volatile bool rx_fault;
 static hub_link_parser_t parser;
 static hub_external_input_t state;
 static btstack_timer_source_t timer;
-static uint32_t last_request, framing_errors;
+static uint32_t last_request, last_output, framing_errors, output_packets;
+static uint16_t output_sequence;
+static uint8_t tx[HUB_LINK_WIRE_MAX], tx_type;
+static size_t tx_length, tx_offset;
 static bool started;
+static uint32_t ui_received, ui_session;
+static uint16_t ui_sequence;
+static bool ui_valid, ui_enrollment;
+static uint32_t manage_id;
+static bool manage_result, reply_pending;
+static uint16_t manage_sequence;
 
 static void uart_irq(void) {
     while (uart_is_readable(LINK_UART)) {
@@ -44,6 +55,11 @@ static void reset_link(const char *reason) {
     restore_interrupts(saved);
     memset(&parser, 0, sizeof(parser));
     last_request = btstack_run_loop_get_time_ms() - HUB_LINK_HEARTBEAT_MS;
+    last_output = btstack_run_loop_get_time_ms() - HUB_LINK_OUTPUT_PERIOD_MS;
+    output_sequence = 0;
+    tx_length = tx_offset = 0;
+    ui_valid = reply_pending = false;
+    manage_id = 0;
     printf("[dual-bt] link reset: %s; release keys/buttons to resume\n", reason);
 }
 
@@ -57,6 +73,26 @@ static void poll_link(btstack_timer_source_t *source) {
         hub_link_frame_t frame;
         uint32_t errors = parser.errors;
         if (hub_link_feed(&parser, byte, &frame)) {
+            if (state.online && frame.nonce == state.nonce && frame.session == state.session) {
+                if (frame.type == HUB_LINK_UI) {
+                    uint16_t distance = (uint16_t)(frame.sequence - ui_sequence);
+                    if (!ui_valid || ui_session != frame.session || (distance && distance < 0x8000u)) {
+                        ui_sequence = frame.sequence; ui_session = frame.session;
+                        ui_received = now; ui_valid = true; ui_enrollment = frame.payload[0] != 0;
+                    }
+                } else if (frame.type == HUB_LINK_MANAGE) {
+                    uint32_t id = (uint32_t)frame.payload[0] | (uint32_t)frame.payload[1] << 8 |
+                        (uint32_t)frame.payload[2] << 16 | (uint32_t)frame.payload[3] << 24;
+                    uint16_t distance=(uint16_t)(frame.sequence-manage_sequence);
+                    if (id && (!manage_id || (distance && distance<0x8000u))) {
+                        manage_result = frame.payload[4] >= 1 && frame.payload[4] <= HUB_COMPUTER_COUNT &&
+                            hub_output_forget(frame.payload[4] - 1, frame.payload[5], frame.payload + 6);
+                        manage_id = id;
+                        manage_sequence=frame.sequence;
+                    }
+                    reply_pending = id != 0 && id==manage_id;
+                }
+            }
             bool was_online = state.online;
             if (!hub_external_receive(&state, &frame, now)) {
                 reset_link("invalid state / sequence gap / ESP32 restart");
@@ -69,12 +105,34 @@ static void poll_link(btstack_timer_source_t *source) {
             break;
         }
     }
-    if ((uint32_t)(now - last_request) >= HUB_LINK_HEARTBEAT_MS) {
+    if (!tx_length && (uint32_t)(now - last_request) >= HUB_LINK_HEARTBEAT_MS) {
         hub_link_frame_t request = {.type = HUB_LINK_REQUEST, .nonce = state.nonce};
-        uint8_t wire[HUB_LINK_WIRE_MAX];
-        size_t length = hub_link_encode(&request, wire);
-        uart_write_blocking(LINK_UART, wire, length);
+        tx_length = hub_link_encode(&request, tx);
+        tx_type = HUB_LINK_REQUEST;
         last_request = now;
+    } else if (!tx_length && state.online && reply_pending) {
+        hub_link_frame_t reply = {.type = HUB_LINK_MANAGE_REPLY, .length = 5,
+            .nonce = state.nonce, .session = state.session};
+        for (unsigned i = 0; i < 4; ++i) reply.payload[i] = (uint8_t)(manage_id >> (8u * i));
+        reply.payload[4] = manage_result;
+        tx_length = hub_link_encode(&reply, tx); tx_type = reply.type; reply_pending = false;
+    } else if (!tx_length && state.online &&
+               (uint32_t)(now - last_output) >= HUB_LINK_OUTPUT_PERIOD_MS) {
+        hub_link_output_t output;
+        hub_output_snapshot(&output);
+        output.flags |= HUB_LINK_OUTPUT_INPUT_ONLINE;
+        hub_link_frame_t frame = {.nonce = state.nonce, .session = state.session,
+                                  .sequence = output_sequence++};
+        hub_link_pack_output(&frame, &output);
+        tx_length = hub_link_encode(&frame, tx);
+        tx_type = HUB_LINK_OUTPUT;
+        last_output = now;
+    }
+    for (unsigned budget = 0; tx_offset < tx_length && budget < 32 && uart_is_writable(LINK_UART); ++budget)
+        uart_get_hw(LINK_UART)->dr = tx[tx_offset++];
+    if (tx_length && tx_offset == tx_length) {
+        if (tx_type == HUB_LINK_OUTPUT) ++output_packets;
+        tx_length = tx_offset = 0;
     }
     btstack_run_loop_set_timer(source, 1);
     btstack_run_loop_add_timer(source);
@@ -108,6 +166,7 @@ void hub_input_status(void) {
     printf("[dual-bt] online=%u packets=%" PRIu32 " resets=%" PRIu32 " framing-errors=%" PRIu32
            " last-rx-age-ms=%" PRIu32 "\n", state.online, state.accepted, state.resets, framing_errors,
            state.online ? btstack_run_loop_get_time_ms() - state.last_rx : 0);
+    printf("[dual-bt] computer telemetry packets=%" PRIu32 " period=1000ms\n", output_packets);
     for (unsigned i = 0; i < HUB_LINK_SLOTS; ++i)
         printf("[dual-bt] input %u keyboard=%u mouse=%u epoch=%u\n", i + 1,
                !!(state.inputs[i].roles & HUB_LINK_KEYBOARD),
@@ -140,7 +199,13 @@ bool hub_input_pairing_busy(void) { return false; }
 bool hub_input_radio_busy(void) { return false; }
 bool hub_input_enroll_start(void) { return use_esp_console(); }
 void hub_input_enroll_stop(void) { use_esp_console(); }
-bool hub_input_enrolling(void) { return false; }
+bool hub_input_link_online(void) {
+    return state.online && !hub_external_expired(&state, btstack_run_loop_get_time_ms());
+}
+bool hub_input_enrolling(void) {
+    return hub_input_link_online() && ui_valid && ui_session == state.session &&
+        btstack_run_loop_get_time_ms() - ui_received < HUB_LINK_OUTPUT_TIMEOUT_MS && ui_enrollment;
+}
 bool hub_input_forget(unsigned mask) { (void)mask; return use_esp_console(); }
 bool hub_input_open_test_connect(unsigned slot, const char *address) {
     (void)slot; (void)address; return use_esp_console();

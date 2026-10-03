@@ -1,11 +1,16 @@
 #ifndef HUB_CONFIG_H
 #define HUB_CONFIG_H
 
-#define HUB_COMPUTER_COUNT 4
 #define HUB_INPUT_COUNT 2
 #ifndef HUB_DUAL_BLUETOOTH
 #define HUB_DUAL_BLUETOOTH 0
 #endif
+#if HUB_DUAL_BLUETOOTH
+#define HUB_COMPUTER_COUNT 7
+#else
+#define HUB_COMPUTER_COUNT 4
+#endif
+#define HUB_PC_CONNECTION_LIMIT 4
 #define HUB_PAIRING_WINDOW_MS 120000u
 #define HUB_INPUT_ENROLLMENT_MS 60000u
 /* Existing SDK initiating-scan defaults, also advertised through Scan Parameters. */
