@@ -1,5 +1,137 @@
 # Pico 2 W Bluetooth keyboard/mouse hub
 
+**Current deployed firmware (2026-10-04 15:35):** at the user's explicit request,
+only ESP32 was updated to `0.6.7-clean-retry`; Pico remains `0.6.2-hid-dedup`
+and was not flashed or restarted. ESP32 app-only flash/readback passed and current
+NVS was byte-identical before boot. Runtime confirmed both versions, retained
+input bonds/records, PC1 ready and fresh UART with no framing errors. Inputs were
+still reconnecting with no real reports in the startup observation; physical
+At 16:08 the user reported no problems noticed so far and requested a commit
+of this version. This is initial usable acceptance, not sustained radio/capacity
+or every failure-path certification.
+
+**Scoped retry-only patch (2026-10-04):** source now builds ESP32
+`0.6.7-clean-retry` from the confirmed `b401938` baseline. Previous withdrawn
+0.6.6/0.6.3 candidate code was backed up outside the repository and removed from
+the source tree. Pico remains byte-for-byte baseline source/firmware; output,
+mouse connection parameters, UART format, NVS locking and scanning are unchanged.
+
+An explicit HID open failure, NULL SDK open result or HID close ends the entire
+attempt: release input state, close the remaining HID/ACL, wait for the worker
+and callbacks to release ownership, then retry the saved address/bond using the
+existing bounded backoff. A failed attempt no longer retains an ACL to patch up
+HID. Initial incoming saved-device connections can still finish their first HID
+setup; a connection that is merely in progress is not treated as failed.
+Old handles/requests remain guarded, and no second worker is started while SDK
+resources are held. Cleanup timeout blocks new connections; a genuine late
+cleanup completion permits automatic retry. Permanent SDK waits still require
+operator recovery/reboot, not unsafe memory release.
+
+Unavailable, null or empty report maps are temporary failures, not proof of
+unsupported hardware. Nonempty bounded descriptors that fail the existing
+parser/role check are retried; only three independent attempts with identical
+descriptor lengths and actual bytes stop as unsupported. A different descriptor,
+unavailable metadata or successful validation resets that streak. Allocation
+failure cannot establish incompatibility. Logs show the read status, map count,
+failing map/length/CRC, role result and repetition count, not input data or keys.
+The parser itself and genuine malformed-report/security rejection remain intact.
+
+Production callback tests cover zero-map OPEN, failed OPEN racing live ACL,
+late/duplicate OPEN/CLOSE, worker completion, full cleanup in either order,
+three-byte-identical descriptor failures and successful key press/release.
+The patch was initially kept off the boards while the user
+was unavailable; the user subsequently requested the ESP32-only update above.
+Image SHA256 `D8F1393DCFCD879C232FF88F71AC311DE1A4D0D64C0A63A1ECD4EA08A5D51869`.
+Software verification and startup observations are not a claim that FILCO's
+physical intermittent fault is permanently eliminated. The user's subsequent
+initial acceptance is recorded above; new debug logging is separate follow-up work.
+
+**Previous usable rollback (2026-10-04 13:57, history):** following a user report of
+severe keyboard lag/repetition, both boards were restored to the usable
+`b401938` baseline: ESP32 `0.6.5-reconnect-phases` and Pico
+`0.6.2-hid-dedup`. Program verification passed; current input NVS was
+byte-identical before reboot and all 893 Pico non-program sectors remained
+unchanged. Runtime confirmed encrypted/HID-ready keyboard/mouse and PC1 with
+empty queues/no overflow. The user subsequently confirmed this restored version
+is usable; this is acceptance of the baseline, not of the withdrawn candidate
+or every failure path. The withdrawn candidate described below is retained as
+history/backup, **not current source or board firmware**. The retry-only patch
+above is current development; no push or tag change was made.
+
+**Withdrawn reliability follow-up after the usable baseline `b401938` (history):**
+the rejected candidate was ESP32 `0.6.6-bounded-recovery` and Pico `0.6.3-switch-recovery`.
+The baseline commit preserves the previous deployed versions and known limits;
+It was withdrawn after a real-input regression, not accepted as a release.
+
+User PIN/passkey/confirmation waiting has its own phase, preserving the original
+120-second authorization/overall deadline across ACL callback ordering instead
+of inheriting the 15-second HID-setup timeout. Ordinary reconnect deadlines remain
+bounded. A missing SDK worker/cleanup callback enters an explicit terminal fault:
+it does not free SDK-owned memory, start a second worker or falsely acknowledge
+rollback. A late genuine close can complete rollback. Otherwise USB `restart`,
+or a BOOT-authorized, confirmed **Restart input board (retain pairing)** action,
+restarts ESP32 with the saved registry/bonds/password intact. No automatic reboot
+loop is introduced. SDK-internal indefinite waits are not claimed to be safely
+cancellable in place.
+
+Discovery times out after 20 seconds and waits at most six more seconds for
+stop confirmation; lost callbacks quarantine unknown radio state and expose a
+restart-required fault. Natural completion and successful stopping no longer
+strand automatic-enrollment stages. Old cross-transport callbacks cannot cancel
+the other transport's active discovery. Buttons, web management and trusted USB
+`scan classic|ble` share this scheduler; USB scanning opens manual management,
+not automatic enrollment. Confirmed deletion still rechecks
+authorization and exact identity; unconfirmed stopping never deletes records.
+
+In dual-board output, old-PC release failure has a three-second deadline.
+Recovery requests disconnect of that old connection, retains its bond and waits
+for the actual HCI disconnect before using the target. Rejected disconnect or
+a missing confirmation after five seconds becomes a visible switch fault, not
+an endless success-shaped switch. No input is leaked to either computer while
+closure is uncertain; a late disconnect completes the switch, and reselecting
+can retry a rejected disconnect. Missing-confirmation faults require confirmed
+closure or a Pico restart. Normal switches do not disconnect computers, and
+single-radio output keeps its prior timeout behavior.
+
+USB status/history printing now uses a short locked snapshot, then prints
+without the input mutex. Verified registry writes/readback also run outside that
+mutex, with a busy gate and revision-aware preservation of names learned during
+the write. Flash operations can still have platform-level timing costs; this is
+not a zero-latency storage claim. Diagnostics retain historical error source,
+time and count while clearing the current error on readiness. Generic HID-open
+failure does not overwrite its immediately preceding specific ACL error.
+
+ESP32 now requests mouse peripheral latency zero on recent real activity, at
+most once per ten seconds, retaining the negotiated supervision timeout and
+allowing idle/peer power-saving updates. Parameter queries are also throttled,
+not performed on every forwarded report. Pico's local `mouse-active` toggle is
+explicitly unsupported for UART inputs and does not pretend to control ESP32.
+Seven saved PC slots, five input records and HID-report dedup behavior remain.
+
+Both final images were flashed/verified on 2026-10-04. ESP32 NVS was byte-identical
+before reboot; Pico readback matched 2,089 actual program blocks and all 893
+non-program sectors remained unchanged. The SDK's explicitly ignored UF2 marker
+is not a physical-flash block. Final image hashes:
+
+```text
+ESP32 11A4089F1BDEDFDD2DC0D450183E1E1A583A68A768E1DD438B6784BC07E4871F
+Pico  3730B8187D266D345FE149030BF7C766E54B67B89E96DFD663F55A449BDD4B19
+```
+
+Runtime confirmed both versions, preserved Windows/Mac identities, PC1 selected
+and both PC1/PC3 encrypted/HID-ready, fresh UART and no framing errors. Final
+bounded observation did **not** regain physical input: FILCO had page timeout
+(`0x104` ESP status corresponding to HCI `0x04`) and M585 was still connecting;
+there were no real input reports in the final image's observation. An earlier
+candidate had received 52 keyboard and 702 mouse reports before remote close/
+timeout. These observations do not establish why the devices became unreachable
+or certify the new mouse policy, sustained Mac movement or four-PC radio load.
+Fault paths are exercised using production functions with mocked SDK/ATT edges,
+including exact deadlines/rollover, late callbacks, loss, persistence interleaving,
+neutral safety, and all 15 browser states. Physical wake/channel verification
+and sustained input acceptance remain pending; no synthetic input, destructive
+deletion or forced PC selection was used.
+
 **ESP32 reconnect correction (`0.6.5-reconnect-phases`):** closing a Classic
 HID profile now clears the old profile request and permits reattachment to its
 live ACL after one second instead of waiting for the old 40-second deadline.

@@ -4,6 +4,7 @@
 #include <inttypes.h>
 #include "hub_web.h"
 #include "auto_input_policy.h"
+#include "descriptor_retry.h"
 
 #define strcasecmp _stricmp
 #define ESP_LOGI(...) ((void)0)
@@ -23,6 +24,7 @@ typedef struct {
 typedef struct {
     bool selected, paused, mapped, secure, pending, recovering, open_running, classic_acl_connected, allow_open, bonded;
     void *dev;
+    input_descriptor_retry_t descriptor_retry;
     uint8_t transport, address_type, address[6], auth, reconnect_failures;
     uint32_t acl_generation, pair_until;
     char name[256];

@@ -8,7 +8,8 @@ enum { HUB_INPUT_HISTORY = 24 };
 typedef enum { INPUT_EVENT_OPEN, INPUT_EVENT_ACL_UP, INPUT_EVENT_HID_OPEN, INPUT_EVENT_ENCRYPT,
                INPUT_EVENT_HID_CLOSE, INPUT_EVENT_ACL_DOWN, INPUT_EVENT_OPEN_FAILED,
                INPUT_EVENT_RECOVER, INPUT_EVENT_CLEANUP_RESULT, INPUT_EVENT_READY,
-               INPUT_EVENT_PAUSED, INPUT_EVENT_RETRY, INPUT_EVENT_FIRST_REPORT } input_event_kind_t;
+               INPUT_EVENT_PAUSED, INPUT_EVENT_RETRY, INPUT_EVENT_FIRST_REPORT,
+               INPUT_EVENT_DESCRIPTOR_RETRY } input_event_kind_t;
 typedef struct {
     uint32_t at, detail;
     uint8_t slot, phase, kind;
@@ -20,7 +21,7 @@ typedef struct {
 
 static inline const char *input_event_name(input_event_kind_t kind) {
     static const char *const names[] = {"open","acl-up","hid-open","encryption","hid-close","acl-down",
-        "open-failed","recover","cleanup-result","ready","paused","operator-retry","first-report"};
+        "open-failed","recover","cleanup-result","ready","paused","operator-retry","first-report","descriptor-retry"};
     return names[kind];
 }
 static inline void input_history_add(input_history_t *history, const input_event_t *event) {

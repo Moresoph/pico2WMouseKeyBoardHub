@@ -7,7 +7,7 @@
 #include "input_diagnostics.h"
 #include "reconnect_policy.h"
 
-#define HUB_WEB_FIRMWARE "0.6.5-reconnect-phases"
+#define HUB_WEB_FIRMWARE "0.6.7-clean-retry"
 #define HUB_WEB_CANDIDATES 16u
 typedef struct {
     uint8_t address[6], transport, type, roles;

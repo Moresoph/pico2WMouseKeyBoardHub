@@ -158,6 +158,9 @@ endif()
 if(NOT EXISTS "${HUB_BTSTACK_PATH}/src/btstack_hid_parser.c")
     message(FATAL_ERROR "Input tests require the Pico SDK BTstack dependency; run bootstrap.ps1 first.")
 endif()
+target_sources(hub_reconnect_lifecycle_tests PRIVATE ../src/hub_remote_hid.c
+    "${HUB_BTSTACK_PATH}/src/btstack_hid_parser.c" "${HUB_BTSTACK_PATH}/src/btstack_util.c")
+target_include_directories(hub_reconnect_lifecycle_tests PRIVATE "${HUB_BTSTACK_PATH}/src")
 add_executable(hub_remote_hid_tests remote_hid_test.c ../src/hub_remote_hid.c
     "${HUB_BTSTACK_PATH}/src/btstack_hid_parser.c" "${HUB_BTSTACK_PATH}/src/btstack_util.c")
 target_include_directories(hub_remote_hid_tests PRIVATE ../esp32/main ../include "${HUB_BTSTACK_PATH}/src")

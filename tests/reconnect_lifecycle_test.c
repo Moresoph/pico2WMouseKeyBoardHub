@@ -2,6 +2,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include "hub_input_records.h"
+#include "hub_hid_report.h"
+#include "hub_remote_hid.h"
+#include "descriptor_retry.h"
 #include "hub_link.h"
 #include "hub_classic_security.h"
 #include "reconnect_policy.h"
@@ -21,9 +25,13 @@ typedef struct {
     uint8_t address[6],seen_roles,auth,interval_attempts,reconnect_failures,profile_failures,transport;
     uint16_t interval,classic_handle;
     uint32_t reports,retry_at,recovery_at,opened_at,pair_until,last_error;
+    uint32_t last_report_at,invalid;
     uint32_t acl_generation,cleanup_token,cleanup_request_at,cleanup_retry_at;
     uint8_t cleanup_result;
     void *dev;
+    char name[256];
+    hub_remote_hid_t hid;
+    input_descriptor_retry_t descriptor_retry;
     pause_reason_t pause_reason;
     input_link_clock_t clock;
     hub_link_input_t input;
@@ -48,6 +56,38 @@ static unsigned request_count;
 static struct {unsigned phase;} trial;
 static input_history_t history;
 static cleanup_event_t reply;
+typedef void esp_hidh_dev_t;
+typedef const char *esp_event_base_t;
+enum { ESP_HIDH_START_EVENT,ESP_HIDH_OPEN_EVENT,ESP_HIDH_CLOSE_EVENT,ESP_HIDH_INPUT_EVENT };
+typedef struct {
+    struct {esp_err_t status;} start;
+    struct {esp_err_t status;esp_hidh_dev_t *dev;} open;
+    struct {int reason;esp_hidh_dev_t *dev;} close;
+    struct {unsigned map_index,report_id,length;const uint8_t *data;esp_hidh_dev_t *dev;} input;
+} esp_hidh_event_data_t;
+static bool classic_ready;
+static void lock(void){lock_owned=true;}
+static void unlock(void){lock_owned=false;}
+static const uint8_t *esp_hidh_dev_bda_get(esp_hidh_dev_t *dev){(void)dev;return peers[0].address;}
+static unsigned esp_hidh_dev_transport_get(esp_hidh_dev_t *dev){(void)dev;return peers[0].transport;}
+static const char *esp_hidh_dev_name_get(esp_hidh_dev_t *dev){(void)dev;return NULL;}
+const char *esp_err_to_name(esp_err_t status){(void)status;return "test-status";}
+static bool classic_admitted(const peer_t *p){return p&&p->selected&&!p->paused&&bonded;}
+static void begin_classic_incoming(peer_t *p){p->pending=true;input_link_enter(&p->clock,INPUT_PHASE_HID,time_ms);}
+static void update_saved_name(const uint8_t *address,const char *name){(void)address;(void)name;}
+static void request_mouse_interval(peer_t *p){(void)p;}
+static esp_err_t esp_ble_set_encryption(uint8_t *address,unsigned mode){(void)address;(void)mode;return ESP_OK;}
+enum { ESP_BLE_SEC_ENCRYPT=1 };
+#define ESP_BD_ADDR_STR "%02x:%02x:%02x:%02x:%02x:%02x"
+#define ESP_BD_ADDR_HEX(a) (a)[0],(a)[1],(a)[2],(a)[3],(a)[4],(a)[5]
+typedef struct {const uint8_t *data;uint16_t len;} esp_hid_raw_report_map_t;
+static esp_hid_raw_report_map_t sdk_maps[HUB_REMOTE_MAPS];
+static size_t sdk_count;
+static esp_err_t sdk_map_status;
+static bool sdk_null_maps;
+static esp_err_t esp_hidh_dev_report_maps_get(esp_hidh_dev_t *dev,size_t *count,esp_hid_raw_report_map_t **maps){
+    assert(dev);*count=sdk_count;*maps=sdk_null_maps?NULL:sdk_maps;return sdk_map_status;
+}
 
 static uint32_t now_ms(void){return time_ms;}
 static bool due(uint32_t now,uint32_t at){return (int32_t)(now-at)>=0;}
@@ -90,7 +130,9 @@ static int xQueueReceive(unsigned queue,void *data,unsigned ticks){
 #include "reconnect_lifecycle_generated.inc"
 
 static peer_t *fresh(void){
+    for(unsigned i=0;i<2;++i)input_descriptor_reset(&peers[i].descriptor_retry);
     memset(peers,0,sizeof(peers));memset(&history,0,sizeof(history));
+    memset(sdk_maps,0,sizeof(sdk_maps));sdk_count=0;sdk_map_status=ESP_OK;sdk_null_maps=false;
     time_ms=1000;closes=submissions=states=btu_posts=request_count=0;
     scanning=fail_queue=false;lock_owned=true;post_error=ESP_OK;requested_scan=0;trial.phase=0;bonded=true;
     peer_t *p=&peers[0];p->selected=true;p->address[0]=1;p->transport=ESP_HID_TRANSPORT_BT;
@@ -104,15 +146,32 @@ static void ready(peer_t *p){
 int main(void){
     peer_t *p=fresh();ready(p);p->profile_requested=true;
     time_ms+=10;input_hid_closed(p);
-    assert(!p->dev&&!p->mapped&&!p->profile_requested&&p->classic_acl_connected&&p->pending);
+    assert(!p->dev&&!p->mapped&&!p->profile_requested&&p->classic_acl_connected&&p->pending&&p->recovering);
     input_reconnect_view_t view={.selected=true,.classic=true,.pending=p->pending,.acl=true,
-        .profile_requested=p->profile_requested,.started_at=p->opened_at};
+        .recovering=p->recovering,.profile_requested=p->profile_requested,.started_at=p->opened_at};
     assert(input_reconnect_plan(&view,time_ms+999,false)==INPUT_WAIT);
-    assert(input_reconnect_plan(&view,time_ms+1000,false)==INPUT_ATTACH);
+    assert(input_reconnect_plan(&view,time_ms+1000,false)==INPUT_WAIT);
+    assert(input_reconnect_plan(&view,time_ms+40000,false)==INPUT_WAIT);
     assert(input_acl_down(p,0x80,8)&&!p->pending&&!p->recovering&&p->clock.phase==INPUT_PHASE_IDLE);
     p=fresh();ready(p);assert(input_acl_down(p,0x80,8));
     assert(p->recovering && p->dev && p->clock.phase==INPUT_PHASE_CLEANUP);
     input_hid_closed(p);assert(!p->recovering&&!p->pending&&!p->dev);
+    p=fresh();p->pending=p->profile_requested=true;input_phase(p,INPUT_PHASE_HID);
+    input_acl_up(p,0x80);
+    input_open_failed(p,ESP_FAIL);
+    assert(p->recovering&&!p->paused&&p->cleanup_pending&&p->classic_acl_connected);
+    uint32_t backoff=p->retry_at;
+    retry_peer(p);assert(p->recovering&&p->retry_at==backoff); /* Cannot begin while ACL owns resources. */
+    assert(input_acl_down(p,0x80,0x16)&&!p->recovering&&p->retry_at==time_ms+1000);
+    p=fresh();p->open_running=true;input_open_failed(p,ESP_FAIL);
+    maintain_peer(p);assert(p->recovering&&p->open_running);
+    input_open_finished(p,true);assert(!p->pending&&!p->recovering&&p->retry_at>time_ms);
+    p=fresh();ready(p);p->open_running=true;
+    input_open_finished(p,false);
+    assert(!p->open_running&&p->recovering&&p->dev&&p->classic_acl_connected&&!p->mapped);
+    input_hid_closed(p);assert(input_acl_down(p,0x80,0x16)&&!p->recovering);
+    p=fresh();ready(p);p->open_running=true;
+    input_open_finished(p,true);assert(!p->open_running&&p->mapped&&p->secure&&!p->recovering);
     p=fresh();ready(p);assert(!input_acl_down(p,0x81,8)&&p->mapped&&p->secure);
     uint32_t generation=p->acl_generation;input_acl_up(p,0x81);
     assert(p->acl_generation==generation+1 && !p->secure && p->recovering);
@@ -172,6 +231,83 @@ int main(void){
     assert(p->pause_reason==PAUSE_SECURITY && retry_input(1)!=ESP_OK);
     p=fresh();
     p->pause_reason=PAUSE_NONE;bonded=false;assert(retry_input(1)!=ESP_OK);
+    /* Missing metadata, failed reads, null/empty maps never become "unsupported". */
+    for(unsigned failure=0;failure<5;++failure){
+        p=fresh();p->dev=p;p->pending=true;input_acl_up(p,0x80);
+        if(failure==1)sdk_map_status=ESP_FAIL;
+        if(failure>=2)sdk_count=1;
+        if(failure==2)sdk_null_maps=true;
+        if(failure==3)sdk_maps[0].len=1;
+        if(failure==4)sdk_maps[0].data=hub_hid_report_descriptor;
+        assert(!input_validate_hid(p,p));
+        assert(!p->paused&&p->recovering&&!p->mapped&&p->descriptor_retry.failures==0);
+        assert(input_acl_down(p,0x80,0x16));input_hid_closed(p);
+        assert(!p->recovering&&p->retry_at>time_ms&&!p->paused);
+    }
+    /* Count identical rejected byte sequences only across completed independent attempts. */
+    const uint8_t unsupported_a[]={0xa4}; /* Push is unsupported by the existing bounded parser. */
+    const uint8_t unsupported_b[]={0xb4};
+    p=fresh();
+    for(unsigned attempt=0;attempt<3;++attempt){
+        time_ms+=2000;p->dev=p;p->pending=true;input_acl_up(p,(uint16_t)(0x80+attempt));
+        sdk_count=1;sdk_maps[0]=(esp_hid_raw_report_map_t){unsupported_a,sizeof(unsupported_a)};
+        assert(!input_validate_hid(p,p));
+        assert(p->descriptor_retry.failures==attempt+1&&p->paused==(attempt==2)&&p->recovering);
+        input_hid_closed(p);assert(p->classic_acl_connected&&p->recovering);
+        assert(input_acl_down(p,(uint16_t)(0x80+attempt),0x16));
+        assert(!p->recovering&&!p->dev&&!p->classic_acl_connected);
+    }
+    assert(p->paused&&p->pause_reason==PAUSE_INVALID_HID&&bonded);
+    p=fresh();p->dev=p;input_acl_up(p,0x80);sdk_count=1;
+    sdk_maps[0]=(esp_hid_raw_report_map_t){unsupported_a,sizeof(unsupported_a)};
+    assert(!input_validate_hid(p,p));assert(input_acl_down(p,0x80,0));input_hid_closed(p);
+    p->dev=p;input_acl_up(p,0x81);sdk_maps[0].data=unsupported_b;
+    assert(!input_validate_hid(p,p)&&p->descriptor_retry.failures==1&&!p->paused);
+    assert(input_acl_down(p,0x81,0));input_hid_closed(p);
+    p->dev=p;input_acl_up(p,0x82);
+    sdk_maps[0]=(esp_hid_raw_report_map_t){hub_hid_report_descriptor,sizeof(hub_hid_report_descriptor)};
+    assert(input_validate_hid(p,p)&&p->mapped&&p->hid.roles==3&&!p->descriptor_retry.bytes);
+    uint8_t key[8]={0,0,4};
+    assert(hub_remote_hid_report(&p->hid,0,1,key,sizeof(key),&p->input)&&p->input.keyboard[2]==4);
+    memset(key,0,sizeof(key));
+    assert(hub_remote_hid_report(&p->hid,0,1,key,sizeof(key),&p->input)&&!p->input.keyboard[2]);
+    assert(input_validate_hid(p,p)); /* Duplicate ready OPEN is not counted as a new attempt. */
+    input_hid_closed(p);
+    assert(!p->input.keyboard[2]&&p->recovering); /* Host release is part of full connection exit. */
+    /* Exercise the real callback, including failed OPEN racing an incoming encrypted ACL. */
+    p=fresh();p->pending=p->profile_requested=true;p->open_running=true;input_acl_up(p,0x80);
+    esp_hidh_event_data_t event={.open={.status=ESP_FAIL,.dev=p}};
+    hid_event(NULL,NULL,ESP_HIDH_OPEN_EVENT,&event);
+    assert(p->recovering&&p->classic_acl_connected&&p->open_running&&!p->dev);
+    p->open_running=false;assert(input_acl_down(p,0x80,0x16)&&!p->recovering);
+    input_acl_up(p,0x81);p->classic_acl_encrypted=true;
+    event.open.status=ESP_OK;hid_event(NULL,NULL,ESP_HIDH_OPEN_EVENT,&event);
+    assert(!p->paused&&p->recovering&&p->descriptor_retry.failures==0); /* Zero-map SDK OPEN is transient. */
+    sdk_count=1;sdk_maps[0]=(esp_hid_raw_report_map_t){hub_hid_report_descriptor,sizeof(hub_hid_report_descriptor)};
+    hid_event(NULL,NULL,ESP_HIDH_OPEN_EVENT,&event);
+    assert(p->recovering&&!p->mapped&&!p->paused); /* Late/duplicate OPEN cannot resurrect failed attempt. */
+    event.close.dev=p;hid_event(NULL,NULL,ESP_HIDH_CLOSE_EVENT,&event);
+    assert(input_acl_down(p,0x81,0x16)&&!p->recovering);
+    time_ms=p->retry_at;input_acl_up(p,0x82);p->classic_acl_encrypted=true;
+    hid_event(NULL,NULL,ESP_HIDH_OPEN_EVENT,&event);maintain_peer(p);
+    assert(p->mapped&&p->secure&&!p->pending&&!p->paused);
+    event.input.dev=p;event.input.map_index=0;event.input.report_id=1;
+    event.input.length=8;event.input.data=key;key[2]=4;
+    hid_event(NULL,NULL,ESP_HIDH_INPUT_EVENT,&event);
+    assert(p->input.keyboard[2]==4&&p->reports==1);
+    key[2]=0;hid_event(NULL,NULL,ESP_HIDH_INPUT_EVENT,&event);
+    assert(!p->input.keyboard[2]&&p->reports==2);
+    void *other_dev=&peers[1];
+    event.close.dev=other_dev;hid_event(NULL,NULL,ESP_HIDH_CLOSE_EVENT,&event);
+    assert(p->dev==p&&p->mapped); /* Stale CLOSE must not release the new live device. */
+    event.close.dev=p;hid_event(NULL,NULL,ESP_HIDH_CLOSE_EVENT,&event);
+    assert(p->recovering&&!p->mapped&&!p->input.keyboard[2]);
+    assert(input_acl_down(p,0x82,0x16)&&!p->recovering);
+    p=fresh();ready(p);recover_peer(p,"test late complete");
+    time_ms+=INPUT_CLEANUP_TIMEOUT_MS;maintain_peer(p);assert(p->paused);
+    input_hid_closed(p);assert(p->recovering&&p->paused&&p->classic_acl_connected);
+    assert(input_acl_down(p,0x80,0x16));
+    assert(!p->paused&&!p->recovering&&p->pause_reason==PAUSE_NONE);
     /* Bounded diagnostics roll over and contain metadata only. */
     memset(&history,0,sizeof(history));
     for(unsigned i=0;i<30;++i){time_ms=i;note_input(p,INPUT_EVENT_OPEN,i);}
@@ -180,6 +316,7 @@ int main(void){
     input_link_clock_t clock={0};input_link_enter(&clock,INPUT_PHASE_HID,0xfffffff0u);
     assert(!input_link_expired(&clock,0x3a87u,false));
     assert(input_link_expired(&clock,0x3a88u,false));
-    puts("Production reconnect lifecycle: both CLOSE/ACL orders, profile reattach, explicit cleanup results/lost replies/deadlines, worker ownership, overall clock, scan isolation, safe retry and metadata ring passed");
+    fresh();
+    puts("Scoped clean-retry: full HID/ACL/worker exit, both callback orders, missing metadata retries, repeated exact descriptor stop, original bonds and report release preserved");
     return 0;
 }

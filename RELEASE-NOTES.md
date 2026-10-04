@@ -1,5 +1,24 @@
 # Usable dual-board release checkpoints
 
+## 2026-10-04 accepted clean-retry checkpoint
+
+At 16:08 the user reported no issues noticed so far with the deployed ESP32
+`0.6.7-clean-retry` and requested committing it. Pico remains `0.6.2-hid-dedup`,
+unchanged. This records initial usable acceptance, not every failure scenario,
+sustained Mac movement or four-PC capacity certification.
+
+ESP32 application SHA256:
+`D8F1393DCFCD879C232FF88F71AC311DE1A4D0D64C0A63A1ECD4EA08A5D51869`.
+Pico UF2 SHA256:
+`2640C2197B08C6F8CEBA6F06A460000964C7F39D33E9F6E7134861D5A2D32F95`.
+
+Only failed connection cleanup/retry and descriptor failure classification
+changed from the `b401938` baseline. Original paired identities/keys are retained;
+Pico, mouse radio parameters, output policies, scanning and NVS locking are
+unchanged. See `README.md` and `HANDOFF-SOFTAP-WEB.md` for deployment details.
+The broader rejected 0.6.6/0.6.3 candidate is backed up outside the repository,
+not current source or board firmware. Existing tags are unchanged; no push.
+
 ## 2026-10-04 usable baseline before further reliability changes
 
 Source baseline: `000b7f8` on `classic-hid-output`; the existing `v0.6.3`
@@ -14,8 +33,9 @@ failure/recovery path or four-PC radio-capacity target has passed acceptance.
 The 12:53 observation confirmed encrypted/HID-ready FILCO and M585,
 keyboard reports increasing from 300 to 339, selected PC1 ready, output queue
 empty, overflow zero and UART framing errors zero. These are runtime counters,
-not end-to-end latency or sustained Mac acceptance. Five saved input records,
-seven saved PC identities, physical enrollment and existing bonds are retained.
+not end-to-end latency or sustained Mac acceptance. Capacity remains five saved
+input records and seven PC identities; physical enrollment and existing bonds
+are retained.
 
 Known follow-up work: user-code pairing must not inherit the short HID-setup
 deadline; missing SDK callbacks can hold a worker and rollback indefinitely;

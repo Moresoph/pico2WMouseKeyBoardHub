@@ -2,7 +2,197 @@
 
 更新日期：2026-10-04。最新状态见首节；下方早期日期/用户确认属于历史记录。
 
-## 2026-10-04 键盘重连逻辑修复（最新）
+## 2026-10-04 16:08 用户确认初步可用并要求提交（最新）
+
+用户反馈0.6.7“暂时没发现有什么问题”，要求先commit当前版本，再单独
+增加debug日志。此次认可对应ESP32 `0.6.7-clean-retry` / Pico `0.6.2-hid-dedup`，
+不扩展为所有故障路径或长期无线验收；不改tag、不push。后续日志仅连接
+元数据，不含按键内容、PIN或密钥，不改已确认可用的连接/转发策略。
+
+## 2026-10-04 15:35 用户授权刷入单点重连补丁
+
+用户明确要求“把代码刷进去我看看”。仅更新ESP32，Pico不刷、不重启，
+仍运行 `0.6.2-hid-dedup`。本次实际ESP32运行 `0.6.7-clean-retry`：
+
+```text
+build\esp32-clean-retry\pico_dual_bt_input.bin
+SHA256 D8F1393DCFCD879C232FF88F71AC311DE1A4D0D64C0A63A1ECD4EA08A5D51869
+```
+
+COM15核MAC `10:52:1C:1D:92:34`，仅写 `0x10000` application，
+1452304字节verify成功；最新NVS `0x9000/0x6000` 启动前逐字节保持不变：
+`backups\esp32-nvs-before-clean-retry-20261004-1535.bin`、
+`backups\esp32-nvs-after-clean-retry-before-boot-20261004-1535.bin`。
+旧三条输入记录、键盘bond和本机热点设置保留，不恢复旧NVS覆盖当前数据。
+可用0.6.5回退镜像仍留备份，未commit/push/改tag。
+
+运行时已读回ESP32 0.6.7与Pico0.6.2。PC1 encrypted/HID-ready、
+queue0/overflow0/UART framing0，键盘尚未回应page（HCI0x04），两输入
+启动采样时仍在连接、无真实报告；键盘失败日志显示cleanup后下一次
+OPEN，paused0，没有再把普通失败锁成unsupported。这只证明固件启动、
+数据保留与普通重试路径，不代表用户已经确认按键无延迟/重复。等用户
+保持原Hub通道唤醒键鼠后验收，不注入输入、不重配、不追加其他改动。
+
+## 2026-10-04 15:06 单点清理重试补丁（历史，当时未刷板）
+
+用户同意仅实现“保留配对和密钥→失败退出→清理完成→重新连接”。
+板上保持已确认可用 **ESP32 0.6.5 + Pico 0.6.2**，没有在本轮刷写、
+重启、重配、删记录或切电脑。候选源码标记ESP32 `0.6.7-clean-retry`。
+用户不可响应是否现在更新/验收的问题，因此不再先部署后等用户试手感。
+
+之前撤回的未提交0.6.6/0.6.3候选代码已备份到本机会话目录：
+`withdrawn-candidate-before-scoped-retry-20261004.patch`，
+单独新增test也已备份；只撤回本会话自己写的候选，不改HEAD、分支、
+用户配对、交接历史。当前源码从 `b401938` 基线起仅重连补丁；
+Pico代码、鼠标参数、NVS并发、扫描/按钮/网页策略、UART格式全部基线不变。
+没有stash/reset/rebase/commit/push/修改tag。
+
+普通HID OPEN失败、SDK返回NULL、HID CLOSE统一走完整cleanup，原ACL也关闭，
+不再保留失败连接补HID。SDK worker/设备/ACL任一还占资源，不允许排下一次；
+真正全部结束后用既有1/2/4/8/15秒backoff重连原地址/密钥，并清HID临时状态。
+初次正常incoming ACL还可完成未失败的HID建立；未完成不等于已经失败。
+关闭时安全清键鼠状态，经原UART逻辑释放电脑端，未改去重/输出队列。
+cleanup截止仍拒绝未确认释放的资源；晚到真实cleanup完成自动解除普通
+cleanup暂停并重试，不解除security/无效报告/操作员暂停。
+SDK本身无限等待没有被假取消或强行free，卡死仍需操作员处理/重启。
+
+描述符读取失败、maps空、data空、length0等不再立即永久暂停；
+这些清理重试且清掉“不兼容”连续计数。nonempty bounded描述符解析/role
+失败也先清理重试，**3次独立尝试同长度同实际字节**仍失败才停止；
+不只比较CRC、不猜boot格式、不绕过安全/真实坏报告校验。成功/不同数据
+清计数，分配失败报错且不当成不兼容。descriptor-retry环形事件和USB日志
+记录status/maps/失败map/length/CRC/roles/次数，不记录实际按键或密钥。
+临时保存的失败描述符仅RAM，设备换槽/forget/成功验证时释放。
+
+新增测试抽取真实 `hid_event` 和生产lifecycle，覆盖failed OPEN与活ACL竞态、
+SDK zero-map OPEN、晚/重复OPEN/CLOSE不能复活旧尝试、worker结束、双方断线
+顺序、确切3次拒绝、不同/缺失/成功重置、真实解析器的按下/松开。
+保留原输入录入、串口安全和Pico去重/输出回归。两种回调断线顺序确认
+后才重开；不把模拟测试说成实际手感验收。
+最终原生输入/录入/协议/真实callback测试和原33组Pico输出/dual去重回归
+通过，ESP32候选完整build通过且无warning。独立候选镜像：
+
+```text
+build\esp32-clean-retry\pico_dual_bt_input.bin
+SHA256 D8F1393DCFCD879C232FF88F71AC311DE1A4D0D64C0A63A1ECD4EA08A5D51869
+```
+
+这是**未部署**镜像，不能据此更新“实际板上版本”。更新前只读采样仍确认
+运行0.6.5，keyboard encrypted/HID-ready、reports7698（采样期无新增）、
+mouse9974→10086/7.5ms；用户当时不方便确认按键，未注入输入。
+Pico未build/未刷/未重启，0.6.2镜像hash保持原值。实际唤醒、重连和重复
+按键/手感验收等用户可参与时再做；当前不再无验收把候选放到板上。
+
+## 2026-10-04 13:57 板上已回退可用基线
+
+用户在13:50报告严重卡顿和大量重复按键。立即通过ESP `disconnect 1`
+暂停键盘，Pico `release` 发送全松开；PC1 queue0/release0，原配对未删除。
+13:41诊断曾发现 keyboard `paused=1/pause-reason=3/invalid=0`，说明被
+描述符校验暂停而非坏报告；一次软件restart仅清暂态，未修根因。
+不能把新候选说成已通过真实键鼠验收，也不能把重复按键归咎用户操作。
+
+恢复已验证baseline镜像，不改Git HEAD/源码，不恢复旧配对备份覆盖当前
+数据，不擦NVS。用户不可响应回退选择，依据候选实际回归撤回自有板上
+更新；不是声称用户已经确认选项。当前板上：
+
+| 板子 | 实际运行固件 | SHA256 |
+| --- | --- | --- |
+| ESP32 | `0.6.5-reconnect-phases` | `2D0707A5747ABB8AC18EECDDF52243C0B48527F777C14735C893E4E42B475136` |
+| Pico | `0.6.2-hid-dedup` | `2640C2197B08C6F8CEBA6F06A460000964C7F39D33E9F6E7134861D5A2D32F95` |
+
+ESP32核MAC，app-only回退并verify，回退当时最新NVS启动前逐字节不变：
+`backups\esp32-nvs-before-usable-rollback-20261004.bin`、
+`backups\esp32-nvs-after-usable-rollback-before-boot-20261004.bin`。
+Pico保存回退前当前完整flash，仅加载基线程序，2090真实UF2块一致、
+893非程序扇区不变（密钥/身份保留）：
+`backups\pico-before-usable-rollback-20261004.bin`、
+`backups\pico-after-usable-rollback-before-boot-20261004.bin`。
+
+13:57串口确认上述两版本，keyboard encrypted/HID-ready、paused0、
+真实reports515/invalid0；Pico接到keyboard角色，PC1 queue0/overflow0、
+framing0，keyboard队列avg466us/max1288us。鼠标也encrypted/HID-ready。
+这些最初是设备侧状态和计数，键盘当时有非中性物理状态，未记录按键内容。
+用户随后明确确认“这个版本可用”：这是对回退后0.6.5/0.6.2基线的确认，
+不是对0.6.6/0.6.3候选或所有异常恢复路径的认可。继续工作以基线为准，
+不要再未获实机验收就部署多项候选；先聚焦FILCO描述符完整性/解析失败点，
+不要混入鼠标参数、NVS并发、PC切换策略等扩大改动。
+
+当时HEAD仍为 `b401938`；0.6.6/0.6.3候选源码和未提交修复保留在工作区，
+**它们当前不在板上**，不要从build目录最新文件或工作区源码推断已部署。
+没有push、改标签、stash/reset/revert代码。后续先补描述符完整性/失败点
+诊断与单一缺陷复现，不再批量叠加试验或把原生测试当真实手感验收。
+
+## 2026-10-04 可用基线与后续可靠性修复
+
+用户要求先 commit 当前可用版本，再继续修复。已提交 **`b401938`**：
+记录已有 `000b7f8` 代码和0.6.5/0.6.2已部署基线、12:53键盘300→339真实
+报告以及PC1 queue0/overflow0。没有改 `v0.6.3` 标签、没有 push。
+随后修复留在工作区，**没有把后续候选自动再 commit 为已验收版本**。
+
+最终候选已部署 ESP32 `0.6.6-bounded-recovery`、
+Pico `0.6.3-switch-recovery`：
+
+```text
+ESP32 build\esp32-slots-buttons\pico_dual_bt_input.bin
+SHA256 11A4089F1BDEDFDD2DC0D450183E1E1A583A68A768E1DD438B6784BC07E4871F
+Pico build\dual-bounded-recovery\pico_bt_hub.uf2
+SHA256 3730B8187D266D345FE149030BF7C766E54B67B89E96DFD663F55A449BDD4B19
+```
+
+主要修复：
+
+- `user-code` 阶段保留原120秒配对/整体截止，ACL/CONNECT事件不能把等待
+  PIN的状态改回15秒HID阶段；普通连接阶段截止保持不变。
+- SDK回调/worker缺失导致清理截止时，不重复open/不强行free。试配进入
+  明确phase5故障，不再说“已取消恢复成功”。晚到的真实CLOSE可完成回滚；
+  否则USB `restart` 或物理授权后确认重启输入板，保留registry/bonds/热点。
+  **SDK内部 portMAX_DELAY 未强行改为可取消；恢复依赖明确的板级重启**，
+  不自动重启、不引入循环重启，普通 `retry` 不再谎称能救永久占用的worker。
+- 扫描20秒截止，停止再等6秒；丢回调进入radio-state-unknown故障，不能假装
+  已停止/再次扫描/删除。STOP成功也推进自动阶段，过时的另一transport
+  回调不清掉当前扫描；晚到停止可解除扫描故障。
+  可信USB `scan classic|ble` 也走同一manual-management排队/截止路径，
+  不再直接启动无active-transport/截止的旁路扫描。
+- 双板PC切换释放3秒未成功→请求断旧连接，保留旧bond，**收到HCI断线**
+  后才继续。断开被拒或5秒缺确认→明确switch fault，普通输入继续禁止；
+  断开被拒可重新选目标，确认缺失需等真实断线或重启Pico，不能假完成。
+  UART增加switch-fault标志且校验fault必须伴随switching；网页显示原因。
+- USB status/history先复制状态再解锁打印；registry写入/校验在输入锁外
+  执行，busy锁住竞争管理操作，revision合并写入期间新学到的名称，避免
+  名称丢失或覆盖其他记录。实际flash仍可能有平台级暂停，非零时延承诺。
+- 诊断有historical error/source/time/count，ready清当前错误；具体ACL
+  错误不被紧随的通用ESP_FAIL覆盖。频繁普通重试事件限频，故障元数据保留。
+- ESP32真实鼠标活动时请求latency0，至少10秒间隔，保留timeout，允许
+  空闲省电更新；参数查询也限频。Pico本地mouse-active开关明确不支持UART
+  输入，不再输出“ON所以ESP鼠标已优化”的错误暗示。
+
+dual native/生产生命周期、原33组output+dual去重+切换失败/ACK/wrap、
+普通与Classic latency策略、15种headless网页状态均通过；两板完整build
+通过，最终ESP32没有编译warning。验证不是向真实电脑发模拟键鼠事件。
+
+部署核硬件身份、app-only ESP写入/verify，最新NVS启动前逐字节不变：
+`backups\esp32-nvs-before-bounded-console-final-20261004.bin`、
+`backups\esp32-nvs-after-bounded-console-final-before-boot-20261004.bin`。
+Pico最新完整4MiB备份/读回：
+`backups\pico-before-bounded-final-20261004.bin`、
+`backups\pico-after-bounded-final-before-boot-20261004.bin`。
+2089实际UF2程序块一致、893非程序扇区不变。最初比较遇到SDK绝对地址
+`0x10FFFF00`占位块；根据SDK `UF2_EXTENSION_RP2_IGNORE_BLOCK=0x9957E304`
+确认它明确标为忽略，不是4MiB物理flash写入；排除时验证了精确标记/地址/
+family，其余块及非程序区逐字节比较，没有放宽物理flash匹配。
+
+**最终实机验收仍缺输入侧可达性：** 最终两固件版本确认、Windows/Mac两
+PC都encrypted/HID-ready、PC1仍选中、UART fresh/framing0/storage0；
+但最终ESP键盘无HID、page timeout `0x104`，M585仍在连接，本轮输入0报告。
+不能据此说“最终新版本键鼠已经不卡”或说键盘必定关机/丢密钥。
+第一候选曾收到keyboard52/mouse702，随后键盘remote close `0x13`、鼠标
+timeout `0x08`，没有证明原因；最终镜像并未取得持续真实输入/latency0
+协商数据。没有强制重新配对/清记录/切电脑/注入模拟输入。
+下一步需用户保持键鼠在Hub对应通道并唤醒，再读真实报告/参数与手感；
+Mac持续移动、4-PC并发和实机故障注入仍不能用普通PC就绪代替。
+日志/程序备份留本机ignored/session files，不提交原始私密数据。
+
+## 2026-10-04 键盘重连逻辑修复
 
 用户授权修复 review 中的重连问题并 **commit，不 push**。Pico 不改，仍
 `0.6.2-hid-dedup`；ESP32 最终已部署 `0.6.5-reconnect-phases`：

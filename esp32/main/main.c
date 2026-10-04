@@ -31,6 +31,7 @@
 #include "hub_ui.h"
 #include "auto_input_policy.h"
 #include "input_diagnostics.h"
+#include "descriptor_retry.h"
 
 static const char *TAG = "dual-bt";
 _Static_assert(ESP_HID_TRANSPORT_BT==HUB_RECORD_CLASSIC && ESP_HID_TRANSPORT_BLE==HUB_RECORD_BLE,
@@ -79,6 +80,7 @@ typedef struct {
     uint32_t auth_number;
     uint32_t pair_until, retry_at, opened_at, reports, invalid, incoming_connections;
     esp_hidh_dev_t *dev;
+    input_descriptor_retry_t descriptor_retry;
     hub_remote_hid_t hid;
     hub_link_input_t input;
 } peer_t;
@@ -330,6 +332,12 @@ static void release_peer(peer_t *p) {
     queue_state();
 }
 static void retry_peer(peer_t *p) {
+    if(p->dev || p->classic_acl_connected || p->open_running){
+        ESP_LOGE(TAG,"input %u cannot retry before HID/ACL/worker cleanup",(unsigned)(p-peers)+1);
+        return;
+    }
+    memset(&p->hid,0,sizeof(p->hid));
+    if(p->pause_reason==PAUSE_CLEANUP_TIMEOUT){p->paused=false;p->pause_reason=PAUSE_NONE;}
     p->pending = p->recovering = p->profile_requested = false;
     p->cleanup_pending=false;
     if (p->reconnect_failures < 5) ++p->reconnect_failures;
@@ -347,6 +355,7 @@ static void recover_peer(peer_t *p, const char *reason) {
         ESP_LOGW(TAG, "input %u recovery: %s; bond/pairing policy unchanged",
                  (unsigned)(p - peers) + 1, reason);
     }
+    if(!p->dev && !p->classic_acl_connected && !p->open_running){retry_peer(p);return;}
     if(p->cleanup_pending || !due(now_ms(),p->cleanup_retry_at))return;
     if (p->classic_acl_connected) {
         p->cleanup_pending=true;p->cleanup_token=++cleanup_token;p->cleanup_request_at=now_ms();
@@ -361,7 +370,7 @@ static void recover_peer(peer_t *p, const char *reason) {
     } else if (p->dev) {
         check_result(esp_hidh_dev_close(p->dev), "close recovering input");
         p->cleanup_retry_at=now_ms()+1000;
-    } else if (!p->open_running) retry_peer(p);
+    }
 }
 static void submit_cleanups(void) {
     cleanup_event_t request;
@@ -379,12 +388,79 @@ static void input_hid_closed(peer_t *p) {
     p->dev=NULL;p->profile_requested=false;
     release_peer(p);
     note_input(p,INPUT_EVENT_HID_CLOSE,0);
-    p->pending=p->classic_acl_connected;
-    if(!p->classic_acl_connected && !p->open_running)retry_peer(p);
-    else if(!p->recovering){
-        p->classic_incoming=p->classic_acl_connected;p->opened_at=now_ms();
-        input_phase(p,INPUT_PHASE_HID);
+    recover_peer(p,"HID closed; finish this connection before retry");
+}
+static void input_open_failed(peer_t *p,uint32_t status) {
+    p->dev=NULL;
+    p->last_error=status;note_input(p,INPUT_EVENT_OPEN_FAILED,status);
+    recover_peer(p,"HID open failed; finish this connection before retry");
+}
+static void input_open_finished(peer_t *p,bool opened) {
+    p->open_running=false;
+    if(!opened)recover_peer(p,"SDK open returned no device; full cleanup before retry");
+    else if((!p->pending || p->recovering) && !p->dev && !p->classic_acl_connected)
+        recover_peer(p,"open worker ended without live HID; clean retry");
+}
+static bool input_validate_hid(peer_t *p,esp_hidh_dev_t *dev) {
+    if(p->mapped && p->dev==dev)return true;
+    size_t count=0;
+    esp_hid_raw_report_map_t *maps=NULL;
+    esp_err_t status=esp_hidh_dev_report_maps_get(dev,&count,&maps);
+    memset(&p->hid,0,sizeof(p->hid));
+    bool complete=status==ESP_OK && maps && count>0 && count<=HUB_REMOTE_MAPS;
+    size_t bytes=count * sizeof(uint16_t);
+    for(size_t i=0;complete && i<count;++i){
+        complete=maps[i].data && maps[i].len>0 && maps[i].len<=4096;
+        bytes+=maps[i].len;
     }
+    if(!complete){
+        input_descriptor_reset(&p->descriptor_retry);
+        p->last_error=status==ESP_OK?ESP_ERR_INVALID_RESPONSE:status;
+        note_input(p,INPUT_EVENT_DESCRIPTOR_RETRY,(uint32_t)count);
+        ESP_LOGW(TAG,"input %u HID metadata unavailable/incomplete: status=%d maps=%u; "
+                 "retry original bond after full cleanup",(unsigned)(p-peers)+1,status,(unsigned)count);
+        recover_peer(p,"HID metadata unavailable/incomplete");
+        return false;
+    }
+    bool valid=true;
+    unsigned failed_map=0;
+    for(size_t i=0;valid && i<count;++i){
+        valid=hub_remote_hid_map(&p->hid,i,maps[i].data,maps[i].len);
+        if(!valid)failed_map=(unsigned)i;
+    }
+    if(valid && p->hid.roles){
+        input_descriptor_reset(&p->descriptor_retry);
+        p->mapped=true;
+        return true;
+    }
+    uint8_t *snapshot=malloc(bytes);
+    if(snapshot){
+        size_t offset=0;
+        for(size_t i=0;i<count;++i){
+            snapshot[offset++]=(uint8_t)maps[i].len;
+            snapshot[offset++]=(uint8_t)(maps[i].len>>8);
+            memcpy(snapshot+offset,maps[i].data,maps[i].len);offset+=maps[i].len;
+        }
+        if(input_descriptor_repeated(&p->descriptor_retry,snapshot,bytes)){
+            p->paused=true;p->pause_reason=PAUSE_INVALID_HID;
+        }
+        free(snapshot);
+    }else{
+        input_descriptor_reset(&p->descriptor_retry);
+        ESP_LOGE(TAG,"input %u cannot retain descriptor for repeat comparison; retry, not unsupported",
+                 (unsigned)(p-peers)+1);
+    }
+    p->last_error=ESP_ERR_INVALID_RESPONSE;
+    note_input(p,INPUT_EVENT_DESCRIPTOR_RETRY,p->descriptor_retry.failures);
+    ESP_LOGW(TAG,"input %u HID validation failed: map=%u length=%u crc=0x%08" PRIx32
+             " parser-ok=%u roles=%u identical-failures=%u paused=%u; original bond retained",
+             (unsigned)(p-peers)+1,failed_map,(unsigned)maps[failed_map].len,
+             hub_records_crc(maps[failed_map].data,maps[failed_map].len),valid,p->hid.roles,
+             p->descriptor_retry.failures,p->paused);
+    if(!p->descriptor_retry.bytes)ESP_LOGE(TAG,"descriptor comparison allocation failed; cannot confirm incompatibility");
+    recover_peer(p,p->paused?"same complete descriptor rejected on three connections":
+                 "descriptor validation failure; full cleanup and bounded retry");
+    return false;
 }
 static void input_acl_up(peer_t *p,uint16_t handle) {
     bool replacement=p->classic_acl_connected && p->classic_handle!=handle;
@@ -399,6 +475,7 @@ static void input_acl_up(peer_t *p,uint16_t handle) {
     }
     note_input(p,INPUT_EVENT_ACL_UP,handle);
     if(replacement)recover_peer(p,"replacement ACL while previous HID resources still owned");
+    else if(p->paused)recover_peer(p,"paused input incoming ACL; close without discarding bond");
 }
 static bool input_acl_down(peer_t *p,uint16_t handle,uint8_t reason) {
     if(!p->classic_acl_connected || p->classic_handle!=handle)return false;
@@ -653,15 +730,7 @@ static void hid_event(void *arg, esp_event_base_t base, int32_t event, void *dat
             check_result(esp_hidh_dev_close(dev), "close unselected input");
         }
         if(p && event==ESP_HIDH_CLOSE_EVENT){input_hid_closed(p);}
-        else if (p && (
-                  (event == ESP_HIDH_OPEN_EVENT && e->open.status != ESP_OK))) {
-            p->dev = NULL;
-            release_peer(p);
-            if (!p->classic_acl_connected) {
-                p->pending = false;
-                if (!p->open_running) retry_peer(p);
-            }
-        }
+        else if(p && event==ESP_HIDH_OPEN_EVENT && e->open.status!=ESP_OK)input_open_failed(p,e->open.status);
         unlock();
         return;
     }
@@ -673,24 +742,8 @@ static void hid_event(void *arg, esp_event_base_t base, int32_t event, void *dat
                 unlock();
                 return;
             }
-            p->dev = NULL;
-            release_peer(p);
-            if (p->classic_acl_connected) {
-                if (++p->profile_failures >= 3) recover_peer(p, "repeated HID setup failures on live ACL");
-                else {
-                    /* A failed outgoing page may race the keyboard's successful incoming ACL. */
-                    p->pending = true;
-                    p->profile_requested = false;
-                    p->opened_at = now_ms();
-                    ESP_LOGW(TAG, "input %u OPEN failed but ACL is live; await/reattach HID instead of discarding incoming link", slot);
-                }
-            }
-            else {
-                p->pending = false;
-                if (!p->open_running) retry_peer(p);
-            }
+            input_open_failed(p,e->open.status);
             ESP_LOGE(TAG, "input %u open failed: %s", slot, esp_err_to_name(e->open.status));
-            p->last_error=e->open.status;note_input(p,INPUT_EVENT_OPEN_FAILED,(uint32_t)e->open.status);
         } else {
             if (transport == ESP_HID_TRANSPORT_BT && !classic_admitted(p)) {
                 p->dev = dev;
@@ -716,20 +769,7 @@ static void hid_event(void *arg, esp_event_base_t base, int32_t event, void *dat
                 snprintf(p->name, sizeof(p->name), "%s", name);
                 update_saved_name(p->address, name);
             }
-            size_t count = 0;
-            esp_hid_raw_report_map_t *maps = NULL;
-            memset(&p->hid, 0, sizeof(p->hid));
-            bool valid = esp_hidh_dev_report_maps_get(dev, &count, &maps) == ESP_OK &&
-                count > 0 && count <= HUB_REMOTE_MAPS;
-            for (size_t i = 0; valid && i < count; ++i)
-                valid = hub_remote_hid_map(&p->hid, i, maps[i].data, maps[i].len);
-            p->mapped = valid && p->hid.roles;
-            if (!p->mapped) {
-                p->paused = true;
-                p->pause_reason=PAUSE_INVALID_HID;
-                recover_peer(p,"unsupported HID descriptor");
-                ESP_LOGE(TAG, "input %u unsupported HID descriptor; paused, no boot-layout guessing", slot);
-            } else {
+            if(input_validate_hid(p,dev)) {
                 input_phase(p,p->secure?INPUT_PHASE_READY:INPUT_PHASE_ENCRYPT);
                 note_input(p,INPUT_EVENT_HID_OPEN,p->hid.roles);
                 ESP_LOGI(TAG, "input %u HID open roles=%u encrypted=%u; waiting for real input", slot, p->hid.roles, p->secure);
@@ -1189,14 +1229,8 @@ static void open_input(unsigned index) {
     esp_hidh_dev_t *result = esp_hidh_dev_open(address, transport, type);
     lock();
     p = &peers[index];
-    p->open_running = false;
     /* OPEN/CLOSE callbacks own device lifetime; never store a returned SDK pointer. */
-    if ((!result || !p->pending || p->recovering) && !p->dev && !p->classic_acl_connected) {
-        release_peer(p);
-        retry_peer(p);
-        ESP_LOGW(TAG, "input %u open ended without live HID; retry in %" PRIu32 "ms",
-                 index + 1, input_reconnect_backoff(p->reconnect_failures));
-    }
+    input_open_finished(p,result!=NULL);
     unlock();
 }
 
@@ -1233,6 +1267,10 @@ static void connection_task(void *arg) {
                     p->paused = true;
                     p->pause_reason=PAUSE_SECURITY;
                     recover_peer(p, "incoming ACL has no bond/pairing consent");
+                    continue;
+                }
+                if(p->dev){
+                    recover_peer(p,"HID object still owned before attach; clean retry instead");
                     continue;
                 }
                 p->pending = p->open_running = p->profile_requested = true;
@@ -1353,6 +1391,7 @@ static void update_saved_name(const uint8_t address[6],const char *name) {
 }
 static void configure_peer(unsigned role,const hub_saved_input_t *record,bool pause) {
     peer_t *p=&peers[role-1];uint8_t epoch=p->input.epoch+1;uint32_t generation=p->acl_generation+1;
+    input_descriptor_reset(&p->descriptor_retry);
     memset(p,0,sizeof(*p));p->input.epoch=epoch;p->acl_generation=generation;
     if(!record || !record->used)return;
     p->selected=true;p->paused=pause;p->transport=record->transport;p->address_type=record->type;
@@ -1890,6 +1929,7 @@ static int console_command(int argc, char **argv) {
             esp_err_t e = save_target(slot, address, transport, type, allow_open);
             check_result(e, "persist input target");
             if (e == ESP_OK) {
+                input_descriptor_reset(&p->descriptor_retry);
                 p->selected = true; p->paused = false;
                 p->pause_reason=PAUSE_NONE;
                 p->transport = transport; p->address_type = type;
@@ -1920,6 +1960,7 @@ static int console_command(int argc, char **argv) {
             esp_err_t e=persist_records(&next);
             check_result(e, "forget target");
             if (e == ESP_OK) {
+                input_descriptor_reset(&p->descriptor_retry);
                 if (p->selected) check_result(p->transport == ESP_HID_TRANSPORT_BT
                     ? esp_bt_gap_remove_bond_device(p->address) : esp_ble_remove_bond_device(p->address), "remove input bond");
                 release_peer(p);
