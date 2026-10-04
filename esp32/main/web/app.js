@@ -56,6 +56,7 @@ function unknown(message) {
   authSignature = '';
   for (const id of ['manual', 'scan-classic', 'scan-ble', 'cancel']) byId(id).disabled = true;
   byId('records').replaceChildren(); byId('candidates').replaceChildren(); byId('auth').replaceChildren();
+  byId('input-events').replaceChildren();
   badge(byId('health'), '状态不可用', 'warning');
   byId('selected').textContent = '状态未知';
   byId('uart').textContent = '状态未知';
@@ -89,6 +90,12 @@ function render(data) {
     const details = input.saved ? `${input.transport} · ${input.bonded ? '有配对记录' : '无配对记录'} · ${input.encrypted ? '已加密' : '未加密'} · HID ${input.hid ? '就绪' : '未就绪'} · 报告 ${input.reports}${input.interval_ms == null ? '' : ` · ${input.interval_ms} ms`}` : '长按 ESP32 BOOT 授权，然后在下方扫描并录入新键鼠';
     const node = card(input.name || `${role} · 名称尚未获取`, label,
       input.ready ? 'ready' : input.paused ? 'warning' : 'unknown', input.address, details);
+    if(input.phase)node.append(text('p',`连接阶段：${input.phase} · ${(input.phase_age_ms/1000).toFixed(1)} 秒 · 本轮 ${(input.attempt_age_ms/1000).toFixed(1)} 秒${input.last_error?` · 最近错误 ${input.last_error}`:''}`,'details'));
+    node.append(text('p',input.report_seen?`本次连接收到过输入，最近报告 ${(input.last_report_age_ms/1000).toFixed(1)} 秒前`:
+      '本次连接尚未收到真实输入；按键／移动后观察报告数，不因正常空闲自动重连','details'));
+    node.append(actionButton('重连原设备（不重配）',()=>command('retry',{slot:input.slot}),
+      Boolean(input.saved && !managementBlock(data) && input.pause_reason!==2 && input.pause_reason!==3),
+      managementBlock(data)||'密钥／报告格式异常需要明确处理'));
     deleteButton(node, input.name || role, input.address, {slot: input.record_slot}, data, false, Boolean(input.record_slot));
     return node;
   }));
@@ -111,6 +118,8 @@ function render(data) {
   byId('management').textContent = data.management_open ? `已实体授权，剩余 ${Math.ceil(data.remaining_ms / 1000)} 秒${data.auto_enrollment ? ' · 自动录入开启' : ' · 手动管理'}${data.scan_waiting ? ' · 扫描排队中，将自动开始' : data.scanning ? ' · 扫描中' : ''}${data.trial ? ` · ${trialPhase}（${data.trial_role === 2 ? '鼠标' : '键盘'} ${data.trial_address}）` : ''}` :
     '管理未授权：长按 ESP32 BOOT 3 秒后松开；双击可开关热点。';
   byId('operation').textContent = data.operation || '';
+  byId('input-events').replaceChildren(...(data.input_events||[]).slice().reverse().map(event=>
+    text('p',`${(event.age_ms/1000).toFixed(1)} 秒前 · 输入 ${event.slot} · ${event.phase} · ${event.event} · ${event.detail}`,'details')));
   byId('scan-classic').disabled = byId('scan-ble').disabled = !data.management_open || data.trial ||
     data.scanning || data.input_storage_fault || data.deletion_pending;
   byId('cancel').disabled = !data.management_open;

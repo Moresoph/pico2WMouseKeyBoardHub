@@ -1,8 +1,66 @@
 # ESP32 + Pico 2 W 热点网页交接
 
-更新日期：2026-10-01。最后一次用户确认：11:42，键盘已经能连接。
+更新日期：2026-10-04。最新状态见首节；下方早期日期/用户确认属于历史记录。
 
-## 2026-10-03 20:43 Pico 冗余 HID 报告修复（最新）
+## 2026-10-04 键盘重连逻辑修复（最新）
+
+用户授权修复 review 中的重连问题并 **commit，不 push**。Pico 不改，仍
+`0.6.2-hid-dedup`；ESP32 最终已部署 `0.6.5-reconnect-phases`：
+
+```text
+build\esp32-slots-buttons\pico_dual_bt_input.bin
+SHA256 2D0707A5747ABB8AC18EECDDF52243C0B48527F777C14735C893E4E42B475136
+```
+
+HID CLOSE 清掉 `profile_requested`，ACL 仍在时等待1秒即可补 HID；
+兼容 HID CLOSE/ACL DOWN 两种顺序，旧 handle 的断线事件不能清掉新连接。
+普通管理窗口不再停掉全部未就绪输入；扫描只挡同 transport，BLE 扫描不再
+阻止 Classic 键盘重连，扫描排队也只等待同 transport 的旧 worker/cleanup。
+
+清理不是“入队就等于断开”：BTU 回执区分 SENT/LOCK_BUSY/OBSOLETE/ABSENT/
+FAILED，以 address、handle、ACL generation、request token 核当前请求。
+锁忙100ms后重试，回执超时2秒安全重核，清理本身最多20秒。第一次实机
+`retry 1` 发现持应用 mutex 提交会让 BTU 立即执行时反复 LOCK_BUSY，约9秒
+后才得到 SENT。因此最终版新增应用提交队列，UART task **unlock 后**
+才投递 BTU；原生生产函数测试明确断言持锁不调用 bridge，并测队列满及
+BTU post 失败，不以巧合成功作为完成条件。
+
+普通 PAGE40s/HID15s/ENCRYPT12s/overall65s；overall 不随阶段进展重置。
+显式配对保留120秒安全窗口。缺 SDK callback/资源仍被持有时清理20秒后
+报 paused，绝不假释放、重复 worker 或删 bond；SDK 自身的 `portMAX_DELAY`
+没有改成可强行取消，若 worker 永不返回仍需诊断后重启。清理超时也不会
+覆盖原安全/无效 HID 暂停原因，从而绕过门禁。
+
+USB `status` 增加 phase/phase-age/attempt-age/report-seen/report-age、
+pause reason、cleanup pending/result 和 last error；`history` 给最近24条
+RAM 连接事件。只记录连接元数据，不记录按键、报告原文、PIN或密钥。
+网页同样有报告年龄/事件列表以及物理授权后的“重连原设备（不重配）”。
+USB `retry 1|2` 不需开启管理窗口；它清普通 backoff，先安全关旧资源，
+不打开 PIN 窗口，不清记录，不能绕过 security/invalid HID fault。
+正常空闲没有报告是合法状态，不会因 report age 自动断线。
+
+全部 dual native/生产 lifecycle、原33组 output/dual dedup、12种浏览器状态
+通过，ESP32 application build 通过。MAC核对 `10:52:1C:1D:92:34`，
+COM15 app-only `0x10000` 写入/verify成功，最终镜像1451088字节，
+app分区剩84912字节；最新 NVS `0x9000/0x6000` 启动前逐字节不变：
+`backups\esp32-nvs-before-reconnect-final-20261004.bin`、
+`backups\esp32-nvs-after-reconnect-final-before-boot-20261004.bin`。
+USB-only热点密码和3条输入记录保留，没有修改标签或推送。
+
+验收范围：第一次运行 FILCO/M585 均 encrypted/HID-ready，键盘9→27报告、
+鼠标369→745，Pico PC1 ready/queue0/overflow0/UART framing0。
+这轮 retry 真实完成 ACL DOWN→HID CLOSE→incoming ACL→加密/HID恢复；
+但暴露了上面已纠正的持锁提交问题，**不能当成最终锁外版的速度验收**。
+最终运行0.6.5确认 M585 encrypted/HID-ready（本轮尚无真实鼠标输入），
+FILCO持续 HCI `0x04` page timeout，未进入ACL；一次 `retry 1` 清掉15s
+backoff，87ms后实际提交 OPEN，没有PIN/新配对，没有pause。不能仅凭
+timeout断言键盘休眠/断电/丢密钥，更不能把“最终尚未回连”说成已修好。
+最终锁外 cleanup 实机计时和键盘长期稳定性需要键盘可达后补验收。
+本机没有连接热点路由，HTTP读取超时；没有强行切换用户 Wi-Fi，
+网页展示/按钮经 headless浏览器验证，不能说最终板上 HTTP 已验收。
+相关日志留 session files，不提交设备私密原始日志。
+
+## 2026-10-03 20:43 Pico 冗余 HID 报告修复
 
 用户报告切到 Mac 后鼠标逐渐延迟。修复前 live Mac/PC3
 `A4:83:E7:80:A9:61` 间隔15ms、latency0，队列曾满64，overflow从43

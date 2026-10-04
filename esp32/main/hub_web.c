@@ -94,6 +94,17 @@ static esp_err_t status_api(httpd_req_t *request) {
     JSON_ADD(cJSON_AddBoolToObject(root, "uart_online", snapshot.uart_online));
     JSON_ADD(cJSON_AddNumberToObject(root, "uart_packets", snapshot.packets));
     JSON_ADD(cJSON_AddNumberToObject(root, "uart_overflows", snapshot.overflows));
+    cJSON *events=cJSON_AddArrayToObject(root,"input_events");JSON_ADD(events);
+    for(unsigned i=0;i<snapshot.event_count;++i){
+        const input_event_t *event=&snapshot.events[i];cJSON *entry=cJSON_CreateObject();
+        if(!entry||!cJSON_AddItemToArray(events,entry)){cJSON_Delete(entry);goto oom;}
+        JSON_ADD(cJSON_AddNumberToObject(entry,"at_ms",event->at));
+        JSON_ADD(cJSON_AddNumberToObject(entry,"age_ms",snapshot.uptime_ms-event->at));
+        JSON_ADD(cJSON_AddNumberToObject(entry,"slot",event->slot));
+        JSON_ADD(cJSON_AddStringToObject(entry,"phase",input_link_phase_name(event->phase)));
+        JSON_ADD(cJSON_AddStringToObject(entry,"event",input_event_name(event->kind)));
+        JSON_ADD(cJSON_AddNumberToObject(entry,"detail",event->detail));
+    }
     JSON_ADD(cJSON_AddBoolToObject(root, "management_open", snapshot.management_open));
     JSON_ADD(cJSON_AddBoolToObject(root, "auto_enrollment", snapshot.auto_enrollment));
     JSON_ADD(cJSON_AddBoolToObject(root, "deletion_pending", snapshot.deletion_pending));
@@ -163,6 +174,16 @@ static esp_err_t status_api(httpd_req_t *request) {
         JSON_ADD(cJSON_AddBoolToObject(entry, "pending", input->pending));
         JSON_ADD(cJSON_AddNumberToObject(entry, "roles", input->roles));
         JSON_ADD(cJSON_AddNumberToObject(entry, "reports", input->reports));
+        JSON_ADD(cJSON_AddStringToObject(entry,"phase",input_link_phase_name(input->phase)));
+        JSON_ADD(cJSON_AddNumberToObject(entry,"phase_age_ms",input->phase_age_ms));
+        JSON_ADD(cJSON_AddNumberToObject(entry,"attempt_age_ms",input->attempt_age_ms));
+        JSON_ADD(cJSON_AddNumberToObject(entry,"last_error",input->last_error));
+        JSON_ADD(cJSON_AddNumberToObject(entry,"pause_reason",input->pause_reason));
+        JSON_ADD(cJSON_AddBoolToObject(entry,"cleanup_pending",input->cleanup_pending));
+        JSON_ADD(cJSON_AddNumberToObject(entry,"cleanup_result",input->cleanup_result));
+        JSON_ADD(cJSON_AddBoolToObject(entry,"report_seen",input->report_seen));
+        if(input->report_seen)JSON_ADD(cJSON_AddNumberToObject(entry,"last_report_age_ms",input->last_report_age_ms));
+        else JSON_ADD(cJSON_AddNullToObject(entry,"last_report_age_ms"));
         if (input->connected && input->interval)
             JSON_ADD(cJSON_AddNumberToObject(entry, "interval_ms", input->interval * 1.25));
         else JSON_ADD(cJSON_AddNullToObject(entry, "interval_ms"));
@@ -278,7 +299,7 @@ static esp_err_t start_locked(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.task_priority = 2;
     config.core_id = 1;
-    config.stack_size = 6144;
+    config.stack_size = 8192;
     config.max_open_sockets = 2;
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 2;

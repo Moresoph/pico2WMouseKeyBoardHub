@@ -43,6 +43,20 @@ else()
     target_compile_options(hub_esp_reconnect_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
 endif()
 add_test(NAME hub_esp_reconnect_tests COMMAND hub_esp_reconnect_tests)
+set(reconnect_generated "${CMAKE_CURRENT_BINARY_DIR}/reconnect_lifecycle_generated.inc")
+add_custom_command(OUTPUT "${reconnect_generated}"
+    COMMAND "${CMAKE_COMMAND}" "-DROOT=${CMAKE_CURRENT_LIST_DIR}/.." "-DOUTPUT=${reconnect_generated}"
+        -P "${CMAKE_CURRENT_LIST_DIR}/generate_reconnect_lifecycle_test.cmake"
+    DEPENDS ../esp32/main/main.c generate_reconnect_lifecycle_test.cmake)
+add_executable(hub_reconnect_lifecycle_tests reconnect_lifecycle_test.c "${reconnect_generated}")
+target_include_directories(hub_reconnect_lifecycle_tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" ../include ../esp32/main
+    esp_stubs ../.deps/esp-idf/components/esp_common/include)
+if(MSVC)
+    target_compile_options(hub_reconnect_lifecycle_tests PRIVATE /W4 /UNDEBUG)
+else()
+    target_compile_options(hub_reconnect_lifecycle_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+endif()
+add_test(NAME hub_reconnect_lifecycle_tests COMMAND hub_reconnect_lifecycle_tests)
 add_executable(hub_classic_security_bridge_tests classic_security_bridge_test.c)
 target_include_directories(hub_classic_security_bridge_tests PRIVATE ../include ../esp32/main esp_stubs
     ../.deps/esp-idf/components/esp_common/include)

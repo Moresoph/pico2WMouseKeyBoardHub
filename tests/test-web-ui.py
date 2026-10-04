@@ -20,6 +20,9 @@ def fixture():
              transport="BLE", saved=True, bonded=True, connected=True, encrypted=True,
              hid=True, ready=True, paused=False, pending=False, roles=2, record_slot=2, reports=20, interval_ms=7.5),
     ]
+    for entry in inputs:
+        entry.update(phase="ready",phase_age_ms=5000,attempt_age_ms=0,last_error=0,pause_reason=0,
+                     report_seen=True,last_report_age_ms=1000)
     computers = [
         dict(slot=i, saved=i <= 2, connected=i == 1, encrypted=i == 1, ready=i == 1,
              suspended=False, address="01:02:03:04:05:06" if i <= 2 else "",
@@ -33,7 +36,8 @@ def fixture():
                 token="",trial=False,scanning=False,operation="",auth=0,auto_enrollment=False,
                 records=[dict(slot=i,saved=i<=2,role=i if i<=2 else 0,active=i<=2,order=i,address="AA:BB:CC:DD:EE:FF",
                               name="FILCO <script>alert(1)</script>" if i==1 else "Saved M720" if i==2 else "",
-                              transport="Classic" if i==1 else "BLE") for i in range(1,6)],candidates=[])
+                              transport="Classic" if i==1 else "BLE") for i in range(1,6)],candidates=[],
+                input_events=[dict(age_ms=2000,slot=1,phase="hid-setup",event="hid-close",detail=0)])
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -164,6 +168,9 @@ def main():
                     assert dom.count(">删除此设备</button>")==7 and dom.count(">删除此电脑</button>")==7
                 if mode=="management":
                     assert '>删除此设备</button>' in dom and '>设置名称</button>' in dom
+                    assert '>重连原设备（不重配）</button>' in dom
+                assert "最近报告 1.0 秒前" in dom and "连接阶段：ready" in dom
+                assert "输入 1 · hid-setup · hid-close" in dom
             else:
                 assert 'class="card selected"' not in pc_dom and "HID 就绪" not in pc_dom
                 assert "状态未知" in dom

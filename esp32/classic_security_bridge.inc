@@ -52,26 +52,36 @@ esp_err_t hub_esp_classic_encrypt(const uint8_t address[6], uint32_t generation)
 typedef struct {
     uint8_t address[6];
     uint16_t handle;
-    uint32_t generation;
+    uint32_t generation, token;
 } hub_classic_close_request_t;
 
 static void hub_classic_close_on_btu(void *context) {
     hub_classic_close_request_t *request = context;
-    if (hub_esp_classic_recovery_current(request->address, request->handle, request->generation) &&
-        BTM_IsAclConnectionUp(request->address, BT_TRANSPORT_BR_EDR) &&
-        BTM_GetHCIConnHandle(request->address, BT_TRANSPORT_BR_EDR) == request->handle) {
-        tBTM_STATUS status = btm_remove_acl(request->address, BT_TRANSPORT_BR_EDR);
-        if (status != BTM_SUCCESS) ESP_LOGW("classic-recovery", "ACL cleanup status=%u", status);
+    hub_cleanup_guard_t guard = hub_esp_classic_recovery_check(request->address, request->handle,
+                                                             request->generation, request->token);
+    hub_cleanup_result_t result = HUB_CLEANUP_OBSOLETE;
+    tBTM_STATUS status = BTM_SUCCESS;
+    if (guard == HUB_CLEANUP_DEFERRED) result = HUB_CLEANUP_LOCK_BUSY;
+    else if (guard == HUB_CLEANUP_CURRENT) {
+        if (!BTM_IsAclConnectionUp(request->address, BT_TRANSPORT_BR_EDR)) result = HUB_CLEANUP_ABSENT;
+        else if (BTM_GetHCIConnHandle(request->address, BT_TRANSPORT_BR_EDR) == request->handle) {
+            status = btm_remove_acl(request->address, BT_TRANSPORT_BR_EDR);
+            result = status == BTM_SUCCESS ? HUB_CLEANUP_SENT : HUB_CLEANUP_FAILED;
+        }
     }
+    hub_esp_classic_cleanup_result(request->address, request->handle, request->generation,
+                                   request->token, result, status);
     osi_free(request);
 }
 
-esp_err_t hub_esp_classic_close_acl(const uint8_t address[6], uint16_t handle, uint32_t generation) {
+esp_err_t hub_esp_classic_close_acl(const uint8_t address[6], uint16_t handle, uint32_t generation,
+                                   uint32_t token) {
     hub_classic_close_request_t *request = osi_malloc(sizeof(*request));
     if (!request) return ESP_ERR_NO_MEM;
     memcpy(request->address, address, 6);
     request->handle = handle;
     request->generation = generation;
+    request->token = token;
     if (!osi_thread_post(btu_thread, hub_classic_close_on_btu, request, 0, 0)) {
         osi_free(request);
         return ESP_FAIL;

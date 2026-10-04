@@ -4,8 +4,10 @@
 #include "esp_err.h"
 #include "hub_link.h"
 #include "hub_input_records.h"
+#include "input_diagnostics.h"
+#include "reconnect_policy.h"
 
-#define HUB_WEB_FIRMWARE "0.6.4-delete-controls"
+#define HUB_WEB_FIRMWARE "0.6.5-reconnect-phases"
 #define HUB_WEB_CANDIDATES 16u
 typedef struct {
     uint8_t address[6], transport, type, roles;
@@ -23,7 +25,9 @@ typedef struct {
     bool saved, bonded, connected, encrypted, hid, ready, paused, pending;
     uint8_t transport, roles, address[6], record_slot;
     uint16_t interval;
-    uint32_t reports;
+    uint32_t reports, phase_age_ms, attempt_age_ms, last_report_age_ms, last_error;
+    uint8_t phase, pause_reason, cleanup_result;
+    bool report_seen, cleanup_pending;
     char name[256];
 } hub_web_input_t;
 
@@ -39,6 +43,8 @@ typedef struct {
     uint8_t trial_role, trial_phase, trial_address[6];
     uint8_t auth, auth_slot, candidate_count;
     hub_web_candidate_t candidates[HUB_WEB_CANDIDATES];
+    uint8_t event_count;
+    input_event_t events[HUB_INPUT_HISTORY];
 } hub_web_snapshot_t;
 
 esp_err_t hub_web_init(bool (*snapshot)(hub_web_snapshot_t *),

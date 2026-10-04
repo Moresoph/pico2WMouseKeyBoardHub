@@ -19,6 +19,7 @@
 #include "esp_console.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "hub_link.h"
@@ -29,6 +30,7 @@
 #include "reconnect_policy.h"
 #include "hub_ui.h"
 #include "auto_input_policy.h"
+#include "input_diagnostics.h"
 
 static const char *TAG = "dual-bt";
 _Static_assert(ESP_HID_TRANSPORT_BT==HUB_RECORD_CLASSIC && ESP_HID_TRANSPORT_BLE==HUB_RECORD_BLE,
@@ -42,6 +44,8 @@ enum {
 enum { AUTH_NONE, AUTH_CONFIRM, AUTH_PASSKEY, AUTH_PIN };
 enum { INPUT_PAIRING_WINDOW_MS = 120000 };
 enum { BLE_MOUSE_INTERVAL_UNITS = 6, BLE_MOUSE_INTERVAL_MAX_ATTEMPTS = 3 };
+typedef enum { PAUSE_NONE, PAUSE_OPERATOR, PAUSE_SECURITY, PAUSE_INVALID_HID,
+               PAUSE_CLEANUP_TIMEOUT } pause_reason_t;
 typedef enum {
     LED_IDLE,
     LED_RECONNECTING,
@@ -62,6 +66,11 @@ typedef struct {
     uint8_t reconnect_failures;
     uint8_t profile_failures;
     uint32_t recovery_at;
+    input_link_clock_t clock;
+    pause_reason_t pause_reason;
+    bool cleanup_pending, report_seen;
+    uint32_t cleanup_token, cleanup_retry_at, cleanup_request_at, last_report_at, last_error;
+    uint8_t cleanup_result;
     bool bonded;
     uint16_t interval;
     char name[256];
@@ -78,6 +87,8 @@ static SemaphoreHandle_t mutex;
 static QueueHandle_t snapshots, uart_events, ble_opens;
 static nvs_handle_t store;
 static uint32_t nonce, session, request_at, sent_at, sent_count, overflow_count, encryption_token;
+static uint32_t cleanup_token;
+static input_history_t history;
 static uint16_t sequence;
 static bool classic_ready, scanning, scan_ble_pending, scan_cancelled;
 enum { SCAN_NONE, SCAN_CLASSIC, SCAN_BLE };
@@ -91,6 +102,14 @@ typedef struct {
     bool connected, encrypted, security_failure;
 } classic_encryption_event_t;
 static QueueHandle_t encryption_events;
+typedef struct {
+    uint8_t address[6], status;
+    uint16_t handle;
+    uint32_t generation, token;
+    hub_cleanup_result_t result;
+    esp_err_t submission_error;
+} cleanup_event_t;
+static QueueHandle_t cleanup_events,cleanup_submissions;
 static hub_input_records_t saved_inputs;
 static bool records_fault;
 static bool record_names_dirty;
@@ -118,6 +137,7 @@ static input_trial_t trial;
 static uint32_t now_ms(void);
 static esp_err_t save_target(unsigned i,const uint8_t *address,uint8_t transport,uint8_t type,bool allow_open);
 static void manage_tick(void);
+static void reject_auth(peer_t *p);
 static void update_saved_name(const uint8_t address[6], const char *name);
 static bool management_open(void){return management_until && (int32_t)(now_ms()-management_until)<0;}
 
@@ -129,6 +149,12 @@ void hub_esp_classic_encryption_result(const uint8_t address[6], uint32_t genera
                                         .status = status, .flags = flags};
     memcpy(event.address, address, 6);
     configASSERT(xQueueSend(encryption_events, &event, 0) == pdTRUE);
+}
+void hub_esp_classic_cleanup_result(const uint8_t address[6], uint16_t handle, uint32_t generation,
+                                    uint32_t token, hub_cleanup_result_t result, uint8_t status) {
+    cleanup_event_t event = {.handle=handle,.generation=generation,.token=token,.result=result,.status=status};
+    memcpy(event.address,address,6);
+    configASSERT(xQueueSend(cleanup_events,&event,0)==pdTRUE);
 }
 
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
@@ -143,6 +169,14 @@ static uint32_t random_nonzero(void) {
 static void check_result(esp_err_t error, const char *operation) {
     if (error != ESP_OK) ESP_LOGE(TAG, "%s failed: %s", operation, esp_err_to_name(error));
 }
+static void note_input(peer_t *p,input_event_kind_t kind,uint32_t detail) {
+    input_event_t event = {.at=now_ms(),.slot=(uint8_t)(p-peers)+1,.phase=p->clock.phase,
+                           .kind=kind,.detail=detail};
+    input_history_add(&history,&event);
+}
+static void input_phase(peer_t *p,input_link_phase_t phase) {
+    input_link_enter(&p->clock,phase,now_ms());
+}
 static peer_t *peer_for(const uint8_t *address, unsigned transport) {
     if (!address) return NULL;
     for (unsigned i = 0; i < HUB_LINK_SLOTS; ++i)
@@ -150,13 +184,15 @@ static peer_t *peer_for(const uint8_t *address, unsigned transport) {
             memcmp(peers[i].address, address, 6) == 0) return &peers[i];
     return NULL;
 }
-bool hub_esp_classic_recovery_current(const uint8_t address[6], uint16_t handle, uint32_t generation) {
-    if (xSemaphoreTake(mutex, 0) != pdTRUE) return false;
+hub_cleanup_guard_t hub_esp_classic_recovery_check(const uint8_t address[6], uint16_t handle,
+                                                  uint32_t generation,uint32_t token) {
+    if (xSemaphoreTake(mutex, 0) != pdTRUE) return HUB_CLEANUP_DEFERRED;
     peer_t *p = peer_for(address, ESP_HID_TRANSPORT_BT);
     bool current = p && p->recovering && p->classic_acl_connected &&
-        p->classic_handle == handle && p->acl_generation == generation;
+        p->classic_handle == handle && p->acl_generation == generation &&
+        p->cleanup_pending && p->cleanup_token==token;
     unlock();
-    return current;
+    return current?HUB_CLEANUP_CURRENT:HUB_CLEANUP_STALE;
 }
 static bool pairing_window_open(const peer_t *p) {
     return p && input_pairing_window_open(p->selected, p->paused, now_ms(), p->pair_until);
@@ -191,6 +227,7 @@ static void begin_classic_incoming(peer_t *p) {
     p->pending = true;
     p->opened_at = now_ms();
     ++p->incoming_connections;
+    input_phase(p,INPUT_PHASE_HID);
     ESP_LOGI(TAG, "input %u accepted saved-target Classic incoming connection; awaiting encrypted HID",
              (unsigned)(p - peers) + 1);
 }
@@ -286,6 +323,7 @@ static void release_peer(peer_t *p) {
     p->interval_attempts = 0;
     p->interval = 0;
     p->encryption_pending = false;
+    p->report_seen = false;
     uint8_t epoch = p->input.epoch + 1u;
     memset(&p->input, 0, sizeof(p->input));
     p->input.epoch = epoch;
@@ -293,23 +331,157 @@ static void release_peer(peer_t *p) {
 }
 static void retry_peer(peer_t *p) {
     p->pending = p->recovering = p->profile_requested = false;
+    p->cleanup_pending=false;
     if (p->reconnect_failures < 5) ++p->reconnect_failures;
     p->retry_at = now_ms() + input_reconnect_backoff(p->reconnect_failures);
+    input_phase(p,p->paused?INPUT_PHASE_PAUSED:INPUT_PHASE_IDLE);
 }
 static void recover_peer(peer_t *p, const char *reason) {
     if (!p->recovering) {
         p->recovering = p->pending = true;
         p->recovery_at = now_ms();
+        p->cleanup_retry_at=now_ms();p->cleanup_pending=false;
+        input_phase(p,INPUT_PHASE_CLEANUP);
         release_peer(p);
+        note_input(p,INPUT_EVENT_RECOVER,0);
         ESP_LOGW(TAG, "input %u recovery: %s; bond/pairing policy unchanged",
                  (unsigned)(p - peers) + 1, reason);
     }
+    if(p->cleanup_pending || !due(now_ms(),p->cleanup_retry_at))return;
     if (p->classic_acl_connected) {
-        check_result(hub_esp_classic_close_acl(p->address, p->classic_handle, p->acl_generation),
-                     "close stalled Classic ACL without deleting bond");
+        p->cleanup_pending=true;p->cleanup_token=++cleanup_token;p->cleanup_request_at=now_ms();
+        cleanup_event_t request={.handle=p->classic_handle,.generation=p->acl_generation,.token=p->cleanup_token};
+        memcpy(request.address,p->address,6);
+        esp_err_t error=xQueueSend(cleanup_submissions,&request,0)==pdTRUE?ESP_OK:ESP_ERR_NO_MEM;
+        check_result(error,"queue Classic cleanup; awaiting explicit result");
+        if(error!=ESP_OK){
+            p->cleanup_pending=false;p->cleanup_retry_at=now_ms()+250;p->last_error=error;
+            note_input(p,INPUT_EVENT_CLEANUP_RESULT,(uint32_t)error);
+        }
     } else if (p->dev) {
         check_result(esp_hidh_dev_close(p->dev), "close recovering input");
+        p->cleanup_retry_at=now_ms()+1000;
     } else if (!p->open_running) retry_peer(p);
+}
+static void submit_cleanups(void) {
+    cleanup_event_t request;
+    /* Post outside the application mutex; immediate BTU execution must not contend with its own caller. */
+    while(xQueueReceive(cleanup_submissions,&request,0)==pdTRUE){
+        esp_err_t error=hub_esp_classic_close_acl(request.address,request.handle,request.generation,request.token);
+        if(error!=ESP_OK){
+            check_result(error,"submit Classic cleanup to BTU");
+            request.result=HUB_CLEANUP_FAILED;request.status=0xff;request.submission_error=error;
+            configASSERT(xQueueSend(cleanup_events,&request,0)==pdTRUE);
+        }
+    }
+}
+static void input_hid_closed(peer_t *p) {
+    p->dev=NULL;p->profile_requested=false;
+    release_peer(p);
+    note_input(p,INPUT_EVENT_HID_CLOSE,0);
+    p->pending=p->classic_acl_connected;
+    if(!p->classic_acl_connected && !p->open_running)retry_peer(p);
+    else if(!p->recovering){
+        p->classic_incoming=p->classic_acl_connected;p->opened_at=now_ms();
+        input_phase(p,INPUT_PHASE_HID);
+    }
+}
+static void input_acl_up(peer_t *p,uint16_t handle) {
+    bool replacement=p->classic_acl_connected && p->classic_handle!=handle;
+    if(!p->classic_acl_connected || replacement){
+        ++p->acl_generation;p->profile_failures=0;p->classic_acl_encrypted=false;
+        p->encryption_pending=false;p->secure=false;
+    }
+    p->classic_acl_connected=true;p->classic_handle=handle;
+    if(!p->mapped){
+        p->pending=true;p->opened_at=now_ms();
+        if(!p->recovering)input_phase(p,INPUT_PHASE_HID);
+    }
+    note_input(p,INPUT_EVENT_ACL_UP,handle);
+    if(replacement)recover_peer(p,"replacement ACL while previous HID resources still owned");
+}
+static bool input_acl_down(peer_t *p,uint16_t handle,uint8_t reason) {
+    if(!p->classic_acl_connected || p->classic_handle!=handle)return false;
+    p->classic_acl_connected=p->classic_acl_encrypted=false;p->cleanup_pending=false;++p->acl_generation;
+    release_peer(p);p->classic_incoming=false;
+    if(reason && reason!=0xff)p->last_error=reason;
+    note_input(p,INPUT_EVENT_ACL_DOWN,reason);
+    if(!p->dev && !p->open_running)retry_peer(p);
+    else {
+        p->pending=true;
+        if(!p->recovering){p->recovering=true;p->recovery_at=now_ms();input_phase(p,INPUT_PHASE_CLEANUP);}
+        p->cleanup_retry_at=now_ms()+500;
+    }
+    return true;
+}
+static void handle_cleanup_event(const cleanup_event_t *event) {
+    peer_t *p=peer_for(event->address,ESP_HID_TRANSPORT_BT);
+    if(!p || !p->recovering || !p->cleanup_pending || p->cleanup_token!=event->token ||
+       p->acl_generation!=event->generation || p->classic_handle!=event->handle)return;
+    p->cleanup_pending=false;p->cleanup_result=event->result;
+    note_input(p,INPUT_EVENT_CLEANUP_RESULT,((uint32_t)event->result<<8)|event->status);
+    if(event->result==HUB_CLEANUP_ABSENT){
+        input_acl_down(p,event->handle,0xff);
+    }else{
+        p->cleanup_retry_at=now_ms()+(event->result==HUB_CLEANUP_LOCK_BUSY?100u:
+            event->result==HUB_CLEANUP_FAILED?500u:2000u);
+        if(event->result==HUB_CLEANUP_FAILED)
+            p->last_error=event->submission_error?event->submission_error:event->status;
+    }
+    ESP_LOGI(TAG,"input %u cleanup result=%u stack-status=%u; queued is not disconnected",
+             (unsigned)(p-peers)+1,event->result,event->status);
+}
+static void maintain_peer(peer_t *p) {
+    uint32_t now=now_ms();
+    if(p->auth && due(now,p->pair_until))reject_auth(p);
+    if(p->recovering){
+        if(!p->dev && !p->classic_acl_connected && !p->open_running){retry_peer(p);return;}
+        if(input_link_expired(&p->clock,now,false)){
+            p->paused=true;p->pending=false;
+            if(p->pause_reason!=PAUSE_SECURITY && p->pause_reason!=PAUSE_INVALID_HID)
+                p->pause_reason=PAUSE_CLEANUP_TIMEOUT;
+            p->cleanup_pending=false;p->recovering=false;
+            release_peer(p);input_phase(p,INPUT_PHASE_PAUSED);
+            note_input(p,INPUT_EVENT_PAUSED,p->pause_reason);
+            ESP_LOGE(TAG,"input %u cleanup deadline: SDK resource still owned (dev=%u ACL=%u worker=%u); "
+                     "no unsafe free/reopen; use retry after checking diagnostics",
+                     (unsigned)(p-peers)+1,p->dev!=NULL,p->classic_acl_connected,p->open_running);
+            return;
+        }
+        if(p->cleanup_pending && now-p->cleanup_request_at>=2000){
+            p->cleanup_pending=false;p->cleanup_retry_at=now;
+            note_input(p,INPUT_EVENT_CLEANUP_RESULT,0xffff);
+            ESP_LOGW(TAG,"input %u cleanup result overdue; safely rechecking current link",(unsigned)(p-peers)+1);
+        }
+        if(!p->cleanup_pending && due(now,p->cleanup_retry_at))recover_peer(p,"retry confirmed cleanup");
+        return;
+    }
+    if(p->paused)return;
+    if(p->pending && p->mapped && forwarding_allowed(p)){
+        p->pending=false;p->pair_until=0;p->reconnect_failures=p->profile_failures=0;
+        input_phase(p,INPUT_PHASE_READY);note_input(p,INPUT_EVENT_READY,p->reports);
+    }
+    if(input_link_expired(&p->clock,now,pairing_window_open(p))){
+        p->last_error=ESP_ERR_TIMEOUT;
+        ESP_LOGW(TAG,"input %u %s deadline; phase-age=%" PRIu32 "ms attempt-age=%" PRIu32 "ms",
+                 (unsigned)(p-peers)+1,input_link_phase_name(p->clock.phase),
+                 now-p->clock.phase_at,now-p->clock.attempt_at);
+        reject_auth(p);recover_peer(p,"phase/overall connection deadline");
+    }
+}
+static esp_err_t retry_input(unsigned role) {
+    if(role<1 || role>2 || trial.phase || scanning || requested_scan)return ESP_ERR_INVALID_STATE;
+    peer_t *p=&peers[role-1];
+    if(!p->selected || p->pause_reason==PAUSE_SECURITY || p->pause_reason==PAUSE_INVALID_HID ||
+       (p->transport==ESP_HID_TRANSPORT_BT? !classic_bonded(p->address):!ble_bonded(p->address)))
+        return ESP_ERR_INVALID_STATE;
+    p->paused=false;p->pause_reason=PAUSE_NONE;p->reconnect_failures=p->profile_failures=0;
+    p->pair_until=0;reject_auth(p);note_input(p,INPUT_EVENT_RETRY,0);
+    if(p->dev || p->open_running || p->classic_acl_connected || p->recovering){
+        if(!p->recovering)recover_peer(p,"operator retry; close old link first");
+    }else{p->pending=false;p->profile_requested=false;p->retry_at=now_ms();input_phase(p,INPUT_PHASE_IDLE);}
+    ESP_LOGI(TAG,"input %u operator retry; no PIN/pairing window and no lost bond",(unsigned)role);
+    return ESP_OK;
 }
 static void reject_auth(peer_t *p) {
     if (p->pin_replied) {
@@ -346,8 +518,8 @@ static void auth_request(peer_t *p, unsigned kind, uint32_t number) {
         if (p->pin16) {
             reject_auth(p);
             p->paused = true;
-            release_peer(p);
-            if (p->dev) check_result(esp_hidh_dev_close(p->dev), "close incompatible PIN input");
+            p->pause_reason=PAUSE_SECURITY;
+            recover_peer(p,"incompatible PIN input");
             ESP_LOGE(TAG, "input %u requires a 16-character legacy PIN; fixed PIN %s is incompatible; paused",
                      slot, CLASSIC_FIXED_PIN);
             return;
@@ -360,8 +532,8 @@ static void auth_request(peer_t *p, unsigned kind, uint32_t number) {
         if (error != ESP_OK) {
             p->auth = AUTH_NONE;
             p->paused = true;
-            release_peer(p);
-            if (p->dev) check_result(esp_hidh_dev_close(p->dev), "close after PIN reply failure");
+            p->pause_reason=PAUSE_SECURITY;
+            p->last_error=error;recover_peer(p,"PIN reply failure");
             return;
         }
         p->pin_replied = true;
@@ -480,7 +652,8 @@ static void hid_event(void *arg, esp_event_base_t base, int32_t event, void *dat
                      ESP_BD_ADDR_HEX(address));
             check_result(esp_hidh_dev_close(dev), "close unselected input");
         }
-        if (p && (event == ESP_HIDH_CLOSE_EVENT ||
+        if(p && event==ESP_HIDH_CLOSE_EVENT){input_hid_closed(p);}
+        else if (p && (
                   (event == ESP_HIDH_OPEN_EVENT && e->open.status != ESP_OK))) {
             p->dev = NULL;
             release_peer(p);
@@ -517,15 +690,16 @@ static void hid_event(void *arg, esp_event_base_t base, int32_t event, void *dat
                 if (!p->open_running) retry_peer(p);
             }
             ESP_LOGE(TAG, "input %u open failed: %s", slot, esp_err_to_name(e->open.status));
+            p->last_error=e->open.status;note_input(p,INPUT_EVENT_OPEN_FAILED,(uint32_t)e->open.status);
         } else {
             if (transport == ESP_HID_TRANSPORT_BT && !classic_admitted(p)) {
                 p->dev = dev;
                 p->pending = true;
                 p->opened_at = now_ms();
                 p->paused = true;
+                p->pause_reason=PAUSE_SECURITY;
                 reject_auth(p);
-                release_peer(p);
-                check_result(esp_hidh_dev_close(dev), "close Classic input without bond/consent");
+                recover_peer(p,"Classic input without bond/consent");
                 ESP_LOGW(TAG, "input %u Classic admission rejected: no bond or explicit pairing window; paused", slot);
                 unlock();
                 return;
@@ -552,10 +726,12 @@ static void hid_event(void *arg, esp_event_base_t base, int32_t event, void *dat
             p->mapped = valid && p->hid.roles;
             if (!p->mapped) {
                 p->paused = true;
-                release_peer(p);
-                check_result(esp_hidh_dev_close(dev), "close unsupported HID");
+                p->pause_reason=PAUSE_INVALID_HID;
+                recover_peer(p,"unsupported HID descriptor");
                 ESP_LOGE(TAG, "input %u unsupported HID descriptor; paused, no boot-layout guessing", slot);
             } else {
+                input_phase(p,p->secure?INPUT_PHASE_READY:INPUT_PHASE_ENCRYPT);
+                note_input(p,INPUT_EVENT_HID_OPEN,p->hid.roles);
                 ESP_LOGI(TAG, "input %u HID open roles=%u encrypted=%u; waiting for real input", slot, p->hid.roles, p->secure);
                 if (transport == ESP_HID_TRANSPORT_BLE && !p->secure)
                     check_result(esp_ble_set_encryption(p->address, ESP_BLE_SEC_ENCRYPT), "BLE encryption");
@@ -565,10 +741,8 @@ static void hid_event(void *arg, esp_event_base_t base, int32_t event, void *dat
         }
     } else if (event == ESP_HIDH_CLOSE_EVENT) {
         if (p->dev && p->dev != dev) { unlock(); return; }
-        p->dev = NULL;
-        release_peer(p);
-        p->pending = p->classic_acl_connected;
-        if (!p->classic_acl_connected && !p->open_running) retry_peer(p);
+        input_hid_closed(p);
+        if(e->close.reason)p->last_error=(uint32_t)e->close.reason;
         ESP_LOGI(TAG, "input %u closed; reason=%d", slot, e->close.reason);
         /* Pinned IDF 5.5.1 postprocess handler frees the device after this callback. */
     } else if (event == ESP_HIDH_INPUT_EVENT && p->dev == dev && p->mapped && forwarding_allowed(p)) {
@@ -576,8 +750,8 @@ static void hid_event(void *arg, esp_event_base_t base, int32_t event, void *dat
                                   e->input.data, e->input.length, &p->input)) {
             ++p->invalid;
             p->paused = true;
-            release_peer(p);
-            check_result(esp_hidh_dev_close(dev), "close malformed HID");
+            p->pause_reason=PAUSE_INVALID_HID;
+            recover_peer(p,"malformed HID report");
             ESP_LOGE(TAG, "input %u invalid report map=%u id=%u len=%u; paused", slot,
                      e->input.map_index, e->input.report_id, e->input.length);
         } else {
@@ -586,6 +760,8 @@ static void hid_event(void *arg, esp_event_base_t base, int32_t event, void *dat
                     p->hid.reports[i].id == e->input.report_id)
                     p->seen_roles |= p->hid.reports[i].roles;
             ++p->reports;
+            p->last_report_at=now_ms();
+            if(!p->report_seen){p->report_seen=true;note_input(p,INPUT_EVENT_FIRST_REPORT,p->reports);}
             if (p->reports == 1) ESP_LOGI(TAG, "input %u first decoded HID report", slot);
             queue_state();
             p->input.dx = p->input.dy = p->input.wheel = 0;
@@ -604,16 +780,7 @@ static void classic_gap(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *e) {
                      ESP_BD_ADDR_HEX(e->acl_conn_cmpl_stat.bda),
                      e->acl_conn_cmpl_stat.stat, e->acl_conn_cmpl_stat.handle);
             if (p && e->acl_conn_cmpl_stat.stat == ESP_BT_STATUS_SUCCESS) {
-                if (!p->classic_acl_connected) {
-                    ++p->acl_generation;
-                    p->profile_failures = 0;
-                }
-                p->classic_acl_connected = true;
-                p->classic_handle = e->acl_conn_cmpl_stat.handle;
-                if (!p->mapped) {
-                    p->pending = true;
-                    p->opened_at = now_ms();
-                }
+                input_acl_up(p,e->acl_conn_cmpl_stat.handle);
             }
             if (e->acl_conn_cmpl_stat.stat == ESP_BT_STATUS_SUCCESS && (!p || !p->profile_requested)) {
                 if (classic_admitted(p) && !p->recovering) begin_classic_incoming(p);
@@ -623,16 +790,9 @@ static void classic_gap(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *e) {
         case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT:
             p = peer_for(e->acl_disconn_cmpl_stat.bda, ESP_HID_TRANSPORT_BT);
             if (p) {
-                if (!p->classic_acl_connected || p->classic_handle != e->acl_disconn_cmpl_stat.handle) break;
+                if (!input_acl_down(p,e->acl_disconn_cmpl_stat.handle,e->acl_disconn_cmpl_stat.reason)) break;
                 ESP_LOGI(TAG, "input %u Classic ACL disconnected reason=%u",
                          (unsigned)(p - peers) + 1, e->acl_disconn_cmpl_stat.reason);
-                p->classic_acl_connected = p->classic_acl_encrypted = false;
-                ++p->acl_generation;
-                if (!p->dev) {
-                    if (!p->open_running) retry_peer(p);
-                }
-                release_peer(p);
-                p->classic_incoming = false;
             }
             break;
         case ESP_BT_GAP_DISC_RES_EVT:
@@ -689,6 +849,7 @@ static void classic_gap(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *e) {
                 p->auth = AUTH_NONE;
                 p->pin_replied = false;
                 p->bonded = classic_bonded(p->address);
+                note_input(p,INPUT_EVENT_ENCRYPT,e->auth_cmpl.stat);
                 ESP_LOGI(TAG, "input %u Classic auth status=%u", (unsigned)(p - peers) + 1, e->auth_cmpl.stat);
                 if (e->auth_cmpl.stat != ESP_BT_STATUS_SUCCESS) {
                     p->paused = e->auth_cmpl.stat == ESP_BT_STATUS_AUTH_FAILURE ||
@@ -696,6 +857,8 @@ static void classic_gap(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *e) {
                         e->auth_cmpl.stat == ESP_BT_STATUS_HCI_AUTH_FAILURE ||
                         e->auth_cmpl.stat == ESP_BT_STATUS_HCI_KEY_MISSING ||
                         e->auth_cmpl.stat == ESP_BT_STATUS_HCI_HOST_REJECT_SECURITY;
+                    p->pause_reason=p->paused?PAUSE_SECURITY:PAUSE_NONE;
+                    p->last_error=e->auth_cmpl.stat;
                     recover_peer(p, p->paused ? "authentication/key failure; explicit action required" : "temporary authentication transport failure");
                 }
             }
@@ -706,6 +869,7 @@ static void classic_gap(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *e) {
                 bool was_secure = p->secure;
                 p->secure = e->enc_chg.enc_mode != ESP_BT_ENC_MODE_OFF;
                 p->classic_acl_encrypted = p->secure;
+                note_input(p,INPUT_EVENT_ENCRYPT,e->enc_chg.enc_mode);
                 ESP_LOGI(TAG, "input %u GAP encryption mode=%u generation=%" PRIu32,
                          (unsigned)(p - peers) + 1, e->enc_chg.enc_mode, p->acl_generation);
                 if (was_secure && !forwarding_allowed(p)) recover_peer(p, "encryption disabled");
@@ -821,12 +985,13 @@ static void ble_gap(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *e) {
                 p->auth = AUTH_NONE;
                 p->pin_replied = false;
                 p->bonded = ble_bonded(p->address);
+                note_input(p,INPUT_EVENT_ENCRYPT,e->ble_security.auth_cmpl.fail_reason);
                 ESP_LOGI(TAG, "input %u BLE encryption=%u reason=%u", (unsigned)(p - peers) + 1,
                          p->secure, e->ble_security.auth_cmpl.fail_reason);
                 if (!p->secure) {
                     p->paused = true;
-                    release_peer(p);
-                    if (p->dev) check_result(esp_hidh_dev_close(p->dev), "close insecure BLE input");
+                    p->pause_reason=PAUSE_SECURITY;p->last_error=e->ble_security.auth_cmpl.fail_reason;
+                    recover_peer(p,"BLE authentication/key failure");
                 }
                 request_mouse_interval(p);
                 queue_state();
@@ -859,8 +1024,10 @@ static void gattc_event(esp_gattc_cb_event_t event, esp_gatt_if_t interface, esp
     if (event == ESP_GATTC_CONNECT_EVT) {
         lock();
         peer_t *p = peer_for(e->connect.remote_bda, ESP_HID_TRANSPORT_BLE);
-        if (p && !p->paused)
+        if (p && !p->paused) {
+            input_phase(p,INPUT_PHASE_HID);
             check_result(esp_ble_set_encryption(p->address, ESP_BLE_SEC_ENCRYPT), "BLE link encryption");
+        }
         unlock();
     }
     esp_hidh_gattc_event_handler(event, interface, e);
@@ -913,6 +1080,8 @@ static void uart_task(void *arg) {
             ESP_LOGW(TAG, "Pico heartbeat lost; discarding queued input");
         }
         classic_encryption_event_t encrypted;
+        cleanup_event_t cleanup;
+        while(xQueueReceive(cleanup_events,&cleanup,0)==pdTRUE)handle_cleanup_event(&cleanup);
         while (xQueueReceive(encryption_events, &encrypted, 0) == pdTRUE) {
             peer_t *p = peer_for(encrypted.address, ESP_HID_TRANSPORT_BT);
             if (!p || !input_classic_encryption_current(p->selected, p->paused, p->classic_acl_connected,
@@ -922,6 +1091,7 @@ static void uart_task(void *arg) {
             }
             p->encryption_pending = false;
             p->secure = p->classic_acl_encrypted = encrypted.encrypted;
+            note_input(p,INPUT_EVENT_ENCRYPT,encrypted.status);
             ESP_LOGI(TAG, "input %u Classic encryption completion: status=%u stack-flags=0x%02x encrypted=%u",
                      (unsigned)(p - peers) + 1, encrypted.status, encrypted.flags, encrypted.encrypted);
             if (!encrypted.connected) {
@@ -930,6 +1100,7 @@ static void uart_task(void *arg) {
                 recover_peer(p, "link disappeared during encryption; wait for HID CLOSE before retry");
             } else if (!p->secure) {
                 p->paused = encrypted.security_failure;
+                p->pause_reason=p->paused?PAUSE_SECURITY:PAUSE_NONE;p->last_error=encrypted.status;
                 recover_peer(p, p->paused ? "security failure; explicit action required" : "temporary encryption failure");
             }
             queue_state();
@@ -976,6 +1147,7 @@ static void uart_task(void *arg) {
             count=hub_link_encode(&f,wire);ui_sent_at=now_ms();
         }
         unlock();
+        submit_cleanups();
         if (count) {
             int written = uart_write_bytes(UART_NUM_1, wire, count);
             lock();
@@ -1041,33 +1213,13 @@ static void connection_task(void *arg) {
         lock();
         uint32_t now = now_ms();
         for (unsigned i = 0; i < HUB_LINK_SLOTS; ++i) {
-            peer_t *p = &peers[i];
-            if (p->auth && due(now, p->pair_until)) reject_auth(p);
-            if (p->pending && p->mapped && forwarding_allowed(p)) {
-                p->pending = false;
-                p->pair_until = 0;
-                p->reconnect_failures = 0;
-                p->profile_failures = 0;
-            }
-            if (p->recovering) {
-                if (!p->dev && !p->classic_acl_connected && !p->open_running) retry_peer(p);
-                else if ((uint32_t)(now - p->recovery_at) >= 5000) {
-                    p->recovery_at = now;
-                    recover_peer(p, "waiting for disconnect/open worker");
-                }
-                continue;
-            }
-            input_reconnect_view_t view = reconnect_view(p);
-            if (input_reconnect_plan(&view, now, false) == INPUT_RECOVER) {
-                reject_auth(p);
-                recover_peer(p, "connection/security deadline; automatic cleanup and retry");
-            }
+            maintain_peer(&peers[i]);
         }
         int classic_index = -1;
-        if (!scanning) {
+        {
             for (unsigned i = 0; i < HUB_LINK_SLOTS; ++i) {
                 peer_t *p = &peers[i];
-                if(management_open() && !p->mapped && !(trial.phase==2 && trial.role==i+1))continue;
+                if(input_scan_blocks_transport(p->transport==ESP_HID_TRANSPORT_BT,requested_scan,active_scan,scanning))continue;
                 if (p->transport == ESP_HID_TRANSPORT_BT && !classic_ready) continue;
                 bool busy = false;
                 for (unsigned j = 0; j < HUB_LINK_SLOTS; ++j) {
@@ -1079,11 +1231,14 @@ static void connection_task(void *arg) {
                 if (action != INPUT_OPEN && action != INPUT_ATTACH) continue;
                 if (action == INPUT_ATTACH && !classic_admitted(p)) {
                     p->paused = true;
+                    p->pause_reason=PAUSE_SECURITY;
                     recover_peer(p, "incoming ACL has no bond/pairing consent");
                     continue;
                 }
                 p->pending = p->open_running = p->profile_requested = true;
                 p->opened_at = now;
+                input_phase(p,p->classic_acl_connected?INPUT_PHASE_HID:INPUT_PHASE_PAGE);
+                note_input(p,INPUT_EVENT_OPEN,p->classic_acl_connected);
                 if (p->transport == ESP_HID_TRANSPORT_BT && p->classic_acl_connected) {
                     p->secure = p->classic_acl_encrypted;
                     ESP_LOGI(TAG, "input %u attaching HID to existing Classic ACL", i + 1);
@@ -1118,6 +1273,8 @@ static bool web_snapshot(hub_web_snapshot_t *out) {
     out->pico_age_ms = now - pico_output.received_at;
     out->pico_fresh = out->uart_online && hub_link_output_fresh(&pico_output, nonce, session, now);
     out->output = pico_output.value;
+    out->event_count=(uint8_t)history.count;
+    input_history_snapshot(&history,out->events);
     out->records=saved_inputs;
     out->auto_enrollment=auto_enrollment;
     out->records_fault=records_fault;
@@ -1148,6 +1305,12 @@ static bool web_snapshot(hub_web_snapshot_t *out) {
         input->roles = p->hid.roles;
         input->interval = p->interval;
         input->reports = p->reports;
+        input->phase=p->clock.phase;input->phase_age_ms=now-p->clock.phase_at;
+        input->attempt_age_ms=p->clock.attempting?now-p->clock.attempt_at:0;
+        input->report_seen=p->report_seen;
+        input->last_report_age_ms=p->report_seen?now-p->last_report_at:0;
+        input->last_error=p->last_error;input->pause_reason=p->pause_reason;
+        input->cleanup_pending=p->cleanup_pending;input->cleanup_result=p->cleanup_result;
         memcpy(input->address, p->address, 6);
         memcpy(input->name, p->name, sizeof(input->name));
         if (!trial.phase || trial.role != i + 1) {
@@ -1217,7 +1380,8 @@ static esp_err_t scan_inputs(bool classic) {
 static void start_queued_scan(void) {
     if(!requested_scan || !management_open() || trial.phase)return;
     for(unsigned i=0;i<2;++i)
-        if(peers[i].open_running || peers[i].recovering || (peers[i].pending&&!peers[i].mapped)){
+        if(((requested_scan==SCAN_CLASSIC)==(peers[i].transport==ESP_HID_TRANSPORT_BT)) &&
+           (peers[i].open_running || peers[i].recovering || (peers[i].pending&&!peers[i].mapped))){
             if(now_ms()-scan_requested_at>=INPUT_RECONNECT_TIMEOUT_MS+10000u){
                 requested_scan=SCAN_NONE;
                 snprintf(operation,sizeof(operation),"旧连接未能结束，扫描未开始；原记录保留，可重新授权重试");
@@ -1287,6 +1451,12 @@ static esp_err_t handle_management(const hub_web_command_t *cmd) {
     if(!management_open() || strcmp(cmd->token,management_token) || records_fault)return ESP_ERR_INVALID_STATE;
     if(!strcmp(cmd->action,"cancel")){close_management();snprintf(operation,sizeof(operation),"已取消，旧设备记录保留");return ESP_OK;}
     if(deletion_pending)return ESP_ERR_INVALID_STATE;
+    if(!strcmp(cmd->action,"retry")){
+        esp_err_t error=retry_input(cmd->slot);
+        snprintf(operation,sizeof(operation),error==ESP_OK?"已请求重连原设备，不重配、不删除记录":
+                 "重试未执行：请结束扫描/试配；密钥或报告格式错误不能自动绕过");
+        return error;
+    }
     if(!strcmp(cmd->action,"manual")){
         auto_enrollment=false;auto_stage=0;stop_scan();
         snprintf(operation,sizeof(operation),"手动管理已开启，扫描停止后可删除记录或选择设备");
@@ -1589,7 +1759,14 @@ static int console_command(int argc, char **argv) {
     lock();
     int slot = argc > 1 ? slot_number(argv[1]) : -1;
     peer_t *p = slot >= 0 ? &peers[slot] : NULL;
-    if(!strcmp(argv[0],"enroll")){
+    if(!strcmp(argv[0],"retry") && p && argc==2)result=retry_input((unsigned)slot+1)!=ESP_OK;
+    else if(!strcmp(argv[0],"history") && argc==1){
+        input_event_t events[HUB_INPUT_HISTORY];input_history_snapshot(&history,events);
+        for(unsigned i=0;i<history.count;++i)printf("input-event at-ms=%" PRIu32 " age-ms=%" PRIu32
+            " input=%u phase=%s event=%s detail=0x%" PRIx32 "\n",events[i].at,now_ms()-events[i].at,
+            events[i].slot,input_link_phase_name(events[i].phase),input_event_name(events[i].kind),events[i].detail);
+        result=0;
+    }else if(!strcmp(argv[0],"enroll")){
         if(argc==1 || (argc==2 && !strcmp(argv[1],"auto"))){
             open_management();
             result=management_open()?0:1;
@@ -1605,6 +1782,8 @@ static int console_command(int argc, char **argv) {
         printf("ESP32 input firmware " HUB_WEB_FIRMWARE ", UART1 TX=%d RX=%d baud=460800, Pico-link=%u packets=%" PRIu32
                " overflows=%" PRIu32 "\n", LINK_UART_TX_PIN, LINK_UART_RX_PIN,
                !!nonce, sent_count, overflow_count);
+        printf("ESP32 uptime-ms=%" PRIu32 " free-heap=%" PRIu32 "; history shows last %u connection events, no key payloads\n",
+               now_ms(),esp_get_free_heap_size(),HUB_INPUT_HISTORY);
         printf("Classic HID security: encryption required, MITM not required (unless explicitly open-connected)\n");
         esp_bt_gap_profile_status_t gap_status;
         esp_err_t gap_error = esp_bt_gap_get_profile_status(&gap_status);
@@ -1645,6 +1824,12 @@ static int console_command(int argc, char **argv) {
             printf("input %u reconnect: worker=%u recovering=%u profile-request=%u failures=%u retry-in-ms=%" PRIu32 "\n",
                    i + 1, peers[i].open_running, peers[i].recovering, peers[i].profile_requested,
                    peers[i].reconnect_failures, due(now_ms(), peers[i].retry_at) ? 0 : peers[i].retry_at - now_ms());
+            printf("input %u phase=%s phase-age-ms=%" PRIu32 " attempt-age-ms=%" PRIu32
+                   " pause-reason=%u cleanup-pending=%u cleanup-result=%u last-error=0x%" PRIx32
+                   " report-seen=%u last-report-age-ms=%" PRIu32 "\n",i+1,input_link_phase_name(peers[i].clock.phase),
+                   now_ms()-peers[i].clock.phase_at,peers[i].clock.attempting?now_ms()-peers[i].clock.attempt_at:0,
+                   peers[i].pause_reason,peers[i].cleanup_pending,peers[i].cleanup_result,peers[i].last_error,
+                   peers[i].report_seen,peers[i].report_seen?now_ms()-peers[i].last_report_at:0);
             if (peers[i].transport == ESP_HID_TRANSPORT_BLE && peers[i].dev) {
                 esp_gap_conn_params_t params;
                 esp_err_t error = esp_ble_get_current_conn_params(peers[i].address, &params);
@@ -1706,6 +1891,7 @@ static int console_command(int argc, char **argv) {
             check_result(e, "persist input target");
             if (e == ESP_OK) {
                 p->selected = true; p->paused = false;
+                p->pause_reason=PAUSE_NONE;
                 p->transport = transport; p->address_type = type;
                 p->allow_open = allow_open;
                 if (allow_open)
@@ -1719,6 +1905,7 @@ static int console_command(int argc, char **argv) {
         }
     } else if (!strcmp(argv[0], "disconnect") && p && argc == 2) {
         p->paused = true; p->pair_until = now_ms();
+        p->pause_reason=PAUSE_OPERATOR;
         reject_auth(p);
         release_peer(p);
         recover_peer(p, "user disconnect");
@@ -1771,9 +1958,11 @@ void app_main(void) {
     mutex = xSemaphoreCreateMutex();
     snapshots = xQueueCreate(64, sizeof(hub_link_input_t) * HUB_LINK_SLOTS);
     encryption_events = xQueueCreate(8, sizeof(classic_encryption_event_t));
+    cleanup_events=xQueueCreate(8,sizeof(cleanup_event_t));
+    cleanup_submissions=xQueueCreate(8,sizeof(cleanup_event_t));
     ble_opens = xQueueCreate(HUB_LINK_SLOTS, sizeof(unsigned));
     management_commands=xQueueCreate(4,sizeof(hub_web_command_t));
-    configASSERT(mutex && snapshots && encryption_events && ble_opens && management_commands);
+    configASSERT(mutex && snapshots && encryption_events && cleanup_events && cleanup_submissions && ble_opens && management_commands);
     gpio_config_t led = {
         .pin_bit_mask = 1ULL << STATUS_LED_PIN,
         .mode = GPIO_MODE_OUTPUT,
@@ -1880,6 +2069,8 @@ void app_main(void) {
     const struct { const char *name, *help; } commands[] = {
         {"enroll","enroll [auto|manual|cancel]; USB operator authorization, same admission path as BOOT long press"},
         {"status", "Board, UART link and two input-slot counters"},
+        {"history","Recent connection phase/errors, no actual keyboard/mouse input data"},
+        {"retry","retry <1|2>; immediately retry saved bonded input without new pairing, safe old-link cleanup first"},
         {"web", "web [on|off] OR web password <8..63 printable ASCII>; saved locally, USB only"},
         {"scan", "scan ble|classic (list only; never automatically authorizes a peer)"},
         {"connect", "connect <1|2> classic <MAC> OR connect <1|2> ble public|random <MAC>; 120s pairing window"},

@@ -14,7 +14,7 @@
 enum { ESP_HID_TRANSPORT_BT=0, ESP_HID_TRANSPORT_BLE=1 };
 enum { SCAN_NONE, SCAN_CLASSIC, SCAN_BLE };
 enum { AUTH_CONFIRM=1, AUTH_PASSKEY, AUTH_PIN, AUTH_NONE=0 };
-enum { INPUT_PAIRING_WINDOW_MS=120000, INPUT_RECONNECT_TIMEOUT_MS=40000 };
+enum { INPUT_PAIRING_WINDOW_MS=120000 };
 enum { ESP_BT_INQ_MODE_GENERAL_INQUIRY, BLE_SCAN_TYPE_ACTIVE, BLE_ADDR_TYPE_PUBLIC,
        BLE_SCAN_FILTER_ALLOW_ALL, BLE_SCAN_DUPLICATE_ENABLE, pdTRUE=1 };
 typedef struct {
@@ -66,6 +66,7 @@ static void check_result(esp_err_t error,const char *what){(void)what;if(error!=
 static bool pairing_allowed(const peer_t *p){return management_open() && p->pending && !p->paused && p->pair_until>clock_ms;}
 static bool old_address(const uint8_t *a){return a[0]==1 || a[0]==2;}
 static void update_saved_name(const uint8_t address[6],const char *name);
+static esp_err_t retry_input(unsigned role){(void)role;return ESP_ERR_INVALID_STATE;}
 static bool classic_bonded(const uint8_t *a){return old_address(a);}
 static bool ble_bonded(const uint8_t *a){return old_address(a);}
 static void queue_state(void){++states;}
@@ -181,6 +182,9 @@ int main(void){
     reset();admit();peers[1].mapped=peers[1].secure=true;peers[1].hid.roles=2;fail_write=true;
     manage_tick();assert(records_fault && trial.abort && saved_inputs.slots[1].used && !saved_inputs.slots[2].used);
     close_old();manage_tick();assert(!trial.phase && peers[1].address[0]==2 && removed[0]==3);
+    reset();peers[0].open_running=true;peers[0].mapped=false;
+    assert(scan_inputs(false)==ESP_OK);manage_tick();
+    assert(scans==1&&scanning); /* Classic recovery cannot hold up BLE discovery. */
     reset();peers[1].open_running=true;assert(scan_inputs(false)==ESP_OK);
     close_management();close_old();manage_tick();assert(!scans && !requested_scan && !trial.phase);
     reset();peers[1].open_running=true;assert(scan_inputs(false)==ESP_OK);

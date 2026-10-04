@@ -16,8 +16,8 @@ int main(void) {
     assert(input_reconnect_plan(&peers[0], 100, other_transport_busy(peers, 0)) == INPUT_OPEN);
     peers[0].pending = peers[0].acl = true;
     peers[0].started_at = 100;
-    assert(input_reconnect_plan(&peers[0], 5099, other_transport_busy(peers, 0)) == INPUT_WAIT);
-    assert(input_reconnect_plan(&peers[0], 5100, other_transport_busy(peers, 0)) == INPUT_ATTACH);
+    assert(input_reconnect_plan(&peers[0], 1099, other_transport_busy(peers, 0)) == INPUT_WAIT);
+    assert(input_reconnect_plan(&peers[0], 1100, other_transport_busy(peers, 0)) == INPUT_ATTACH);
     peers[0].profile_requested = true;
     assert(input_reconnect_plan(&peers[0], 5101, false) == INPUT_WAIT);
     assert(input_reconnect_plan(&peers[0], 40100, false) == INPUT_RECOVER);

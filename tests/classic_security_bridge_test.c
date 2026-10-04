@@ -25,6 +25,12 @@ static bool reply_connected, reply_encrypted, reply_security;
 static uint16_t acl_handle = 0x80;
 static unsigned acl_closes;
 static uint32_t acl_generation = 1;
+static uint32_t cleanup_token=1;
+static bool guard_busy;
+static hub_cleanup_result_t close_result;
+static uint32_t close_token;
+static unsigned close_completions;
+static uint8_t remove_status;
 static void (*work)(void *);
 static void *work_context, *pending_context;
 static tBTM_SEC_CBACK *pending_callback;
@@ -57,14 +63,22 @@ static uint16_t BTM_GetHCIConnHandle(BD_ADDR address, tBT_TRANSPORT transport) {
     assert(address[0] == 1 && transport == BT_TRANSPORT_BR_EDR);
     return acl_handle;
 }
-bool hub_esp_classic_recovery_current(const uint8_t address[6], uint16_t handle, uint32_t generation) {
+hub_cleanup_guard_t hub_esp_classic_recovery_check(const uint8_t address[6], uint16_t handle,
+                                                  uint32_t generation,uint32_t token) {
     assert(address[0] == 1);
-    return handle == acl_handle && generation == acl_generation;
+    if(guard_busy)return HUB_CLEANUP_DEFERRED;
+    return handle == acl_handle && generation == acl_generation && token==cleanup_token?
+        HUB_CLEANUP_CURRENT:HUB_CLEANUP_STALE;
+}
+void hub_esp_classic_cleanup_result(const uint8_t address[6],uint16_t handle,uint32_t generation,
+                                    uint32_t token,hub_cleanup_result_t result,uint8_t status){
+    (void)handle;(void)generation;(void)status;assert(address[0]==1);
+    close_result=result;close_token=token;++close_completions;
 }
 static tBTM_STATUS btm_remove_acl(BD_ADDR address, tBT_TRANSPORT transport) {
     assert(address[0] == 1 && transport == BT_TRANSPORT_BR_EDR);
     ++acl_closes;
-    return BTM_SUCCESS;
+    return remove_status;
 }
 static tBTM_STATUS BTM_SetEncryption(BD_ADDR address, tBT_TRANSPORT transport,
                                     tBTM_SEC_CBACK *callback, void *context) {
@@ -121,28 +135,38 @@ int main(void) {
     assert(hub_esp_classic_encrypt(address, 13) == ESP_OK);
     work(work_context);
     assert(reply_security && !reply_encrypted && !outstanding);
-    assert(hub_esp_classic_close_acl(address, 0x80, 1) == ESP_OK);
+    assert(hub_esp_classic_close_acl(address, 0x80, 1,1) == ESP_OK);
     work(work_context);
-    assert(acl_closes == 1 && !outstanding);
-    assert(hub_esp_classic_close_acl(address, 0x80, 1) == ESP_OK);
+    assert(acl_closes == 1 && !outstanding && close_result==HUB_CLEANUP_SENT);
+    assert(hub_esp_classic_close_acl(address, 0x80, 1,1) == ESP_OK);
     acl_handle = 0x81;
     work(work_context);
-    assert(acl_closes == 1 && !outstanding); /* Never disconnect a replacement ACL. */
+    assert(acl_closes == 1 && !outstanding && close_result==HUB_CLEANUP_OBSOLETE);
     acl_handle = 0x80;
-    assert(hub_esp_classic_close_acl(address, 0x80, 1) == ESP_OK);
+    assert(hub_esp_classic_close_acl(address, 0x80, 1,1) == ESP_OK);
     acl_generation = 2; /* Even if the controller reuses the same numeric handle. */
     work(work_context);
     assert(acl_closes == 1 && !outstanding);
     link_up = false;
-    assert(hub_esp_classic_close_acl(address, 0x80, 2) == ESP_OK);
+    assert(hub_esp_classic_close_acl(address, 0x80, 2,1) == ESP_OK);
     work(work_context);
-    assert(acl_closes == 1 && !outstanding);
+    assert(acl_closes == 1 && !outstanding && close_result==HUB_CLEANUP_ABSENT);
+    link_up=true;guard_busy=true;
+    assert(hub_esp_classic_close_acl(address,0x80,2,1)==ESP_OK);work(work_context);
+    assert(close_result==HUB_CLEANUP_LOCK_BUSY && acl_closes==1 && !outstanding);
+    guard_busy=false;cleanup_token=2;
+    assert(hub_esp_classic_close_acl(address,0x80,2,1)==ESP_OK);work(work_context);
+    assert(close_result==HUB_CLEANUP_OBSOLETE && acl_closes==1 && close_token==1);
+    remove_status=3;
+    assert(hub_esp_classic_close_acl(address,0x80,2,2)==ESP_OK);work(work_context);
+    assert(close_result==HUB_CLEANUP_FAILED && acl_closes==2 && !outstanding);
+    assert(close_completions==7);
     post = false;
     assert(hub_esp_classic_encrypt(address, 12) == ESP_FAIL && !outstanding);
-    assert(hub_esp_classic_close_acl(address, 0x80, 2) == ESP_FAIL && !outstanding);
+    assert(hub_esp_classic_close_acl(address, 0x80, 2,2) == ESP_FAIL && !outstanding);
     allocate = false;
     assert(hub_esp_classic_encrypt(address, 13) == ESP_ERR_NO_MEM && !outstanding);
-    assert(hub_esp_classic_close_acl(address, 0x80, 2) == ESP_ERR_NO_MEM && !outstanding);
+    assert(hub_esp_classic_close_acl(address, 0x80, 2,2) == ESP_ERR_NO_MEM && !outstanding);
     for (unsigned bits = 0; bits < 32; ++bits) {
         bool selected = (bits & 1) != 0, paused = (bits & 2) != 0, connected = (bits & 4) != 0;
         bool mapped = (bits & 8) != 0, requested = (bits & 16) != 0;

@@ -1,5 +1,37 @@
 # Pico 2 W Bluetooth keyboard/mouse hub
 
+**ESP32 reconnect correction (`0.6.5-reconnect-phases`):** closing a Classic
+HID profile now clears the old profile request and permits reattachment to its
+live ACL after one second instead of waiting for the old 40-second deadline.
+Saved-device recovery continues during manual management; discovery blocks
+only its own transport, so BLE discovery does not block the Classic keyboard.
+Classic cleanup has explicit queued/sent, lock-busy, obsolete, absent and
+failure handling, with handle/generation/request-token checks. BTU submission
+runs outside the application mutex to avoid contention with its own caller.
+
+Paging, HID setup, encryption and cleanup have separate 40/15/12/20-second
+deadlines; an ordinary connection attempt has a non-resetting 65-second
+overall limit. An authorized pairing attempt retains its 120-second security
+window. Missing SDK completion enters a visible paused fault; it never frees
+SDK-owned resources or starts a duplicate worker. `status` includes phase,
+report age, pause reason and cleanup state; `history` shows the latest 24
+connection events without key contents. `retry 1` / `retry 2`, or the physically
+authorized web retry button, retries the saved bond without deleting records
+or opening a PIN/pairing window. Key/security and invalid-HID faults are not
+bypassed. A ready but idle keyboard is never disconnected merely for silence.
+
+The final application was flashed and verified on 2026-10-04; pairing NVS was
+byte-identical before reboot, and Pico firmware was not changed. Production
+lifecycle regressions cover both HID/ACL close orders, mutex boundaries, queue/
+post failures, late replies, deadlines, scan isolation and security-preserving
+retry. The first live run restored encrypted FILCO/M585 input with real reports;
+its retry trace exposed the mutex contention corrected in the final image.
+Final-image M585 reconnected encrypted/HID-ready, but FILCO was not reachable
+in the final bounded observation (HCI page timeout `0x04`); its manual retry
+immediately bypassed backoff without re-pairing. Final live-ACL cleanup timing
+and sustained keyboard acceptance still require a reachable/woken keyboard.
+This is not proof that every intermittent physical/radio stall is eliminated.
+
 **Pico output-load correction (`0.6.2-hid-dedup`):** the dual-board output backend
 no longer queues an unchanged keyboard snapshot or a mouse report with unchanged
 buttons and zero movement/wheel. Comparison uses the latest pending report of

@@ -70,3 +70,11 @@ $exe=Join-Path $out 'ap_password_test.exe'
 if($LASTEXITCODE){throw 'AP password policy compilation failed'}
 & $exe
 if($LASTEXITCODE){throw 'AP password policy tests failed'}
+& $cmake "-DROOT=$root" "-DOUTPUT=$out\reconnect_lifecycle_generated.inc" -P "$root\tests\generate_reconnect_lifecycle_test.cmake"
+if($LASTEXITCODE){throw 'Production reconnect extraction failed'}
+$exe=Join-Path $out 'reconnect_lifecycle_test.exe'
+& $cc -Wall -Werror "-I$out" "-I$root\include" "-I$root\esp32\main" "-I$root\tests\esp_stubs" `
+    "-I$root\.deps\esp-idf\components\esp_common\include" "$root\tests\reconnect_lifecycle_test.c" -o $exe
+if($LASTEXITCODE){throw 'Production reconnect compilation failed'}
+& $exe
+if($LASTEXITCODE){throw 'Production reconnect tests failed'}
