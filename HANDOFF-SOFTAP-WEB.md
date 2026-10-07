@@ -1,8 +1,231 @@
 # ESP32 + Pico 2 W 热点网页交接
 
-更新日期：2026-10-04。最新状态见首节；下方早期日期/用户确认属于历史记录。
+更新日期：2026-10-07。最新状态见首节；下方早期日期/用户确认属于历史记录。
 
-## 2026-10-04 16:08 用户确认初步可用并要求提交（最新）
+## 2026-10-07 20:28 用户要求保存当前可用release（最新）
+
+用户先反馈“鼠标又好了，不再频繁断”，随后明确要求commit为release。
+本轮只保存代码/本地tag，**不刷板、不重启、不改变参数/配对/选中电脑**。
+release名称`v0.6.11`，实际组合ESP32 `0.6.11-wifi-default-off` +
+Pico `0.6.2-hid-dedup`（Pico不变），现有v0.6.3等标签不动，不push。
+用户确认对应当前版本的可用状态，不等于已经找到鼠标超时根因。
+
+关键是release不能混入未上板debug：先将工作区未部署的diag相关source/
+tests备份到本机会话目录
+`pending-debug-before-v0.6.11-release`，所有原pending全diff备份
+`pre-v0.6.11-full-working.patch`；随后只撤回本会话新增日志candidate，
+保留用户已部署sleepOFF/mouseactivity/WiFi默认OFF等改动，调整测试提取
+目标为实际release。不修改Git HEAD/分支、不stash/reset/rebase、不删除
+配对数据。**当前源码已不含diag候选，basic status/history保持**；
+以前“当前工作区版本xxx-diag”的段落都是历史，日志代码仍可从backup恢复。
+
+逐文件核对当前tracked `esp32/include/src` 87份文件与实际部署隔离source
+一致（仅规范化CRLF）；Pico source/构建版本相对ffc7f38不变。最新已部署
+镜像仍74CCD804（ESP）/2640C219（Pico），build目录没有覆盖已部署镜像。
+从repository根source用部署sdkconfig重新完整构建在
+`build\esp32-release-v0.6.11`，不刷入。路径/编译元数据不同允许hash不同，
+不要说release rebuild必定与隔离部署binary逐字节复现。
+重新构建通过，无编译warning，镜像SHA256
+`7596631D133C2AF38F0838CDBB998EAC0C8000E7B9EE77106E9546B3629CCD70`，
+1452128字节、app partition剩83872字节；actual板上仍74CCD804镜像，
+本轮未刷入rebuild。staged87份firmware文件同样与部署source一致。
+release生产mouseactivity/cleanretry/records/webstartup/button回归和原
+33组output/dual去重通过。异常使用HCI0x08发生过、随后无频繁断线只是
+用户观测改善；release notes保留这个限度，不能承诺永久稳定/4PC验收。
+
+## 2026-10-07 默认Wi-Fi关闭与使用中鼠标断线监听
+
+用户要求核对WiFi并刷入“默认关闭，只有双击开启”；随后要求先监听使用中
+也掉线。首先只读确认原0.6.10当时WebOFF，因此不能再说是WiFi未关导致。
+暂停刷写，42秒被动监听（前35秒无status/history输出）捕获：
+`BT_HCI rsn0x8`在26382610ms，应用cleanup26382623ms，CLOSE reason8；
+底层先超时、13ms后应用才收尾，无新的activity参数请求/协商错误记录。
+键盘/PC1持续在线，UART framing0、输出queue0/overflow0。
+鼠标恢复后报告259023，后续又读到ready仅5秒、reports259817→259872，
+仍是7.5ms/latency44/timeout2160，attempts0/invalid0。这与用户使用中
+也断线的反馈一致，不得说一定是省电、WiFi或大厂鼠标不可能出问题。
+确切底层原因仍未定位；此前关闭WiFi一次稳定只是有限观察，不是根因证明。
+原始日志留session files `mouse-active-drops-20261007-*.log`，
+不记录按键/不上传私密数据。Pico历史最大queue等待6.6秒不是当前队列
+积压，不当成这次根因（当前queue0/普通报告仍增加）。
+
+继续完成用户已授权的单点WiFi改动，实际已部署：
+**ESP32 `0.6.11-wifi-default-off` / Pico `0.6.2-hid-dedup`不变**。
+boot只初始化WiFi配置，不 `esp_wifi_start`/HTTPstart；每次重启仍OFF，
+不持久ONflag。BOOTruntime double-click是唯一开启路径，长按仅录入，不
+隐式开WiFi；USB `web on`明确拒绝并提示doubleclick，保留web status/off/
+password，密码写入不会把OFF热点开启。要网页管理先双击开热点再长按授权。
+同一点击规则仍可双击关闭。仅这些路径改动，其余sleepOFF/mouseactivity/
+latency/timeout/重连/parse/records/Pico/SDK完全原样；不混pendingdiag。
+
+独立source来自本轮前实际0.6.10代码快照，逐文件核对只有main控制按键/
+help、hub_web初始不开/USBon拒绝、版本CMake/header四文件预期差异。
+真实hub_web_init/set_enabled/command函数提取测试bootOFF、物理路径可
+toggleON/OFF、on拒绝、status/password不偷偷启用、initialization/控制
+错误保留；真实按钮helper测试long/short/none不enable、long仍enrollment，
+double才返回toggle。原输入/解析/cleanup/鼠标activity安全和Picooutput
+回归通过。一次stub `esp_err_to_name`静态声明warning导致-Werror失败，
+仅改stub符合SDK声明后通过，不放宽warning或生产行为。最终build无warning。
+
+```text
+build\esp32-bt-awake\pico_dual_bt_input.bin
+SHA256 74CCD804E2401589B399D8A26072529E3EC198E37DB18863663447664B055520
+backups\esp32-0.6.10-before-wifi-default-off.bin
+旧镜像SHA256 42E908C868C855AD8E2056013089C3BAA9C265FD5181F4C128E74932B2049798
+```
+
+核MAC10:52:1C:1D:92:34，COM15 app-only0x10000写入1452160字节verify。
+最新NVS0x9000/0x6000启动前字节保持不变（不回灌旧keys/password）：
+`backups\esp32-nvs-before-wifi-default-off-20261007.bin`、
+`backups\esp32-nvs-after-wifi-default-off-before-boot-20261007.bin`。
+postboot实际WebOFF/initESP_OK/firmware0.6.11，鼠标encrypted/HIDready、
+11.25ms/latency44/timeout2160、0 reports：未做真实移动测试，peer参数
+保持原策略不因ready强制7.5ms；键盘当时仍page/ESP_FAIL未ready。
+Pico0.6.2一直没刷/重启，PC1ready/queue0/overflow0、UARTonline/framing0。
+**这只验收WiFi默认关闭，不是频繁鼠标断线已解决**。没有为恢复键盘额外
+重启、重配或改参数；等设备可达/活动再验收真实转发，不注入模拟输入。
+
+当前工作区版本0.6.11-wifi-default-off-diag仍含之前未上板diagnostic，
+板上是不含diag的0.6.11-wifi-default-off。HEADffc7f38不变，无commit/push。
+本轮前部署source压缩备份/session `mouse-activity-isolated-before-wifi-default-off-20261007.zip`；
+工作区原pending diff也备份。不能用旧verifymouse脚本代替新WiFi精确比对，
+本轮脚本`verify-wifi-default-off-source.py`。
+
+## 2026-10-06 09:30 用户要求活动时调间隔，并授权直接刷板（最新）
+
+实际已刷 **ESP32 0.6.10-mouse-activity**，Pico仍0.6.2，没动Pico；
+不混入待上板diag代码，蓝牙modem sleep保持OFF。只改变鼠标参数触发：
+HID就绪、BLEauth成功和参数更新回执均不自动请求7.5ms；真实移动/滚轮/
+按钮变化才考虑请求，keyboard或零动作重复状态不算mouse activity。
+队列先保存报告再请求参数，不等待协商才转发；间隔/timeout/latency值
+由SDK读取，**只请求interval=7.5ms，latency和timeout原样保留**。
+SDK读取和请求至少间隔10秒、pending时不重发，连续最多3次未满足快速
+间隔就不再干预，确认快速间隔或重连才重置预算。没有idle定时主动关闭
+或强制降速；第一下仍受省电时实际间隔影响，不承诺零延迟唤醒。
+
+隔离source继续从ffc7f38导出基线＋sleepoff＋本次activity策略构建，
+policy/helper与生产callback测试的工作区内容逐字节一致，所有其他导出
+文件逐一核对。未混入此前withdrawn优化或未提交diag，不改SDK/Pico/NVS/
+重连/解析器/监督超时。旧0.6.9镜像先备份，复用build目录快速增量build：
+
+```text
+build\esp32-bt-awake\pico_dual_bt_input.bin
+SHA256 42E908C868C855AD8E2056013089C3BAA9C265FD5181F4C128E74932B2049798
+backups\esp32-0.6.9-bt-awake-before-mouse-activity.bin
+旧镜像SHA256 BA06B40B666A731B489DA36B457FA52E96FD4E4B696E5320195320E7F6975A59
+```
+
+原native输入/录入/生命周期、33组Picooutput/dedup回归通过；真实
+hid_event+实际参数policy测试idle/peerupdate无请求、motion/wheel/button
+触发、1000数据包pending期间正常转发、10秒边界、连续失败限额、已快/
+读取失败/安全门禁/配对试用隔离/重连reset/wrap。build无warning且sleepoff。
+测试中报告计数初次断言错1，按实际1keyboard+1noop+1motion+1000修正，
+生产逻辑未为通过断言偷改；隔离source初次比对空白缩进差异已统一核验。
+
+COM15核MAC10:52:1C:1D:92:34，app-only0x10000写入1451952字节并verify。
+当前配对/设置NVS启动前逐字节不变：
+`backups\esp32-nvs-before-mouse-activity-20261006-0931.bin`、
+`backups\esp32-nvs-after-mouse-activity-before-boot-20261006-0931.bin`。
+Pico0.6.2串口确认UART online/framing0、PC1ready/queue0/overflow0，
+当时mouse role尚未恢复，没有实际鼠标数据验收。ESPconsole刷后多次出现
+COM15 mapping unavailable/FileNotFound/WriteFile AccessDenied；一次只读
+PnP/DOS mapping显示返回后再次打开write仍失效。没有为修USB乱重启或
+强行重枚举，已停止反复串口探测。**最终协商参数和掉线改善未读到**，
+不能把flashverify说成用户手感已通过。
+
+09:05用户已双击关WiFi，WebOFF实测。但app重启会默认start热点；
+尝试query web时写失败，未确认/恢复OFF；用户若要继续保持关闭可双击
+ESPBOOT。这个USB限制需如实交代，不能声称热点仍关闭。无commit/push。
+当前工作区含pendingdiag版本0.6.10-mouse-activity-diag，板上是无diag
+0.6.10-mouse-activity，不要从当前工作区label误认已部署内容。
+
+## 2026-10-04 23:28 用户要求关闭ESP32蓝牙sleep
+
+用户明确“不需要考虑省电”，仅关闭ESP32蓝牙controller modem sleep。
+查当前0.6.7实际sdkconfig发现默认ORIG modem sleep开启、主晶振计时，
+CPU PM关闭；旧版同样开启，因此不是已确定root cause。之前鼠标真实
+HCI0x08断线、空闲相关但并非每次空闲必断，不把常见BLE省电说成正常
+反复断线，也不先改鼠标latency来代替验证ESP自身sleep。
+
+本轮配置 `CONFIG_BTDM_CTRL_MODEM_SLEEP=n`，编译时整个controller
+sleep模式NONE，而不是调用不支持接口后忽略错误。实际SDK在modem sleep
+未启用时使用 `BTDM_MODEM_SLEEP_MODE_NONE`；CPU PM仍关闭。主工程源码
+加同配置与开机提示，保留未刷入的debug代码、版本`0.6.9-bt-awake-diag`。
+**板上实验镜像不混入diag**：由 `git archive ffc7f38` 导出到ignored
+`build\esp32-bt-awake-source`，只改sleep默认、开机说明和版本0.6.9，
+`.deps` junction复用固定SDK而不改SDK。实际build目录`build\esp32-bt-awake`。
+所有导出文件与accepted zip逐个比对（仅规范化CRLF），确认只有4个文件
+精确预期差异；鼠标7.5ms/latency44/timeout、retry、NVS/网页/扫描、Pico
+均accepted基线不变。不撤回未提交日志、不commit、不push、旧镜像不覆盖。
+实际generated sdkconfig/header已验证modem sleep OFF、PM OFF；不能仅
+凭defaults宣称旧构建目录里sleep也关了。
+已完成独立build，无warning；用户授权下只写ESP32application，实际
+板上**0.6.9-bt-awake**，Pico仍0.6.2，未刷/重启Pico。日志候选未混入。
+
+```text
+build\esp32-bt-awake\pico_dual_bt_input.bin
+SHA256 BA06B40B666A731B489DA36B457FA52E96FD4E4B696E5320195320E7F6975A59
+```
+
+MAC核`10:52:1C:1D:92:34`、COM15，app-only0x10000写入1451664字节、
+verify匹配，当前NVS0x9000/0x6000启动前逐字节相同：
+`backups\esp32-nvs-before-bt-awake-20261004-2329.bin`、
+`backups\esp32-nvs-after-bt-awake-before-boot-20261004-2329.bin`。
+没有删配对/密钥或覆盖原NVS；旧0.6.7可用镜像仍D8F1393D，HEAD仍ffc7f38，
+未commit/push/改tag。导出代码可以用accepted zip+精确4文件差异复现。
+
+38秒启动读取确认版本0.6.9，键盘和鼠标正常加密/HIDready，keyboard11
+报告、mouse391报告、invalid0，鼠标实际7.5ms/latency44/timeout2160ms，
+PC1 ready/queue0/overflow0，Pico0.6.2/UART framing0。没有注入输入。
+此窗口未看到鼠标CLOSE，但不是人工控制的移动/静置重复试验，不宣称根因
+确定或所有空闲掉线已消除。开机sleep日志可能在串口接入前已经输出；
+生成config/header与最终binary检查保证只编译sleep-disabled路径，
+没有伪称捕获过开机提示。原生input/生产diag回归也通过。
+新的工作区0.6.9-bt-awake-diag包含未上板日志，不等于实际0.6.9-bt-awake；
+既有build目录需重新配置n才能继承，默认修改不覆盖历史sdkconfig。
+
+## 2026-10-04 16:08 已提交可用版本；日志候选单独开发
+
+可用0.6.7版本已按用户要求提交 **`ffc7f38`**，没有push/改标签。
+当前板上仍ESP32 `0.6.7-clean-retry` / Pico `0.6.2-hid-dedup`，
+用户反馈暂时未发现问题。后续仅debug日志候选 `0.6.8-connection-diag`，
+**未刷板、未commit**，独立构建目录 `build\esp32-connection-diag`；
+不覆盖可用0.6.7镜像，不重启设备，不修改连接/重试策略和外围功能。
+
+新增USB只读 `diag`：每input连接attempt ID、原始失败code/domain/time、
+HCI常见错误说明、last descriptor SDK read seen/status/maps/data-present/
+length/CRC、当前dev/ACL/worker/recovering/paused和retry delay、事件计数、
+report age、UART framing/overflow。`history`增强记录attempt elapsed、
+generation、Classic handle、资源状态bitmask，仍最多24条RAM事件。
+失败历史独立保留，不被ready掩盖；紧随ACL失败的通用ESP_FAIL不覆盖具体
+HCI status。只分析HCI域，其他SDK错误不错误套用HCI意义。
+不同失败回调可以多计数，计数不是“独立故障次数”；按target配置重置，
+环形覆盖不清累计计数，重启不持久。初次incoming ACL与补HID保持同轮ID，
+cleanup完后新连接才新ID，elapsed包含ready期间时间，非物理端到端时延。
+
+重要：`diag/history`先短持锁复制，**解锁后打印**，新增记录路径仅写RAM，
+不每个按键/鼠标包输出、不额外广播/查SDK/写Flash；不会查日志时主动
+重连。既有 `status` 锁内打印、NVS并发、mouse参数、Pico队列/切换、网页
+轮询JSON保持不变。本轮没有重引入此前撤回的优化。
+只记录连接元数据，不记录按键/按钮/位移、PIN/passkey、密钥或密码。
+既有配对交互提示和web-password USB命令不属于这份redacted输出。
+网页仍显示基本事件；新增完整字段走USB，避免增加JSON内存/轮询负担。
+资源状态/cleanup结果/stale详情码解读见README。
+最终生产callback/记录/打印测试通过，验证同轮ID、错误域优先级、时间回绕、
+计数保留、descriptor摘要以及diag执行前后连接/输入状态不变、每次printf
+均未持input mutex。原输入录入/CRC/释放与33组Pico输出/dual去重回归通过。
+ESP32独立build通过，无编译warning，未刷板：
+
+```text
+build\esp32-connection-diag\pico_dual_bt_input.bin
+SHA256 1E3C748FA8E3851C801C6AAB6B5C846917C27108ABE7F7A51D63F625FFFEA47B
+```
+
+当前板上0.6.7镜像仍是D8F1393D，未重启或修改记录；新diag命令只有更新
+日志候选后才存在，不能现在在0.6.7上声称已使用。日志补丁留未提交，
+ffc7f38始终指用户确认的无新增日志版本。debug性能实机观察未宣称验收。
+
+## 2026-10-04 16:08 用户确认初步可用并要求提交
 
 用户反馈0.6.7“暂时没发现有什么问题”，要求先commit当前版本，再单独
 增加debug日志。此次认可对应ESP32 `0.6.7-clean-retry` / Pico `0.6.2-hid-dedup`，

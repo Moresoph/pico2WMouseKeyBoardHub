@@ -1,5 +1,59 @@
 # Usable dual-board release checkpoints
 
+## v0.6.11 — usable release (2026-10-07)
+
+The user requested preserving the current version as a release after reporting
+that frequent mouse disconnects had stopped. This is a usable release checkpoint,
+not proof of the original timeout root cause or certification of every device,
+sustained Mac workload, four-PC radio target or exception path.
+
+| Board | Release/deployed firmware | Deployed image SHA256 |
+| --- | --- | --- |
+| Original dual-mode ESP32 | `0.6.11-wifi-default-off` | `74CCD804E2401589B399D8A26072529E3EC198E37DB18863663447664B055520` |
+| Pico 2 W | `0.6.2-hid-dedup` (unchanged) | `2640C2197B08C6F8CEBA6F06A460000964C7F39D33E9F6E7134861D5A2D32F95` |
+
+### Changes since the accepted `ffc7f38` clean-retry checkpoint
+
+- Bluetooth controller modem sleep is disabled on ESP32. CPU power management
+  remains off; Pico firmware and output policies are unchanged.
+- Mouse fast-interval requests are activity-triggered, not made at HID readiness,
+  authentication completion or in response to peer idle-parameter updates.
+  Real movement, wheel steps and button changes can request 7.5ms, preserving
+  negotiated latency and supervision timeout. Pending requests, ten-second
+  spacing and a three-unsatisfied-request budget prevent repeated intervention.
+  Input is forwarded before considering negotiation; no-op mouse reports and
+  keyboard traffic cannot trigger requests.
+- Every boot leaves the Wi-Fi hotspot/HTTP server off, even if previously on.
+  ESP32 BOOT double-click toggles it on/off; long-press still opens enrollment
+  but does not enable Wi-Fi. USB `web on` is rejected; status, off and local
+  password configuration remain supported without implicitly enabling it.
+- Existing paired identities/keys, five input-record capacity, seven saved
+  PC identities, input cleanup/retry, routing and HID dedup are retained.
+
+### Validation and limits
+
+Release application/source files were compared against the exact source used
+for the deployed image. Unflashed debug additions were backed up locally and
+excluded: this release has the basic `status/history`, not the candidate `diag`
+command. Production tests cover activity/pending/cooldown/failure/rollover,
+HID/ACL cleanup ordering and releases, enrollment/deletion, boot-off and physical
+enable controls. The existing 33-group output and dual HID-dedup regressions pass.
+The release is built from repository source with modem sleep explicitly off;
+generated `sdkconfig` values, not only defaults, must reflect this setting.
+
+Prior app-only deployment verification passed and current ESP32 NVS remained
+byte-identical before boot; Pico was neither flashed nor rebooted for these
+updates. This release operation does not modify the boards or paired records.
+Intermittent HCI `0x08` mouse timeouts were previously observed even with Wi-Fi
+off and before application cleanup. The later user-reported improvement is not
+attributed to any one configuration without controlled evidence.
+
+The local annotated tag is `v0.6.11`; previous release tags are unchanged.
+No branch/tag push or hosted GitHub release is created by this local checkpoint.
+Firmware images, raw logs, credentials and NVS/flash backups remain excluded
+from source control. Build paths/timestamps may change hashes, so the table
+identifies the actual deployed images rather than promising reproducible hashes.
+
 ## 2026-10-04 accepted clean-retry checkpoint
 
 At 16:08 the user reported no issues noticed so far with the deployed ESP32

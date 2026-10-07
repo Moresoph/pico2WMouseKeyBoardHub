@@ -79,3 +79,11 @@ $exe=Join-Path $out 'reconnect_lifecycle_test.exe'
 if($LASTEXITCODE){throw 'Production reconnect compilation failed'}
 & $exe
 if($LASTEXITCODE){throw 'Production reconnect tests failed'}
+& $cmake "-DROOT=$root" "-DOUTPUT=$out\web_startup_generated.inc" -P "$root\tests\generate_web_startup_test.cmake"
+if($LASTEXITCODE){throw 'Production web startup extraction failed'}
+$exe=Join-Path $out 'web_startup_test.exe'
+& $cc -Wall -Werror "-I$out" "-I$root\tests\esp_stubs" "-I$root\.deps\esp-idf\components\esp_common\include" `
+    "$root\tests\web_startup_test.c" -o $exe
+if($LASTEXITCODE){throw 'Web startup compilation failed'}
+& $exe
+if($LASTEXITCODE){throw 'Web startup tests failed'}

@@ -1,6 +1,175 @@
 # Pico 2 W Bluetooth keyboard/mouse hub
 
-**Current deployed firmware (2026-10-04 15:35):** at the user's explicit request,
+**Usable release: `v0.6.11` (2026-10-07).** The repository source now matches the
+deployed **ESP32 `0.6.11-wifi-default-off` + Pico `0.6.2-hid-dedup`**.
+The user reported the mouse was no longer frequently disconnecting and requested
+this checkpoint. See [RELEASE-NOTES.md](RELEASE-NOTES.md) for behavior, deployed
+hashes and limitations. This is initial usable acceptance, not a proven timeout
+root-cause fix. No firmware update or paired-record change is part of committing
+this release. Unflashed `diag` additions are backed up outside the repository
+and excluded; only the deployed basic `status/history` is included.
+
+**Current deployed firmware (2026-10-07):** ESP32 `0.6.11-wifi-default-off`,
+Pico `0.6.2-hid-dedup` unchanged. The hotspot/HTTP server is **OFF on every
+boot**, even if enabled before restart. Only a deliberate ESP32 BOOT double-click
+toggles it ON/OFF. Long-press still opens input enrollment but no longer starts
+Wi-Fi; enable the hotspot separately by double-click before using the management
+page. USB `web` reads state/settings and `web off` can shut it down; `web on`
+is rejected with a physical-double-click instruction. Password changes do not
+enable a stopped hotspot, and there is no persisted "start enabled" flag.
+
+Only this Wi-Fi startup/button/console policy changed in the flashed image.
+Controller modem sleep remains OFF, mouse activity-only interval requests and
+all existing latency/timeout/reconnection settings are unchanged, and pending
+debug changes were not included. Exact isolated-source comparison and production
+startup/control/button regressions passed. App-only flash verification passed,
+pairing/password NVS was byte-identical before boot, and live startup confirmed
+`Web: OFF`. No keys/records were erased and Pico was not reset or flashed.
+The subsequent local release commit/tag does not push or update the devices.
+
+```text
+build\esp32-bt-awake\pico_dual_bt_input.bin
+SHA256 74CCD804E2401589B399D8A26072529E3EC198E37DB18863663447664B055520
+```
+
+**Mouse timeout root cause remains unconfirmed.** Before this update, Wi-Fi was already
+OFF and passive monitoring captured HCI `0x08` connection timeout, followed
+about 13ms later by application cleanup. There was no activity interval request
+in that capture; keyboard and PC/UART stayed online. This disproves assuming
+all drops require enabled Wi-Fi or an application "idle timeout", but does not
+identify the underlying radio/controller cause. During post-flash startup,
+the mouse reconnected encrypted/HID-ready at 11.25ms/latency44/timeout2160ms with
+zero reports (no fabricated activity); keyboard was still paging. Initial
+radio readiness does not certify sustained real input or absence of drops.
+The diagnostic variant was backed up and excluded from release source; release
+source is the non-diagnostic board version. Previous exact image remains
+`backups\esp32-0.6.10-before-wifi-default-off.bin`.
+
+**Previous deployed firmware (2026-10-06, history):** at the user's request, ESP32 was
+updated to `0.6.10-mouse-activity`; Pico stays `0.6.2-hid-dedup` untouched.
+Bluetooth modem sleep remains disabled. Mouse radio parameters are now left
+alone during idle, including after a successful peer parameter update or initial
+HID/authentication setup. Only a decoded movement, wheel step or button change
+can request a 7.5ms interval; unchanged mouse reports and keyboard traffic cannot.
+
+The input report is queued normally before considering the request, and
+forwarding does not wait for negotiation. Parameter reads/requests have a
+10-second spacing and pending-request gate. A streak of three requests that do
+not establish the fast interval stops further intervention until a confirmed
+fast interval or reconnection resets the budget. Peer-selected latency and
+supervision timeout are preserved; no idle disconnect/reconnect timer was added.
+The first input after idle still arrives at the peer's then-current interval;
+this cannot guarantee instant first-motion wake-up or fix all idle disconnects.
+
+Deployment is an isolated accepted-source build plus the existing sleep-off
+setting and only this activity policy, without pending diagnostic changes:
+
+```text
+build\esp32-bt-awake\pico_dual_bt_input.bin
+SHA256 42E908C868C855AD8E2056013089C3BAA9C265FD5181F4C128E74932B2049798
+```
+
+The build directory is reused; the previous exact sleep-only image remains
+`backups\esp32-0.6.9-bt-awake-before-mouse-activity.bin`. App-only flash verification
+passed and current pairing/settings NVS remained byte-identical before reboot.
+Pico UART was online with zero framing errors and PC1 ready with no output
+overflow. ESP32 USB re-enumeration/write errors prevented reading post-update
+actual mouse parameters; no claim of resolved idle drops or real-input acceptance
+is made. ESP32 boot normally starts the hotspot again; the previously requested
+Wi-Fi-off state could not be checked/restored through the unavailable console.
+Keep that runtime state separate from controller modem sleep being disabled.
+
+Production activity/callback tests cover idle peer updates, ready/auth exclusion,
+motion/wheel/button versus keyboard/no-op reports, immediate forwarding, pending
+requests, exact cooldown/failure budget, success/reconnection and uptime rollover.
+No Pico, paired records, parser, cleanup or supervision policy was changed.
+The current working source includes the still-unflashed diagnostics and is
+`0.6.10-mouse-activity-diag`; no commit or push was performed for this update.
+
+**Previous deployed firmware (2026-10-04 late evening, history):** ESP32
+`0.6.9-bt-awake` + unchanged Pico `0.6.2-hid-dedup`. At the user's request,
+only ESP32 Bluetooth controller sleep was disabled and flashed, without the
+pending `diag` changes. Pairing/settings NVS was byte-identical before boot.
+Keyboard and mouse reconnected encrypted/HID-ready with real reports, PC1
+remained ready and UART framing errors were zero. Short startup observation
+does not establish that all intermittent idle disconnects are eliminated.
+
+**ESP32 Bluetooth sleep disabled:** the source default is
+now `CONFIG_BTDM_CTRL_MODEM_SLEEP=n`. This disables controller modem sleep at
+build time, for both BLE and Classic; the existing CPU power-management setting
+remains off. It is not a mouse-latency change. No mouse interval, peripheral
+latency, supervision timeout, reconnection policy or Pico behavior is changed.
+Existing configured build directories must be reconfigured with this option
+off; editing defaults alone does not override a saved `sdkconfig`.
+
+To keep this experiment separate from unflashed diagnostic changes, the
+sleep-only firmware is built from exported accepted commit `ffc7f38` plus just
+the sleep setting, startup policy message and version `0.6.9-bt-awake`. The local
+source still includes pending diagnostics and is labeled `0.6.9-bt-awake-diag`;
+do not mistake it for the sleep-only image. Accepted `0.6.7` images remain intact
+as fallback. Disabling sleep is a single-variable experiment, not proof that
+modem sleep caused every earlier idle disconnect; power consumption will rise.
+Deployed sleep-only application SHA256:
+`BA06B40B666A731B489DA36B457FA52E96FD4E4B696E5320195320E7F6975A59`.
+Resolved generated configuration and compiled image were checked: modem sleep
+off, CPU PM still off, only the disabled startup-message path compiled.
+Mouse actual parameters remained 7.5ms / latency44 / timeout2160ms after
+reconnection; no artificial input or forced selection was used.
+
+**Accepted checkpoint and debug follow-up (2026-10-04 16:08, history):** the initially
+accepted/deployed ESP32 `0.6.7-clean-retry` + unchanged Pico `0.6.2-hid-dedup`
+are committed as `ffc7f38`. Nothing was pushed and existing tags are unchanged.
+The logging-only follow-up built as ESP32 `0.6.8-connection-diag` and **was not
+flashed**. It was retained locally and later backed up outside this release.
+Later deployments and the actual release source are described above.
+
+### Connection debug logs (logging candidate only)
+
+In the backed-up logging candidate, ESP32 USB `diag` captures connection counters,
+last failure, current resource ownership and the most recent 24 events.
+`history` prints just those events. Both copy data under the input mutex and
+print **after unlocking**; neither starts discovery, reconnects, reboots nor
+changes keys/bonds. No continuous per-report logging is added. Existing `status`
+and Pico `status`/`latency` remain available; this change does not move their
+other operations, modify NVS locking or change forwarding/retry policy.
+
+| Diagnostic | What it distinguishes |
+| --- | --- |
+| `attempt`, `elapsed-ms`, generation and Classic handle | Which connection attempt produced a failure and how long setup/cleanup took; an initial incoming ACL and its HID attach share a number |
+| Last failure domain, raw code, timestamp, attempt and HCI reason | Page timeout (`0x104` / HCI `0x04`), missing key, authentication or remote/local termination; generic SDK OPEN failure cannot hide its immediately preceding exact ACL status |
+| Last descriptor read: seen/status/map count/present/length/CRC | No read yet versus empty/unavailable SDK metadata versus a nonempty map rejected by the parser; no raw descriptor dump or input payload |
+| Worker, ACL, device, pending/recovering/paused flags, retry-scheduled delay and event counters | Waiting for actual ownership release versus the next allowed retry; counters survive ring overwrite |
+| Reports seen/age, UART overflow/framing counters | Healthy but idle input versus interrupted UART; no idle-driven recovery is introduced |
+
+Failure data is **historical**, not evidence that a currently ready connection
+is broken. Counters are RAM-only since boot or target configuration, not a
+persistent history. Attempts retain one ID through success, close and cleanup;
+after cleanup the next outgoing/incoming connection begins a new ID.
+Event elapsed time is time since that attempt started (including time connected),
+not physical end-to-end latency. Timing subtraction handles uptime rollover.
+Counts track callbacks/events rather than unique physical faults; one failed
+attempt can produce several related events.
+
+Event state bits are ACL=1, HID device=2, open worker=4, pending=8,
+recovering=16, encrypted=32, paused=64; Classic no-handle is `0xffff`.
+Cleanup-result detail packs result in the high byte and SDK status in the low
+byte: result 0=sent, 1=lock-busy, 2=obsolete, 3=absent, 4=failed;
+`0xffff` means a result was overdue. Stale-callback detail 1=CLOSE,
+2=failed OPEN, 3=cleanup reply, 4=encryption reply.
+Deadline failure code names the connection phase, not an HCI error; other
+domains retain their own SDK/error codes and are not guessed as HCI statuses.
+The existing webpage keeps its basic event list; full added metadata/counters
+are in USB `diag`/`history`, avoiding a larger polling JSON response.
+
+Debug records contain **no keycodes, button state, motion, PIN/passkeys or
+pairing key material**. Only first-report existence and counts are recorded.
+The pre-existing operator pairing prompts and USB-only hotspot-password command
+are not part of this redacted diagnostic dump; do not share those outputs as
+debug records. Production tests check observational state preservation,
+unlocked printing, descriptor summaries, error-domain precedence, IDs/counters
+and wraparound while re-running the accepted cleanup/report-safety paths.
+
+**Previous deployed firmware (2026-10-04 15:35, history):** at the user's explicit request,
 only ESP32 was updated to `0.6.7-clean-retry`; Pico remains `0.6.2-hid-dedup`
 and was not flashed or restarted. ESP32 app-only flash/readback passed and current
 NVS was byte-identical before boot. Runtime confirmed both versions, retained
@@ -555,8 +724,7 @@ with an online UART link and zero framing errors.
 
 ### Local SoftAP status website
 
-The optional-management firmware revision `0.5.2-softap-status` starts an
-ESP32-only Wi-Fi hotspot `PicoHub-XXXX` with a fixed management address
+The optional ESP32-only Wi-Fi hotspot `PicoHub-XXXX` uses a fixed management address
 `http://192.168.4.1`. It does not join a router, require the router's password,
 or provide Internet access/NAT. Connect the phone or management computer to
 this hotspot and explicitly keep the connection when the OS reports no Internet.
@@ -566,8 +734,10 @@ The WPA2 hotspot password is generated independently on first boot and saved
 in the ESP32 `hub_web` NVS namespace. It is not the keyboard pairing PIN, is
 not hard-coded in source, and is never returned by HTTP. Run `web` on the ESP32
 USB console to read the SSID/password. `web off` stops HTTP and the Wi-Fi radio
-without disabling Bluetooth; `web on` restores them. These switches are RAM-only;
-the hotspot starts on reboot. Maximum management clients: two.
+without disabling Bluetooth. From `0.6.11-wifi-default-off`, every boot leaves
+the hotspot OFF and only BOOT double-click toggles it on; USB `web on` is rejected.
+Long-press enrollment does not enable Wi-Fi. The switch is RAM-only; restarting
+returns to OFF, not the previous ON state. Maximum management clients: two.
 `web password <new-password>` on the USB console saves and verifies an
 8–63-character printable ASCII password in the local `hub_web` namespace,
 then reapplies the protected hotspot configuration. An active hotspot briefly

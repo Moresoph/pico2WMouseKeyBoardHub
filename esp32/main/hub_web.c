@@ -392,7 +392,8 @@ esp_err_t hub_web_init(bool (*snapshot)(hub_web_snapshot_t *),esp_err_t (*comman
     if (!control) return ESP_ERR_NO_MEM;
     initialization_error = initialize();
     if (initialization_error != ESP_OK) return initialization_error;
-    return start_locked();
+    ESP_LOGI(TAG, "Wi-Fi/HTTP initialized but OFF at boot; double-click BOOT to enable");
+    return ESP_OK;
 }
 bool hub_web_enabled(void){return running;}
 static esp_err_t stop_locked(void) {
@@ -449,7 +450,10 @@ int hub_web_command(int argc, char **argv) {
     if (!control) { ESP_LOGE(TAG, "web initialization unavailable"); return 1; }
     xSemaphoreTake(control, portMAX_DELAY);
     esp_err_t error = ESP_OK;
-    if (argc == 2 && !strcmp(argv[1], "on")) error = start_locked();
+    if (argc == 2 && !strcmp(argv[1], "on")) {
+        ESP_LOGW(TAG, "hotspot enable requires a physical BOOT double-click");
+        error = ESP_ERR_INVALID_STATE;
+    }
     else if (argc == 2 && !strcmp(argv[1], "off")) error = stop_locked();
     else if (argc == 3 && !strcmp(argv[1], "password")) error = change_password_locked(argv[2]);
     else if (argc != 1) error = ESP_ERR_INVALID_ARG;

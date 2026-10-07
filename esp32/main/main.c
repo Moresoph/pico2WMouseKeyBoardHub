@@ -44,7 +44,8 @@ enum {
 };
 enum { AUTH_NONE, AUTH_CONFIRM, AUTH_PASSKEY, AUTH_PIN };
 enum { INPUT_PAIRING_WINDOW_MS = 120000 };
-enum { BLE_MOUSE_INTERVAL_UNITS = 6, BLE_MOUSE_INTERVAL_MAX_ATTEMPTS = 3 };
+enum { BLE_MOUSE_INTERVAL_UNITS = 6, BLE_MOUSE_INTERVAL_MAX_ATTEMPTS = 3,
+       BLE_MOUSE_INTERVAL_RETRY_MS = 10000 };
 typedef enum { PAUSE_NONE, PAUSE_OPERATOR, PAUSE_SECURITY, PAUSE_INVALID_HID,
                PAUSE_CLEANUP_TIMEOUT } pause_reason_t;
 typedef enum {
@@ -77,6 +78,8 @@ typedef struct {
     char name[256];
     uint8_t address[6], transport, address_type, auth, seen_roles;
     uint8_t interval_attempts;
+    bool interval_checked;
+    uint32_t interval_check_at;
     uint32_t auth_number;
     uint32_t pair_until, retry_at, opened_at, reports, invalid, incoming_connections;
     esp_hidh_dev_t *dev;
@@ -261,9 +264,13 @@ static bool forwarding_allowed(const peer_t *p) {
     return p->secure || (p->transport == ESP_HID_TRANSPORT_BT && p->allow_open);
 }
 static void request_mouse_interval(peer_t *p) {
-    if (!p || p->paused || !p->mapped || !p->secure ||
+    if (!p || p->paused || p->recovering || !p->mapped || !p->secure ||
         p->transport != ESP_HID_TRANSPORT_BLE || !(p->hid.roles & HUB_LINK_MOUSE) ||
-        p->interval_pending) return;
+        p->interval_pending || (trial.phase && trial.role==(unsigned)(p-peers)+1)) return;
+    uint32_t now=now_ms();
+    if(p->interval_checked && now-p->interval_check_at<BLE_MOUSE_INTERVAL_RETRY_MS)return;
+    if(p->interval_attempts>=BLE_MOUSE_INTERVAL_MAX_ATTEMPTS)return;
+    p->interval_checked=true;p->interval_check_at=now;
     unsigned slot = (unsigned)(p - peers) + 1;
     esp_gap_conn_params_t current;
     esp_err_t error = esp_ble_get_current_conn_params(p->address, &current);
@@ -272,9 +279,8 @@ static void request_mouse_interval(peer_t *p) {
         return;
     }
     p->interval = current.interval;
-    if (current.interval == BLE_MOUSE_INTERVAL_UNITS) return;
-    if (p->interval_attempts >= BLE_MOUSE_INTERVAL_MAX_ATTEMPTS) {
-        ESP_LOGW(TAG, "input %u 7.5ms request limit reached; retaining negotiated BLE parameters", slot);
+    if (current.interval <= BLE_MOUSE_INTERVAL_UNITS) {
+        p->interval_attempts=0;
         return;
     }
     esp_ble_conn_update_params_t update = {
@@ -286,11 +292,27 @@ static void request_mouse_interval(peer_t *p) {
     memcpy(update.bda, p->address, sizeof(update.bda));
     ++p->interval_attempts;
     error = esp_ble_gap_update_conn_params(&update);
-    check_result(error, "request 7.5ms BLE mouse interval");
+    check_result(error, "activity-triggered 7.5ms mouse interval request");
     p->interval_pending = error == ESP_OK;
     if (p->interval_pending)
-        ESP_LOGI(TAG, "input %u requested BLE interval=7.500ms; preserving latency=%u timeout=%ums; awaiting negotiation",
+        ESP_LOGI(TAG, "input %u real mouse activity requested interval=7.500ms; preserving latency=%u timeout=%ums; awaiting negotiation",
                  slot, current.latency, current.timeout * 10u);
+    else if(p->interval_attempts==BLE_MOUSE_INTERVAL_MAX_ATTEMPTS)
+        ESP_LOGW(TAG,"input %u activity interval request limit reached; retain negotiated parameters",slot);
+}
+static void input_mouse_parameters(peer_t *p,uint32_t status,uint16_t interval,uint16_t latency,uint16_t timeout) {
+    p->interval_pending=false;
+    unsigned slot=(unsigned)(p-peers)+1;
+    if(status==ESP_BT_STATUS_SUCCESS){
+        p->interval=interval;
+        if(interval<=BLE_MOUSE_INTERVAL_UNITS)p->interval_attempts=0;
+        ESP_LOGI(TAG,"input %u negotiated BLE interval=%u.%03ums latency=%u timeout=%ums; "
+                 "peer parameters retained until real mouse activity",slot,
+                 interval*5u/4u,interval%4u*250u,latency,timeout*10u);
+    }else{
+        ESP_LOGE(TAG,"input %u BLE parameter update failed: status=%" PRIu32
+                 "; no immediate retry, attempts=%u",slot,status,p->interval_attempts);
+    }
 }
 static void snapshot_locked(hub_link_input_t out[HUB_LINK_SLOTS]) {
     for (unsigned i = 0; i < HUB_LINK_SLOTS; ++i) {
@@ -323,6 +345,7 @@ static void release_peer(peer_t *p) {
     p->pin_replied = false;
     p->interval_pending = false;
     p->interval_attempts = 0;
+    p->interval_checked=false;p->interval_check_at=0;
     p->interval = 0;
     p->encryption_pending = false;
     p->report_seen = false;
@@ -775,7 +798,6 @@ static void hid_event(void *arg, esp_event_base_t base, int32_t event, void *dat
                 ESP_LOGI(TAG, "input %u HID open roles=%u encrypted=%u; waiting for real input", slot, p->hid.roles, p->secure);
                 if (transport == ESP_HID_TRANSPORT_BLE && !p->secure)
                     check_result(esp_ble_set_encryption(p->address, ESP_BLE_SEC_ENCRYPT), "BLE encryption");
-                request_mouse_interval(p);
                 queue_state();
             }
         }
@@ -786,6 +808,7 @@ static void hid_event(void *arg, esp_event_base_t base, int32_t event, void *dat
         ESP_LOGI(TAG, "input %u closed; reason=%d", slot, e->close.reason);
         /* Pinned IDF 5.5.1 postprocess handler frees the device after this callback. */
     } else if (event == ESP_HIDH_INPUT_EVENT && p->dev == dev && p->mapped && forwarding_allowed(p)) {
+        uint8_t previous_buttons=p->input.buttons;
         if (!hub_remote_hid_report(&p->hid, e->input.map_index, e->input.report_id,
                                   e->input.data, e->input.length, &p->input)) {
             ++p->invalid;
@@ -795,16 +818,22 @@ static void hid_event(void *arg, esp_event_base_t base, int32_t event, void *dat
             ESP_LOGE(TAG, "input %u invalid report map=%u id=%u len=%u; paused", slot,
                      e->input.map_index, e->input.report_id, e->input.length);
         } else {
+            bool mouse_report=false;
             for (unsigned i = 0; i < p->hid.count; ++i)
                 if (p->hid.reports[i].map == e->input.map_index &&
-                    p->hid.reports[i].id == e->input.report_id)
+                    p->hid.reports[i].id == e->input.report_id){
                     p->seen_roles |= p->hid.reports[i].roles;
+                    mouse_report=(p->hid.reports[i].roles&HUB_LINK_MOUSE)!=0;
+                }
+            bool mouse_activity=mouse_report && (p->input.dx || p->input.dy || p->input.wheel ||
+                                                p->input.buttons!=previous_buttons);
             ++p->reports;
             p->last_report_at=now_ms();
             if(!p->report_seen){p->report_seen=true;note_input(p,INPUT_EVENT_FIRST_REPORT,p->reports);}
             if (p->reports == 1) ESP_LOGI(TAG, "input %u first decoded HID report", slot);
             queue_state();
             p->input.dx = p->input.dy = p->input.wheel = 0;
+            if(mouse_activity)request_mouse_interval(p);
         }
     }
     unlock();
@@ -1033,26 +1062,14 @@ static void ble_gap(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *e) {
                     p->pause_reason=PAUSE_SECURITY;p->last_error=e->ble_security.auth_cmpl.fail_reason;
                     recover_peer(p,"BLE authentication/key failure");
                 }
-                request_mouse_interval(p);
                 queue_state();
             }
             break;
         case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
             p = peer_for(e->update_conn_params.bda, ESP_HID_TRANSPORT_BLE);
             if (p) {
-                p->interval_pending = false;
-                unsigned slot = (unsigned)(p - peers) + 1;
-                if (e->update_conn_params.status == ESP_BT_STATUS_SUCCESS) {
-                    p->interval = e->update_conn_params.conn_int;
-                    ESP_LOGI(TAG, "input %u negotiated BLE interval=%u.%03ums latency=%u timeout=%ums",
-                             slot, e->update_conn_params.conn_int * 5u / 4u,
-                             e->update_conn_params.conn_int % 4u * 250u,
-                             e->update_conn_params.latency, e->update_conn_params.timeout * 10u);
-                    request_mouse_interval(p);
-                } else {
-                    ESP_LOGE(TAG, "input %u BLE parameter update failed: status=%u",
-                             slot, e->update_conn_params.status);
-                }
+                input_mouse_parameters(p,e->update_conn_params.status,e->update_conn_params.conn_int,
+                                       e->update_conn_params.latency,e->update_conn_params.timeout);
             }
             break;
         default: break;
@@ -1744,19 +1761,23 @@ static void manage_tick(void) {
         if(saved_inputs.active[role]==255 && peers[role].selected && peer_idle(&peers[role]))
             configure_peer(role+1,NULL,false);
 }
+static bool control_button_action(hub_ui_action_t action,uint32_t now) {
+    if(action==HUB_UI_LONG)open_management();
+    else if(action==HUB_UI_DOUBLE)return true;
+    else if(action==HUB_UI_SHORT){
+        if(management_open()||trial.phase){close_management();snprintf(operation,sizeof(operation),"Cancelled by button");}
+        else led_ack_until=now+1000;
+    }
+    return false;
+}
 static void controls_task(void *arg) {
     (void)arg;hub_ui_button_t button={0};
     hub_ui_fault_clock_t fault_clock={0};
-    uint32_t started=now_ms();bool web_toggle=false,web_on=false;
+    uint32_t started=now_ms();
     for(;;){
         vTaskDelay(pdMS_TO_TICKS(20));lock();
         uint32_t now=now_ms();hub_ui_action_t action=hub_ui_tick(&button,gpio_get_level(GPIO_NUM_0)==0,now);
-        if(action==HUB_UI_LONG){open_management();web_on=true;}
-        else if(action==HUB_UI_DOUBLE)web_toggle=true;
-        else if(action==HUB_UI_SHORT){
-            if(management_open()||trial.phase){close_management();snprintf(operation,sizeof(operation),"Cancelled by button");}
-            else led_ack_until=now+1000;
-        }
+        bool web_toggle=control_button_action(action,now);
         manage_tick();
         status_led_mode_t mode=status_led_mode_locked(now);
         bool fault_led=hub_ui_fault_tick(&fault_clock,mode==LED_FAULT&&!(button.long_press&&button.stable),now);
@@ -1764,9 +1785,8 @@ static void controls_task(void *arg) {
             (mode==LED_FAULT?fault_led:status_led_level(mode,now));
         if(button.long_press&&button.stable)led=hub_ui_led(HUB_LED_PAIR,now);
         unlock();gpio_set_level(STATUS_LED_PIN,led);
-        if(web_toggle||web_on){
-            check_result(hub_web_set_enabled(web_on?true:!hub_web_enabled()),"physical button hotspot control");
-            web_toggle=web_on=false;
+        if(web_toggle){
+            check_result(hub_web_set_enabled(!hub_web_enabled()),"physical button hotspot control");
         }
     }
 }
@@ -1833,7 +1853,7 @@ static int console_command(int argc, char **argv) {
         else check_result(gap_error, "read Classic GAP profile status");
         printf("Classic legacy PIN: fixed %s during explicit pairing window; status LED GPIO%d=%s\n",
                CLASSIC_FIXED_PIN, STATUS_LED_PIN, status_led_name(status_led_mode_locked(now_ms())));
-        printf("BLE mouse interval target: 7.500ms; preserve negotiated latency/timeout\n");
+        printf("BLE mouse interval: idle peer parameters retained; real activity requests7.500ms, >=10s spacing; preserve latency/timeout\n");
         printf("Input management: open=%u remaining-ms=%" PRIu32 " scan-wait=%u scanning=%u candidates=%u trial-phase=%u trial-role=%u storage-fault=%u\n",
                management_open(),management_open()?management_until-now_ms():0,requested_scan,scanning,candidate_count,
                trial.phase,trial.role,records_fault);
@@ -2073,6 +2093,11 @@ void app_main(void) {
     esp_bt_controller_config_t controller = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_init(&controller));
     ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BTDM));
+#ifdef CONFIG_BTDM_CTRL_MODEM_SLEEP
+    ESP_LOGW(TAG, "Bluetooth controller modem sleep enabled by build configuration");
+#else
+    ESP_LOGI(TAG, "Bluetooth controller modem sleep DISABLED; mouse connection parameters unchanged");
+#endif
     ESP_ERROR_CHECK(esp_bluedroid_init());
     ESP_ERROR_CHECK(esp_bluedroid_enable());
     for (unsigned i = 0; i < HUB_LINK_SLOTS; ++i)
@@ -2112,7 +2137,7 @@ void app_main(void) {
         {"status", "Board, UART link and two input-slot counters"},
         {"history","Recent connection phase/errors, no actual keyboard/mouse input data"},
         {"retry","retry <1|2>; immediately retry saved bonded input without new pairing, safe old-link cleanup first"},
-        {"web", "web [on|off] OR web password <8..63 printable ASCII>; saved locally, USB only"},
+        {"web", "web [off] OR web password <8..63 printable ASCII>; OFF at boot, enable only by BOOT double-click"},
         {"scan", "scan ble|classic (list only; never automatically authorizes a peer)"},
         {"connect", "connect <1|2> classic <MAC> OR connect <1|2> ble public|random <MAC>; 120s pairing window"},
         {"open-connect", "open-connect <1|2> <MAC>; EXPLICIT saved consent to UNENCRYPTED/UNAUTHENTICATED Classic HID"},

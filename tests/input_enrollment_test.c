@@ -5,6 +5,7 @@
 #include "hub_web.h"
 #include "auto_input_policy.h"
 #include "descriptor_retry.h"
+#include "hub_ui.h"
 
 #define strcasecmp _stricmp
 #define ESP_LOGI(...) ((void)0)
@@ -301,6 +302,13 @@ int main(void){
     assert(saved_inputs.active[0]==3 && saved_inputs.slots[0].used && saved_inputs.slots[1].used);
     assert(!strcmp(saved_inputs.slots[3].name,"New keyboard"));
     manage_tick();assert(!management_open() && !auto_enrollment);
-    puts("Production input enrollment: queued discovery, unfamiliar mouse admission, encrypted-role commit, old-record preservation, cancel/failure/write rollback, stale identity/token, candidate priority and fresh pairing deadline passed");
+    reset();close_management();
+    assert(!control_button_action(HUB_UI_LONG,clock_ms)&&management_open());
+    assert(auto_enrollment&&requested_scan==SCAN_BLE); /* Long press still enrolls, never enables Wi-Fi. */
+    assert(!control_button_action(HUB_UI_SHORT,clock_ms)&&!management_open());
+    assert(control_button_action(HUB_UI_DOUBLE,clock_ms)&&!management_open());
+    assert(!control_button_action(HUB_UI_NONE,clock_ms)&&!management_open());
+    assert(!control_button_action(HUB_UI_SHORT,clock_ms)&&led_ack_until==clock_ms+1000);
+    puts("Production input enrollment and double-click-only hotspot controls: admission/rollback/deletion preserved, long/short/idle never enable Wi-Fi");
     return 0;
 }

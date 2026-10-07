@@ -7,7 +7,7 @@
 #include "input_diagnostics.h"
 #include "reconnect_policy.h"
 
-#define HUB_WEB_FIRMWARE "0.6.7-clean-retry"
+#define HUB_WEB_FIRMWARE "0.6.11-wifi-default-off"
 #define HUB_WEB_CANDIDATES 16u
 typedef struct {
     uint8_t address[6], transport, type, roles;

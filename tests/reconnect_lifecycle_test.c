@@ -22,6 +22,8 @@ typedef struct {
     bool selected,paused,pending,mapped,secure,pin_replied,interval_pending,encryption_pending;
     bool classic_acl_connected,classic_acl_encrypted,classic_incoming,open_running,recovering,profile_requested;
     bool cleanup_pending,report_seen,allow_open;
+    bool interval_checked;
+    uint32_t interval_check_at;
     uint8_t address[6],seen_roles,auth,interval_attempts,reconnect_failures,profile_failures,transport;
     uint16_t interval,classic_handle;
     uint32_t reports,retry_at,recovery_at,opened_at,pair_until,last_error;
@@ -53,7 +55,7 @@ enum { cleanup_submissions=1,cleanup_events,pdTRUE=1 };
 static cleanup_event_t requests[8],completion;
 static unsigned request_count;
 #define configASSERT assert
-static struct {unsigned phase;} trial;
+static struct {unsigned phase,role;} trial;
 static input_history_t history;
 static cleanup_event_t reply;
 typedef void esp_hidh_dev_t;
@@ -75,7 +77,22 @@ const char *esp_err_to_name(esp_err_t status){(void)status;return "test-status";
 static bool classic_admitted(const peer_t *p){return p&&p->selected&&!p->paused&&bonded;}
 static void begin_classic_incoming(peer_t *p){p->pending=true;input_link_enter(&p->clock,INPUT_PHASE_HID,time_ms);}
 static void update_saved_name(const uint8_t *address,const char *name){(void)address;(void)name;}
-static void request_mouse_interval(peer_t *p){(void)p;}
+enum { BLE_MOUSE_INTERVAL_UNITS=6,BLE_MOUSE_INTERVAL_MAX_ATTEMPTS=3,BLE_MOUSE_INTERVAL_RETRY_MS=10000,
+       ESP_BT_STATUS_SUCCESS=0 };
+typedef struct {uint16_t interval,latency,timeout;} esp_gap_conn_params_t;
+typedef struct {uint16_t min_int,max_int,latency,timeout;uint8_t bda[6];} esp_ble_conn_update_params_t;
+static esp_gap_conn_params_t current_params;
+static esp_ble_conn_update_params_t requested_params;
+static unsigned parameter_reads,parameter_requests,states_at_parameter_request;
+static esp_err_t read_params_status,request_params_status;
+static hub_link_input_t last_queued_input;
+static esp_err_t esp_ble_get_current_conn_params(const uint8_t *address,esp_gap_conn_params_t *out){
+    assert(address[0]==1);++parameter_reads;*out=current_params;return read_params_status;
+}
+static esp_err_t esp_ble_gap_update_conn_params(const esp_ble_conn_update_params_t *params){
+    requested_params=*params;++parameter_requests;states_at_parameter_request=states;
+    return request_params_status;
+}
 static esp_err_t esp_ble_set_encryption(uint8_t *address,unsigned mode){(void)address;(void)mode;return ESP_OK;}
 enum { ESP_BLE_SEC_ENCRYPT=1 };
 #define ESP_BD_ADDR_STR "%02x:%02x:%02x:%02x:%02x:%02x"
@@ -92,12 +109,8 @@ static esp_err_t esp_hidh_dev_report_maps_get(esp_hidh_dev_t *dev,size_t *count,
 static uint32_t now_ms(void){return time_ms;}
 static bool due(uint32_t now,uint32_t at){return (int32_t)(now-at)>=0;}
 static void check_result(esp_err_t error,const char *operation){(void)error;(void)operation;}
-static void queue_state(void){++states;}
+static void queue_state(void){++states;last_queued_input=peers[0].input;}
 static void input_phase(peer_t *p,input_link_phase_t phase){input_link_enter(&p->clock,phase,time_ms);}
-static void note_input(peer_t *p,input_event_kind_t kind,uint32_t detail){
-    input_event_t event={.at=time_ms,.slot=(uint8_t)(p-peers)+1,.phase=p->clock.phase,.kind=kind,.detail=detail};
-    input_history_add(&history,&event);
-}
 static bool forwarding_allowed(const peer_t *p){return p->secure||p->allow_open;}
 static bool pairing_window_open(const peer_t *p){return p->pair_until && !due(time_ms,p->pair_until);}
 static bool classic_bonded(const uint8_t *address){(void)address;return bonded;}
@@ -134,9 +147,95 @@ static peer_t *fresh(void){
     memset(peers,0,sizeof(peers));memset(&history,0,sizeof(history));
     memset(sdk_maps,0,sizeof(sdk_maps));sdk_count=0;sdk_map_status=ESP_OK;sdk_null_maps=false;
     time_ms=1000;closes=submissions=states=btu_posts=request_count=0;
+    parameter_reads=parameter_requests=states_at_parameter_request=0;
+    read_params_status=request_params_status=ESP_OK;
+    current_params=(esp_gap_conn_params_t){.interval=24,.latency=44,.timeout=216};
+    memset(&requested_params,0,sizeof(requested_params));
     scanning=fail_queue=false;lock_owned=true;post_error=ESP_OK;requested_scan=0;trial.phase=0;bonded=true;
     peer_t *p=&peers[0];p->selected=true;p->address[0]=1;p->transport=ESP_HID_TRANSPORT_BT;
     return p;
+}
+static void mouse_activity_policy_tests(void){
+    peer_t *p=fresh();p->transport=ESP_HID_TRANSPORT_BLE;p->secure=true;p->pending=true;
+    sdk_count=1;sdk_maps[0]=(esp_hid_raw_report_map_t){hub_hid_report_descriptor,sizeof(hub_hid_report_descriptor)};
+    esp_hidh_event_data_t event={.open={.status=ESP_OK,.dev=p}};
+    hid_event(NULL,NULL,ESP_HIDH_OPEN_EVENT,&event);
+    assert(p->mapped&&p->secure&&!parameter_reads&&!parameter_requests); /* Ready alone is not activity. */
+    input_mouse_parameters(p,ESP_BT_STATUS_SUCCESS,24,44,216);
+    assert(p->interval==24&&!parameter_reads&&!parameter_requests);
+    uint8_t keyboard[8]={0,0,4};
+    event.input.dev=p;event.input.map_index=0;event.input.report_id=1;
+    event.input.length=8;event.input.data=keyboard;
+    hid_event(NULL,NULL,ESP_HIDH_INPUT_EVENT,&event);
+    assert(!parameter_reads&&!parameter_requests&&last_queued_input.keyboard[2]==4);
+    uint8_t mouse[6]={0};
+    event.input.report_id=2;event.input.length=6;event.input.data=mouse;
+    hid_event(NULL,NULL,ESP_HIDH_INPUT_EVENT,&event);
+    assert(!parameter_requests&&!parameter_reads); /* Unchanged mouse state is not activity. */
+    mouse[1]=1;unsigned before_states=states;
+    hid_event(NULL,NULL,ESP_HIDH_INPUT_EVENT,&event);
+    assert(parameter_reads==1&&parameter_requests==1&&p->interval_pending);
+    assert(requested_params.min_int==6&&requested_params.max_int==6&&requested_params.latency==44);
+    assert(requested_params.timeout==216&&requested_params.bda[0]==1);
+    assert(states_at_parameter_request==before_states+1&&last_queued_input.dx==1&&!p->input.dx);
+    for(unsigned i=0;i<1000;++i){++time_ms;hid_event(NULL,NULL,ESP_HIDH_INPUT_EVENT,&event);}
+    assert(parameter_requests==1&&parameter_reads==1&&p->reports==1003);
+    assert(last_queued_input.dx==1); /* Pending parameter update never stalls forwarding. */
+    input_mouse_parameters(p,ESP_BT_STATUS_SUCCESS,6,44,216);
+    assert(!p->interval_pending&&!p->interval_attempts&&p->interval==6);
+    /* Peer chooses a longer idle interval: accept it without a counter-request, even after hours. */
+    time_ms+=3600000;current_params=(esp_gap_conn_params_t){.interval=80,.latency=12,.timeout=400};
+    input_mouse_parameters(p,ESP_BT_STATUS_SUCCESS,80,12,400);
+    assert(p->interval==80&&parameter_requests==1&&parameter_reads==1);
+    mouse[1]=0;hid_event(NULL,NULL,ESP_HIDH_INPUT_EVENT,&event);
+    assert(parameter_requests==1&&parameter_reads==1);
+    mouse[5]=1;hid_event(NULL,NULL,ESP_HIDH_INPUT_EVENT,&event); /* Wheel activity. */
+    assert(parameter_requests==2&&parameter_reads==2&&p->interval_pending);
+    assert(requested_params.latency==12&&requested_params.timeout==400);
+    assert(last_queued_input.wheel==1&&!p->input.wheel);
+    input_mouse_parameters(p,1,80,12,400);
+    assert(!p->interval_pending&&parameter_requests==2&&parameter_reads==2);
+    uint32_t checked_at=p->interval_check_at;
+    mouse[5]=0;mouse[0]=1;time_ms=checked_at+9999;
+    hid_event(NULL,NULL,ESP_HIDH_INPUT_EVENT,&event);
+    assert(parameter_requests==2&&last_queued_input.buttons==1); /* Click still forwards during cooldown. */
+    time_ms=checked_at+10000;mouse[0]=0;
+    hid_event(NULL,NULL,ESP_HIDH_INPUT_EVENT,&event);
+    assert(parameter_requests==3&&parameter_reads==3&&last_queued_input.buttons==0);
+    input_mouse_parameters(p,1,80,12,400);
+    request_params_status=ESP_FAIL;time_ms+=10000;mouse[1]=1;
+    hid_event(NULL,NULL,ESP_HIDH_INPUT_EVENT,&event);
+    assert(parameter_requests==4&&!p->interval_pending&&p->interval_attempts==3);
+    for(unsigned i=0;i<20;++i){time_ms+=10000;hid_event(NULL,NULL,ESP_HIDH_INPUT_EVENT,&event);}
+    assert(parameter_requests==4&&parameter_reads==4); /* Bounded rejection streak, no endless requests. */
+    input_mouse_parameters(p,ESP_BT_STATUS_SUCCESS,6,12,400);
+    assert(!p->interval_attempts);
+    current_params.interval=6;request_params_status=ESP_OK;time_ms+=10000;
+    hid_event(NULL,NULL,ESP_HIDH_INPUT_EVENT,&event);
+    assert(parameter_reads==5&&parameter_requests==4); /* Already-fast activity does not renegotiate. */
+    current_params.interval=24;read_params_status=ESP_FAIL;time_ms+=10000;
+    hid_event(NULL,NULL,ESP_HIDH_INPUT_EVENT,&event);assert(parameter_reads==6&&parameter_requests==4);
+    hid_event(NULL,NULL,ESP_HIDH_INPUT_EVENT,&event);assert(parameter_reads==6);
+    read_params_status=ESP_OK;time_ms+=10000;
+    p->paused=true;request_mouse_interval(p);assert(parameter_reads==6);p->paused=false;
+    p->recovering=true;request_mouse_interval(p);assert(parameter_reads==6);p->recovering=false;
+    p->secure=false;request_mouse_interval(p);assert(parameter_reads==6);p->secure=true;
+    trial.phase=2;trial.role=1;request_mouse_interval(p);assert(parameter_reads==6);trial.phase=0;
+    p->transport=ESP_HID_TRANSPORT_BT;request_mouse_interval(p);assert(parameter_reads==6);
+    p->transport=ESP_HID_TRANSPORT_BLE;
+    release_peer(p);assert(!p->interval_checked&&!p->interval_pending&&!p->interval_attempts);
+    p->mapped=p->secure=true;p->hid.roles=HUB_LINK_MOUSE;
+    time_ms=0xfffffff0u;request_mouse_interval(p);
+    assert(parameter_requests==5&&p->interval_pending);
+    input_mouse_parameters(p,1,24,12,400);
+    time_ms=0xfffffff0u+9999u;request_mouse_interval(p);assert(parameter_requests==5);
+    ++time_ms;request_mouse_interval(p);assert(parameter_requests==6);
+    p=fresh();p->transport=ESP_HID_TRANSPORT_BLE;p->mapped=p->secure=true;p->hid.roles=HUB_LINK_MOUSE;
+    time_ms=0;request_params_status=ESP_FAIL;request_mouse_interval(p);
+    assert(parameter_requests==1&&p->interval_checked);
+    time_ms=9999;request_mouse_interval(p);assert(parameter_requests==1);
+    time_ms=10000;request_mouse_interval(p);assert(parameter_requests==2);
+    puts("Mouse interval policy: idle/ready/peer updates untouched; real motion/wheel/buttons request only after forwarding; pending/cooldown/failures/wrap safe, latency/timeout retained");
 }
 static void ready(peer_t *p){
     input_phase(p,INPUT_PHASE_PAGE);p->pending=p->profile_requested=true;
@@ -144,6 +243,7 @@ static void ready(peer_t *p){
     maintain_peer(p);assert(p->clock.phase==INPUT_PHASE_READY&&!p->pending);
 }
 int main(void){
+    mouse_activity_policy_tests();
     peer_t *p=fresh();ready(p);p->profile_requested=true;
     time_ms+=10;input_hid_closed(p);
     assert(!p->dev&&!p->mapped&&!p->profile_requested&&p->classic_acl_connected&&p->pending&&p->recovering);
@@ -317,6 +417,6 @@ int main(void){
     assert(!input_link_expired(&clock,0x3a87u,false));
     assert(input_link_expired(&clock,0x3a88u,false));
     fresh();
-    puts("Scoped clean-retry: full HID/ACL/worker exit, both callback orders, missing metadata retries, repeated exact descriptor stop, original bonds and report release preserved");
+    puts("Release clean-retry and mouse activity: full ownership exit, descriptor retries, report releases, idle policy and bounded history passed");
     return 0;
 }

@@ -2,6 +2,20 @@ cmake_minimum_required(VERSION 3.20)
 project(hub_router_tests LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 enable_testing()
+set(web_startup_generated "${CMAKE_CURRENT_BINARY_DIR}/web_startup_generated.inc")
+add_custom_command(OUTPUT "${web_startup_generated}"
+    COMMAND "${CMAKE_COMMAND}" "-DROOT=${CMAKE_CURRENT_LIST_DIR}/.." "-DOUTPUT=${web_startup_generated}"
+        -P "${CMAKE_CURRENT_LIST_DIR}/generate_web_startup_test.cmake"
+    DEPENDS ../esp32/main/hub_web.c generate_web_startup_test.cmake)
+add_executable(hub_web_startup_tests web_startup_test.c "${web_startup_generated}")
+target_include_directories(hub_web_startup_tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" esp_stubs
+    ../.deps/esp-idf/components/esp_common/include)
+if(MSVC)
+    target_compile_options(hub_web_startup_tests PRIVATE /W4 /UNDEBUG)
+else()
+    target_compile_options(hub_web_startup_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+endif()
+add_test(NAME hub_web_startup_tests COMMAND hub_web_startup_tests)
 add_executable(hub_ap_password_tests ap_password_test.c)
 target_include_directories(hub_ap_password_tests PRIVATE ../esp32/main)
 if(MSVC)
