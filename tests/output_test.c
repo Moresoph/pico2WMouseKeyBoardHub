@@ -130,7 +130,17 @@ void btstack_run_loop_set_timer_handler(btstack_timer_source_t *timer,
                                       void (*handler)(btstack_timer_source_t *)) {
     timer->process = handler;
 }
+#if HUB_TEST_REAL_ROUTER
+bool hub_security_capture_active(void) { return false; }
+bool hub_security_keyboard(unsigned input, const uint8_t report[8]) {
+    (void)input;
+    (void)report;
+    return false;
+}
+void hub_security_input_disconnected(unsigned input) { (void)input; }
+#else
 void hub_router_release_all(void) { ++router_releases; hub_output_release_all(); }
+#endif
 bool hub_security_pairing_open(void) { return pairing_window; }
 bool hub_security_allow_pairing(hci_con_handle_t handle) { (void)handle; return pairing_window; }
 void hci_add_event_handler(btstack_packet_callback_registration_t *registration) {
@@ -1596,6 +1606,27 @@ static void management_identity_deletion(void) {
 }
 
 #if HUB_DUAL_BLUETOOTH
+static void deferred_escape_tap_survives_dedup(void) {
+    for (unsigned synchronous = 0; synchronous < 2; ++synchronous) {
+        fresh();
+        ready_peer(1, 0, false);
+        synchronous_send = synchronous != 0;
+        const uint8_t escape[8] = {0, 0, 0x29};
+        const uint8_t neutral[8] = {0};
+        unsigned sent = notification_count;
+        assert(hub_output_keyboard(neutral));
+        assert(hub_output_keyboard(escape));
+        assert(hub_output_keyboard(neutral));
+        assert(hub_output_keyboard(neutral));
+        pump();
+        assert(notification_count == sent + 2);
+        assert(notifications[sent].attribute == KEYBOARD_HANDLE
+            && !memcmp(notifications[sent].data, escape, 8));
+        assert(notifications[sent + 1].attribute == KEYBOARD_HANDLE
+            && !memcmp(notifications[sent + 1].data, neutral, 8));
+    }
+}
+
 static void unchanged_keyboard_queue(void) {
     fresh();
     ready_peer(1, 0, false);
@@ -1749,8 +1780,79 @@ static void unchanged_error_retry_does_not_drop_transition(void) {
 }
 #endif
 
+#if HUB_TEST_REAL_ROUTER
+static void real_router_escape_switch_release_order(void) {
+    for (unsigned synchronous = 0; synchronous < 2; ++synchronous) {
+        fresh();
+        hub_router_init();
+        for (unsigned slot = 0; slot < 4; ++slot) ready_peer(slot + 1, (int)slot, false);
+        synchronous_send = synchronous != 0;
+        const uint8_t escape[8] = {0, 0, 0x29};
+        const uint8_t pc4[8] = {0, 0, 0x29, 0x21};
+        const uint8_t neutral[8] = {0};
+        unsigned writes = flash_writes;
+        unsigned sent = notification_count;
+        hub_router_keyboard(0, escape);
+        hub_router_mouse(1, 1, 0, 0, 0);
+        pump();
+        hub_router_keyboard(0, pc4);
+        assert(output_store.selected == 3 && flash_writes == writes + 1);
+        assert(switch_pending || active_slot == 3);
+        assert(hub_output_ready(3) && computers[1].release_pending == 0
+            && computers[2].release_pending == 0);
+        pump();
+        assert(active_slot == 3 && !switch_pending && hub_output_ready(0));
+        hub_router_keyboard(0, pc4);
+        assert(flash_writes == writes + 1);
+        hub_router_keyboard(0, neutral);
+        hub_router_mouse(1, 0, 0, 0, 0);
+        hub_router_poll();
+        for (unsigned i = sent; i < notification_count; ++i) {
+            if (notifications[i].attribute != KEYBOARD_HANDLE) continue;
+            for (unsigned key = 2; key < 8; ++key)
+                assert(notifications[i].data[key] != 0x29 && notifications[i].data[key] != 0x21);
+        }
+        sent = notification_count;
+        hub_router_keyboard(0, key_down);
+        pump();
+        assert(notification_count == sent + 1 && notifications[sent].handle == 4
+            && notifications[sent].data[2] == 4);
+        hub_router_keyboard(0, neutral);
+        pump();
+
+        writes = flash_writes;
+        hub_router_keyboard(0, pc4); /* Same selected PC: consumed, not persisted again. */
+        pump();
+        assert(active_slot == 3 && flash_writes == writes);
+        hub_router_keyboard(0, neutral);
+        hub_router_poll();
+        disconnect_peer(2);
+        pump();
+        const uint8_t pc2[8] = {0, 0, 0x29, 0x1f};
+        hub_router_keyboard(0, pc2); /* A truly offline target still must be rejected. */
+        pump();
+        assert(active_slot == 3 && flash_writes == writes);
+        hub_router_keyboard(0, neutral);
+        hub_router_poll();
+        sent = notification_count;
+        hub_router_keyboard(0, escape);
+        pump();
+        assert(notification_count == sent);
+        hub_router_keyboard(0, neutral);
+        pump();
+        assert(notification_count == sent + 2 && notifications[sent].handle == 4
+            && notifications[sent].data[2] == 0x29
+            && notifications[sent + 1].data[2] == 0);
+    }
+}
+#endif
+
 int main(void) {
-#if HUB_DUAL_BLUETOOTH
+#if HUB_TEST_REAL_ROUTER
+    real_router_escape_switch_release_order();
+    puts("Real router+output: asynchronous/synchronous Esc+4 switching, old-PC releases, offline rejection and deferred Escape passed");
+#elif HUB_DUAL_BLUETOOTH
+    deferred_escape_tap_survives_dedup();
     unchanged_keyboard_queue();
     unchanged_mouse_preserves_actions();
     full_queue_dedup_and_real_overflow();

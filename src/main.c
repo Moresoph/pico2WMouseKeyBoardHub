@@ -333,6 +333,45 @@ static bool forget_inputs(unsigned mask) {
     return accepted;
 }
 
+static bool start_pc_pairing(bool use_keyboard, bool use_just_works) {
+    if (ble_pairing_active() || keyboard_passkey.active || hub_input_pairing_busy()
+        || hub_input_enrolling()) {
+        printf("[security] finish input enrollment (enroll stop) and pending connections first\n");
+        return false;
+    }
+    if (use_keyboard && !hub_input_keyboard_ready()) {
+        printf("[security] connect a keyboard and wait for HID-ready before pair keyboard\n");
+        return false;
+    }
+#if HUB_DUAL_BLUETOOTH
+    if (!hub_output_pairing_prepare()) {
+        printf("[security] PC pairing unavailable: storage/radio context busy\n");
+        return false;
+    }
+#endif
+#if HUB_CLASSIC_OUTPUT_TEST
+    gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
+    gap_ssp_set_authentication_requirement(
+        SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING);
+#else
+    if (!hub_security_configure(use_just_works ? HUB_SECURITY_PC_JUST_WORKS
+        : use_keyboard ? HUB_SECURITY_PC_KEYBOARD : HUB_SECURITY_PC_CONSOLE)) return false;
+#endif
+    keyboard_pairing_mode = use_keyboard;
+    just_works_pairing_mode = use_just_works;
+    computer_pairing_policy = true;
+    pairing_deadline = btstack_run_loop_get_time_ms() + HUB_PAIRING_WINDOW_MS;
+    pairing_enabled = true;
+#if HUB_CLASSIC_OUTPUT_TEST
+    hub_classic_output_pairing_changed(true);
+#endif
+    if (use_keyboard) hub_router_release_all();
+    printf("[security] PC pairing open for 120 seconds, mode=%s; close with pair off\n",
+           use_just_works ? "JustWorks (encrypted, no code entry, no MITM)"
+               : use_keyboard ? "physical keyboard (normal input paused)" : "console");
+    return true;
+}
+
 static void poll_enrollment_button(uint32_t now) {
     if (!working || boot_pending || (int32_t)(now - next_button_sample) < 0) return;
     next_button_sample = now + 25u;
@@ -348,21 +387,9 @@ static void poll_enrollment_button(uint32_t now) {
             }
         }
     } else if (action == HUB_UI_LONG) {
-        if (hub_input_enrolling() || !hub_input_keyboard_ready() || ble_pairing_active()) {
-            printf("[button] PC pairing rejected: finish input enrollment/connect keyboard first\n");
+        if (!start_pc_pairing(false, true)) {
             ui_ack_until = 0;
             ui_error_until = now+10000;
-        } else if (!hub_output_pairing_prepare()) {
-            printf("[button] PC pairing unavailable: storage/radio context busy\n");
-            ui_error_until=now+10000;
-        }
-        else {
-            keyboard_pairing_mode = computer_pairing_policy = pairing_enabled = true;
-            just_works_pairing_mode = false;
-            hub_security_configure(HUB_SECURITY_PC_KEYBOARD);
-            pairing_deadline = now + HUB_PAIRING_WINDOW_MS;
-            hub_router_release_all();
-            printf("[button] PC keyboard-code pairing open for 120 seconds; records full => oldest replaced after encrypted success\n");
         }
     }
     hub_ui_led_t mode = keyboard_passkey.active ? HUB_LED_CODE :
@@ -787,7 +814,10 @@ static void print_help(void) {
         "  pair keyboard              Pair a PC using an already-connected keyboard\n"
 #endif
         "  pair justworks             Pair one PC without code entry (encrypted, no MITM)\n"
-#if HUB_CLASSIC_OUTPUT_TEST
+#if HUB_DUAL_BLUETOOTH
+        "  pair on | pair off         Default Just Works pairing / close window (120 seconds)\n"
+        "  pair console               Explicit console code/confirmation pairing\n"
+#elif HUB_CLASSIC_OUTPUT_TEST
         "  pair off                   Close the Classic PC window (120 seconds)\n"
 #else
         "  pair on | pair off         Console pairing / close window (120 seconds)\n"
@@ -821,14 +851,22 @@ static void print_help(void) {
 #if HUB_CLASSIC_OUTPUT_TEST
         "Ctrl+Alt+Right/Left has no second PC to select in this experiment.\n"
 #else
-        "Shortcut: Ctrl+Alt+Right/Left, then release all keys/buttons.\n"
+        "Shortcuts: Ctrl+Alt+Right/Left = next/previous ready PC;\n"
+        "  hold mouse left+right >0.8 seconds = next ready PC;\n"
+        "  Esc + digit = saved PC number (1-%u); offline target leaves selection unchanged.\n"
+        "  Esc is withheld while held; release sends one tap unless consumed by a shortcut.\n"
+        "Release all keys/buttons after each switch.\n"
 #endif
 #if !HUB_DUAL_BLUETOOTH
         "BOOTSEL while running: short=enroll; hold 8 seconds=input-only reset.\n"
 #else
-        "BOOTSEL: short=next ready PC/cancel pairing; hold 3 seconds then release=PC keyboard-code pairing.\n"
+        "BOOTSEL: short=next ready PC/cancel pairing; hold 3 seconds then release=PC Just Works pairing (no MITM).\n"
 #endif
-        "\n");
+        "\n"
+#if !HUB_CLASSIC_OUTPUT_TEST
+        , HUB_COMPUTER_COUNT
+#endif
+        );
 }
 
 static void print_bonds(void) {
@@ -1097,6 +1135,10 @@ static void console_command(char *line) {
                hub_input_keyboard_ready(), keyboard_passkey.active);
         printf("[status] input-enrollment=%u BOOTSEL=%u\n",
                hub_input_enrolling(), enrollment_button.stable_pressed);
+#if HUB_DUAL_BLUETOOTH
+        printf("[status] PC-pairing-default=JustWorks (encrypted, no code entry, no MITM); "
+               "closed at boot, explicit 120-second window\n");
+#endif
         printf("[status] classic-level=%u classic-mode=%u open-test-build=%u\n",
                gap_get_security_level(), gap_get_security_mode(), HUB_CLASSIC_OPEN_TEST);
         printf("[status] open-input-bridge=%u\n", hub_input_open_bridge_enabled());
@@ -1172,38 +1214,15 @@ static void console_command(char *line) {
             return;
         }
         if (strcmp(args[1], "on") == 0 || strcmp(args[1], "keyboard") == 0
-            || strcmp(args[1], "justworks") == 0) {
+            || strcmp(args[1], "justworks") == 0
+#if HUB_DUAL_BLUETOOTH
+            || strcmp(args[1], "console") == 0
+#endif
+            ) {
             bool use_keyboard = strcmp(args[1], "keyboard") == 0;
-            bool use_just_works = strcmp(args[1], "justworks") == 0;
-            if (ble_pairing_active() || keyboard_passkey.active || hub_input_pairing_busy()
-                || hub_input_enrolling()) {
-                printf("[security] finish input enrollment (enroll stop) and pending connections first\n");
-                return;
-            }
-            if (use_keyboard && !hub_input_keyboard_ready()) {
-                printf("[security] connect a keyboard and wait for HID-ready before pair keyboard\n");
-                return;
-            }
-            keyboard_pairing_mode = use_keyboard;
-            just_works_pairing_mode = use_just_works;
-            computer_pairing_policy = true;
-#if HUB_CLASSIC_OUTPUT_TEST
-            gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
-            gap_ssp_set_authentication_requirement(
-                SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING);
-#else
-            hub_security_configure(use_just_works ? HUB_SECURITY_PC_JUST_WORKS
-                : use_keyboard ? HUB_SECURITY_PC_KEYBOARD : HUB_SECURITY_PC_CONSOLE);
-#endif
-            pairing_deadline = btstack_run_loop_get_time_ms() + HUB_PAIRING_WINDOW_MS;
-            pairing_enabled = true;
-#if HUB_CLASSIC_OUTPUT_TEST
-            hub_classic_output_pairing_changed(true);
-#endif
-            if (use_keyboard) hub_router_release_all();
-            printf("[security] PC pairing open for 120 seconds, mode=%s; close with pair off\n",
-                   use_just_works ? "JustWorks (encrypted, no code entry, no MITM)"
-                       : use_keyboard ? "physical keyboard (normal input paused)" : "console");
+            bool use_just_works = strcmp(args[1], "justworks") == 0
+                || (HUB_DUAL_BLUETOOTH && strcmp(args[1], "on") == 0);
+            start_pc_pairing(use_keyboard, use_just_works);
             return;
         }
         if (strcmp(args[1], "off") == 0) {

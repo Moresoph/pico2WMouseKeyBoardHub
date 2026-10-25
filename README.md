@@ -1,7 +1,189 @@
 # Pico 2 W Bluetooth keyboard/mouse hub
 
-**Usable release: `v0.6.11` (2026-10-07).** The repository source now matches the
-deployed **ESP32 `0.6.11-wifi-default-off` + Pico `0.6.2-hid-dedup`**.
+**Current Pico deployment (2026-10-25):** `0.6.9-esc-switch-fix` fixes
+the order of operations for fixed-PC Esc shortcuts. Live reproduction captured
+Esc+4 correctly, immediately followed by `release=0x02` and an erroneous
+`PC4 offline/not ready` rejection. The shortcut previously released all outputs
+before checking/selecting its target. Output readiness deliberately excludes
+peers whose neutral-release reports are still pending, so the shortcut itself
+temporarily invalidated an otherwise-ready PC.
+
+A successful shortcut now selects through the existing output state machine
+first; that state machine persists the target and drains the old PC's releases
+before completing the switch. It does not globally release/invalidate the target.
+Same-PC, offline, invalid and rejected requests still consume the shortcut and
+release output safely. Deferred Escape, fixed PC1-PC7 numbering, mouse 0.8-second
+switching and pairing policy are unchanged. The original isolated-router mock
+did not model release-pending readiness; a real router+output integration test
+now reproduces the old failure and checks asynchronous and synchronous switching.
+
+Only Pico `F1812912A883CCE2` was flashed after a verified full 4 MiB private
+backup. All 2,101 program payload blocks matched readback and all 892
+non-program sectors, including pairing storage, were byte-identical before boot.
+Runtime confirms `0.6.9-esc-switch-fix`, the original PC1 selection, all five
+saved PCs and six BLE bonds. PC1 and PC4 reconnected encrypted/ready; UART is
+online with zero framing errors. Neither ESP32 board was accessed.
+The user confirmed successful physical switching with the corrected firmware
+on 2026-10-25. This is user-reported acceptance, not a captured switching trace.
+
+```text
+build\esc-switch-fix\pico_bt_hub.uf2
+SHA256 DFCEAB2EC83CC40C42D18622AD7CF2C4E7B638FBFF2A30F4A0C0650A0ACB4291
+```
+
+**Previous Pico deployment (2026-10-25):** `0.6.8-esc-release` withholds
+Escape while physically held. Releasing it queues exactly one Escape press and
+release, preserving other currently held keys/modifiers. It does not auto-repeat.
+If Esc is used with any selection digit, the deferred Escape is discarded,
+including already-selected, offline, invalid, ambiguous or rejected targets:
+no Escape is sent to either PC on release. Fixed `Esc+1` through `Esc+7`
+selection and the mouse's 0.8-second gesture are unchanged.
+
+Deferred Escape state is per input and is cancelled on disconnection, manual
+release, routing suppression, output loss, switching and passkey capture; it is
+never replayed on a new PC. Pairing code capture still handles physical Escape
+immediately. Insufficient six-key/queue capacity explicitly releases output
+and logs the failure instead of leaving Escape held.
+
+The initial live investigation found PC1 already selected, PC2 offline and PC4
+ready, with UART online and zero framing errors. At that stage `Esc+1` was a
+no-op and `Esc+2` could not switch; `Esc+4` targeted the other ready PC. No continuous
+capture of the user's earlier attempt was available, so that attempt's cause
+was not yet established. Subsequent live Esc+4 reproduction established the
+release-order defect corrected in the current deployment above.
+Shortcut logs distinguish already-selected, offline,
+accepted and rejected requests; an accepted request is not a delivery guarantee.
+Release all keys/buttons between shortcut attempts.
+
+Only Pico `F1812912A883CCE2` was flashed, after a verified full 4 MiB private
+rollback backup outside the repository. All 2,101 program payload blocks matched
+readback and all 892 non-program sectors, including pairing storage, were
+byte-identical before boot. Runtime confirms the new version/help, original
+PC1 selection, five saved PCs, six BLE bonds and unchanged Classic bonds.
+PC1 and PC4 reconnected encrypted/ready; UART is online with zero framing errors,
+and new pairing remains closed at boot with Just Works as the explicit default.
+Neither ESP32 board was touched. Router tests assert exact delayed press/release
+sequences and no Esc after successful/rejected shortcuts or safety cancellation;
+UART integration and synchronous/asynchronous output-queue tests also cover the
+deferred tap. Physical shortcut and Esc acceptance on destination PCs has not
+yet been observed.
+
+```text
+build\esc-release\pico_bt_hub.uf2
+SHA256 01DD77C9ABB0E5954A2A392617F576149DF8CB2D3BA20DCEB200386D194AC9DE
+```
+
+**Previous Pico deployment (2026-10-24):** `0.6.7-esc-pc-switch` replaces
+Left+Right arrows plus a ready-PC ordinal with **Esc + digit** for a fixed saved
+PC number: `Esc+1` selects PC1, `Esc+2` selects PC2, through `Esc+7` for PC7.
+Top-row and keypad digits work. An offline/not-ready target does not switch
+to a different PC: for example, with only PC1 and PC4 ready, `Esc+2` does nothing
+and `Esc+4` selects PC4. Release all keys/buttons after a shortcut.
+Escape alone and ordinary digits still forward normally; the old arrow+digit
+combination is no longer a shortcut. Mouse left+right over 0.8 seconds,
+Ctrl+Alt+Left/Right and Just Works enrollment are unchanged.
+
+Only Pico `F1812912A883CCE2` was flashed after a verified full 4 MiB private
+rollback backup. All 2,095 payload blocks matched readback, and all 893
+non-program sectors, including pairing storage, were unchanged before boot.
+Runtime confirms the new version and Esc+digit help, preserved PC1 selection,
+all five saved PCs and six BLE bonds, and unchanged Classic bonds. PC1 and PC4
+reconnected encrypted/ready; UART is online with zero framing errors.
+Neither ESP32 board was accessed or flashed. Router tests exercise fixed
+PC1-PC7 mapping, both digit rows, offline targets, repeated/ambiguous/invalid
+chords, ordinary Escape/digits and old arrows, capture/rearm safety and the
+unchanged 0.8-second mouse threshold. UART and pairing regressions also pass.
+Physical Esc-shortcut acceptance on destination PCs has not yet been observed.
+
+```text
+build\esc-pc-switch\pico_bt_hub.uf2
+SHA256 0D08F8E82583BE67544789EC71065AF3BD72401601C7E0853C07CC7A5AE25B42
+```
+
+**Previous Pico deployment (2026-10-23):** `0.6.6-mouse-switch-800ms` shortens
+the mouse left+right hold from 2 seconds to **more than 0.8 seconds**.
+One-shot triggering, release-to-rearm, ready-PC cycling, keyboard shortcuts
+and Just Works enrollment are unchanged.
+
+Only Pico `F1812912A883CCE2` was flashed after a verified full 4 MiB private
+backup. All 2,095 firmware payload blocks matched readback, and all 893
+non-program sectors, including pairing storage, were unchanged before boot.
+Runtime confirms the new version and 0.8-second help, preserved PC5 selection,
+all five saved PCs and six BLE bonds, and encrypted/ready PC1, PC4 and PC5.
+UART remains online with zero framing errors; neither ESP32 board was touched.
+Router/UART tests cover 799,999 / 800,000 / 800,001 microseconds, clock rollover,
+one-shot/rearm and unchanged keyboard switching. Physical timing acceptance
+on the destination computers has not yet been observed.
+
+```text
+build\mouse-switch-800ms\pico_bt_hub.uf2
+SHA256 59AB53A3D878CB4766234CFDE4D374F9CB6163744D842F65EC33683A6A885A60
+```
+
+**Previous Pico deployment (2026-10-23):** dual-board Pico firmware
+`0.6.5-input-switch` retains the Just Works enrollment default and existing
+pairing storage, and adds two shortcuts:
+
+- Hold **both buttons on the same mouse** (left + right) continuously for
+  **more than 2 seconds** to select the next ready PC, wrapping past offline
+  slots. A stationary mouse works too; repeated reports do not restart the timer.
+- Hold **Left + Right arrow keys**, then press **1-4** (top row or numeric keypad)
+  to select the first through fourth currently ready PC, ordered by persistent
+  PC number. For example, when PC1, PC4 and PC5 are ready, digits 1, 2 and 3
+  select PC1, PC4 and PC5. This is not an absolute saved-slot shortcut.
+
+Each gesture fires once until released. An unavailable ordinal or lack of another
+ready PC leaves the selection unchanged. Release **all keys and mouse buttons**
+before resuming input or another gesture; shortcut input is not replayed on the
+new PC. The existing Ctrl+Alt+Left/Right shortcuts remain available. See
+[Switching and input safety](#switching-and-input-safety) for input consumption.
+
+Only Pico `F1812912A883CCE2` was flashed, after a verified full 4 MiB backup
+retained locally outside the repository. All 2,095 UF2 payload blocks matched
+the readback, and all 893 non-program flash sectors, including pairing storage,
+were byte-identical before boot. Neither ESP32 board was accessed or flashed.
+Runtime confirmed the new version/help, boot-closed Just Works default, five
+saved PCs, six BLE bonds and unchanged Classic bonds. PC1 and PC4 reconnected
+encrypted/ready; PC5's saved record remains but it was initially offline.
+The ESP32 UART is online with zero framing errors. Production router tests
+cover both four- and seven-slot builds, UART-fed gestures, exact hold boundaries,
+clock rollover, ready-PC ordering, one-shot consumption and release/capture safety.
+Physical shortcut acceptance on the destination computers is not yet observed.
+
+```text
+build\input-switch\pico_bt_hub.uf2
+SHA256 638B92B6148CE6004A79FA9790F40F646446BE5230342E360A0110565687B7EF
+```
+
+**Previous Pico deployment (2026-10-17):** dual-board Pico firmware
+`0.6.4-justworks-default` uses encrypted **Just Works** (no code entry, no MITM
+authentication) for a runtime BOOTSEL hold of at least 3 seconds then release,
+or `pair on` / `pair justworks` on Pico's USB console. Pairing stays closed at
+boot and opens only for 120 seconds or until a PC pairing result; a short press
+or `pair off` cancels it. No connected keyboard is required. Existing saved
+computer identities/bonds and ESP32 firmware are unchanged. Use only in a
+trusted environment: nearby devices can attempt enrollment during this window.
+`pair keyboard` retains authenticated code entry; `pair console` explicitly
+selects the former USB confirmation workflow. Single-radio defaults are unchanged.
+
+Only the identified Pico was flashed; neither ESP32 board was accessed or flashed.
+A verified full 4 MiB rollback backup is retained locally outside the repository
+because it contains pairing keys. Before restarting, all 2,089 firmware payload
+blocks matched the UF2, and all 893 non-program flash sectors were byte-identical
+to the backup; the SDK's ignored UF2 marker was not treated as flash payload.
+Runtime reports the new version, boot-closed pairing, and `pair on` selects
+`PC-JustWorks SC-only=1 encryption-key=16`. The four saved PC identities and five
+BLE bonds remain; PC1 and PC4 reconnected encrypted/ready, and the ESP32 UART is
+online with zero framing errors. New-PC pairing has not yet been completed on
+the destination computer; OS connection confirmation may still be required.
+
+```text
+build\justworks-default\pico_bt_hub.uf2
+SHA256 036BA241FAE08109C73AEDD25CAEC65290707C05C6CDF7AA99C9D6AB7B5123A3
+```
+
+**Previous usable release: `v0.6.11` (2026-10-07).** This update starts from
+that release's **ESP32 `0.6.11-wifi-default-off` + Pico `0.6.2-hid-dedup`** source.
 The user reported the mouse was no longer frequently disconnecting and requested
 this checkpoint. See [RELEASE-NOTES.md](RELEASE-NOTES.md) for behavior, deployed
 hashes and limitations. This is initial usable acceptance, not a proven timeout
@@ -9,7 +191,7 @@ root-cause fix. No firmware update or paired-record change is part of committing
 this release. Unflashed `diag` additions are backed up outside the repository
 and excluded; only the deployed basic `status/history` is included.
 
-**Current deployed firmware (2026-10-07):** ESP32 `0.6.11-wifi-default-off`,
+**Previous deployed firmware (2026-10-07, history):** ESP32 `0.6.11-wifi-default-off`,
 Pico `0.6.2-hid-dedup` unchanged. The hotspot/HTTP server is **OFF on every
 boot**, even if enabled before restart. Only a deliberate ESP32 BOOT double-click
 toggles it ON/OFF. Long-press still opens input enrollment but no longer starts
@@ -458,13 +640,14 @@ These are storage limits, not a guarantee of 12 simultaneous radio links.
 ESP32 keeps one active keyboard and one active mouse chosen from its five
 records. Pico has seven logical PC identities and retains a four-peripheral
 connection limit; simultaneous four-PC capacity remains a hardware acceptance
-item. Selecting another ready PC works through BOOTSEL or Ctrl+Alt+Left/Right.
+item. Selecting another ready PC works through BOOTSEL, Ctrl+Alt+Left/Right,
+mouse left+right held over 0.8 seconds, or Esc plus 1-7 (fixed saved PC number).
 
 | Runtime gesture | ESP32 BOOT (GPIO0) | Pico BOOTSEL |
 | --- | --- | --- |
 | Short press/release | Normal-status acknowledgement; during management, cancel | Next ready PC; during PC pairing, cancel |
 | Double click | Toggle Wi-Fi/HTTP | Same next-ready action, no destructive function |
-| Hold at least 3 s, then release | Open 120 s authorization and auto-scan/enroll unique new inputs; start hotspot if off | Open 120 s keyboard-code PC pairing |
+| Hold at least 3 s, then release | Open 120 s authorization and auto-scan/enroll unique new inputs; start hotspot if off | Open 120 s Just Works PC pairing (encrypted, no code, no MITM) |
 
 Long actions happen on release. Buttons held during startup must first be
 released and do not invoke runtime actions. EN/RESET still resets. Holding
@@ -488,10 +671,10 @@ activate a stored input, or explicitly confirm deletion of an input/PC slot.
 Unknown advertisements are never auto-selected by RSSI or scan order; only a
 unique, new, explicitly classified keyboard/mouse is auto-admitted in the window.
 Legacy FILCO PIN remains `123456` + Enter on the new keyboard when prompted;
-SSP confirmation/passkeys have explicit page controls. PC pairing requires an
-already-connected keyboard for the computer's code and never silently falls
-back to Just Works. Incoming unknown pairings stay rejected outside explicit
-target authorization.
+SSP confirmation/passkeys have explicit page controls. Pico's default PC
+pairing is now explicitly authorized Just Works; `pair keyboard` still requires
+an already-connected keyboard and never silently falls back to Just Works.
+Incoming unknown pairings stay rejected outside explicit target authorization.
 
 When full, the oldest **first-admitted** record is evicted, not the
 least-recently-used device. Reconnection/activation does not change age.
@@ -2762,8 +2945,9 @@ complete; the original authentication timeout still applies. Closed-window
 requests, established-link failures and other security errors remain rejected.
 No unrelated bonds or logical PC reservations are erased.
 
-The original `pair on` mode is still available without a connected keyboard.
-It uses the console's display/confirmation workflow, including
+In the dual-board image, `pair on` is an alias for `pair justworks`, and the
+original console display/confirmation workflow is available as `pair console`.
+The single-radio image retains that workflow as `pair on`. It uses
 `confirm <ticket> yes` only after comparing both six-digit displays, or
 `passkey <ticket> <six digits>` when requested.
 
@@ -2845,6 +3029,15 @@ Local logs are `build\classic-output\output-only-*-20260925-*`,
 
 ## Switching and input safety
 
+- Mouse left+right held continuously **more than 0.8 seconds** on one mouse:
+  select the next ready computer, once per gesture. Both buttons must be released
+  before rearming. Holds interrupted by disconnection, routing stop, manual release,
+  passkey capture or another switch are cancelled; two separate mice cannot
+  combine their buttons to start the timer.
+- Hold `Esc`, then press one digit `1`-`7` (top row or keypad): select that fixed
+  saved PC number, not its ordinal among online PCs. Offline, unauthenticated
+  and not-yet-HID-ready targets leave selection unchanged. Multiple digits and
+  out-of-range digits are rejected. Single-radio builds support PC1-PC4.
 - `Ctrl+Alt+Right`: select the next ready computer.
 - `Ctrl+Alt+Left`: select the previous ready computer.
 - Unready computer slots are skipped. If none is available, selection does not
@@ -2856,8 +3049,15 @@ Local logs are `build\classic-output\output-only-*-20260925-*`,
 - No input is deliberately replayed after a disconnected/unready period.
 - Enter `release` for an emergency all-keys/all-buttons release.
 
-The final arrow key of a switching chord is consumed. Ctrl/Alt presses may
-already have reached the old computer before the chord can be recognized.
+The final arrow key of a Ctrl+Alt switching chord is consumed. Recognizing
+Esc+digit releases old output and consumes the chord until all input is released.
+Selecting the already-active PC or an unavailable target still consumes the
+shortcut and requires release. Escape itself is withheld until physical release,
+then sent once as a press/release pair unless consumed by a shortcut or cancelled
+by a safety boundary. A digit pressed before Escape may already reach the old PC.
+Other keys/modifiers remain held during the deferred tap. Mouse buttons
+during the initial 0.8-second hold or Ctrl/Alt presses may also reach the old computer
+before a complete switching gesture can be recognized.
 Unexpected radio loss prevents a guaranteed final release packet; the computer
 also has to handle the disconnected HID device.
 
@@ -2873,13 +3073,15 @@ Report IDs) are rejected explicitly, so this is not yet universal HID support.
 
 ## Pairing and administration
 
-New PC pairing is closed at startup. `pair keyboard` or `pair on` temporarily
-permits it; an
+New PC pairing is closed at startup. `pair keyboard`, `pair justworks` or
+`pair on` temporarily permits it; an
 explicit input `connect` authorizes pairing that selected input peer.
 Known bonded peers can re-encrypt without opening a new pairing window.
 
-Keyboard-based computer enrollment requires passkey authentication and rejects
-Just Works. Input devices and console-only enrollment can still use Just Works,
+The dual-board image defaults to Just Works for an explicit `pair on` or runtime
+BOOTSEL long press; this does not open enrollment automatically at boot.
+Optional `pair keyboard` enrollment requires passkey authentication and rejects
+Just Works. Input devices and explicitly selected Just Works enrollment can use Just Works,
 which does not provide man-in-the-middle protection. Pair only in a
 trusted environment, check comparison numbers, and close the pairing window
 after enrollment. Anyone with access to the USB console can administer the hub

@@ -40,6 +40,13 @@ foreach ($suite in @('router', 'passkey', 'button', 'smp_decode', 'classic_decod
     if ($LASTEXITCODE -ne 0) { throw "$suite tests failed: $LASTEXITCODE" }
 }
 
+$output = Join-Path $outputDirectory 'hub_router_dual_tests.exe'
+& $compiler -Wall -Werror -DHUB_DUAL_BLUETOOTH=1 "-I$(Join-Path $root 'include')" `
+    (Join-Path $root 'tests\router_test.c') (Join-Path $root 'src\hub_router.c') -o $output
+if ($LASTEXITCODE -ne 0) { throw "Dual-board router compilation failed: $LASTEXITCODE" }
+& $output
+if ($LASTEXITCODE -ne 0) { throw "Dual-board router tests failed: $LASTEXITCODE" }
+
 $output = Join-Path $outputDirectory 'hub_output_probe_tests.exe'
 & $compiler -Wall -Werror "-I$(Join-Path $root 'include')" `
     (Join-Path $root 'tests\output_probe_test.c') -o $output
@@ -49,6 +56,20 @@ if ($LASTEXITCODE -ne 0) { throw "Output probe tests failed: $LASTEXITCODE" }
 
 if ([string]::IsNullOrWhiteSpace($SdkPath)) { $SdkPath = Join-Path $root '.deps\pico-sdk' }
 $btstack = Join-Path $SdkPath 'lib\btstack\src'
+$generatedPairing = Join-Path $outputDirectory 'pc_pairing_generated.inc'
+$cmake = Join-Path $root '.tools\python\cmake\data\bin\cmake.exe'
+& $cmake "-DROOT=$root" "-DOUTPUT=$generatedPairing" `
+    -P (Join-Path $root 'tests\generate_pc_pairing_test.cmake')
+if ($LASTEXITCODE -ne 0) { throw "PC pairing test generation failed: $LASTEXITCODE" }
+foreach ($dual in @(0, 1)) {
+    $output = Join-Path $outputDirectory "hub_pc_pairing_${dual}_tests.exe"
+    & $compiler -Wall -Werror -DENABLE_BLE=1 -DENABLE_CLASSIC=1 "-DHUB_DUAL_BLUETOOTH=$dual" `
+        "-I$outputDirectory" "-I$(Join-Path $root 'include')" "-I$btstack" `
+        (Join-Path $root 'tests\pc_pairing_test.c') -o $output
+    if ($LASTEXITCODE -ne 0) { throw "PC pairing variant $dual compilation failed: $LASTEXITCODE" }
+    & $output
+    if ($LASTEXITCODE -ne 0) { throw "PC pairing variant $dual tests failed: $LASTEXITCODE" }
+}
 $hidParser = Join-Path $btstack 'btstack_hid_parser.c'
 $util = Join-Path $btstack 'btstack_util.c'
 if (-not (Test-Path -LiteralPath $hidParser) -or -not (Test-Path -LiteralPath $util)) {

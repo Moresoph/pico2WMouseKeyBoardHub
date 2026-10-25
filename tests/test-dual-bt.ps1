@@ -13,7 +13,7 @@ if ($LASTEXITCODE) { throw 'Dual Bluetooth compilation failed' }
 & $exe
 if ($LASTEXITCODE) { throw 'Dual Bluetooth tests failed' }
 $exe = Join-Path $out 'dual_bt_router_test.exe'
-& $cc -Wall -Werror "-I$root\include" "$root\tests\dual_bt_router_test.c" `
+& $cc -Wall -Werror -DHUB_DUAL_BLUETOOTH=1 "-I$root\include" "$root\tests\dual_bt_router_test.c" `
     "$root\src\hub_link.c" "$root\src\hub_external_input.c" "$root\src\hub_router.c" -o $exe
 if ($LASTEXITCODE) { throw 'Dual Bluetooth router compilation failed' }
 & $exe
